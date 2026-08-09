@@ -383,9 +383,9 @@ rag/
 
 ---
 
-## P1 status — what landed in this release
+## P1 + P2 status — what's shipped
 
-All four P1 features from the original roadmap are now shipped:
+**P1 (walking skeleton + RAG core):** all original features.
 
 - [x] **BGE cross-encoder reranker** (`providers/rerank_bge.py`) —
   defaults to `BAAI/bge-reranker-base` (~0.5 GB fp16) so it fits on
@@ -400,6 +400,25 @@ All four P1 features from the original roadmap are now shipped:
 - [x] **Browser-based GUI** (FastAPI + vanilla HTML/CSS/JS) — see
   the "GUI server" section below; auto-launches at logon via the
   Task Scheduler task that `scripts/install-service.ps1` installs.
+
+**P2 (no terminal, clear GUI, persistent backends):** done.
+
+- [x] **Boot orchestrator** (`scripts/start_all.ps1`, `rag start`).
+  One command brings up the whole stack: Ollama + Qdrant + the rag
+  GUI server, in that order, with health probes, then opens the
+  browser. Idempotent. Double-click `rag.bat` (no args) to trigger
+  the same path; the desktop shortcut at `scripts/create-desktop-
+  shortcut.ps1` pins it to the desktop.
+- [x] **GUI tab nav**: Ask / Ingest / Library.
+  - **Ask** — chat with `[n]` citations, topic filter dropdown.
+  - **Ingest** — drag-and-drop / file-picker upload of PDFs and
+    Markdown. Posts to `/api/ingest`; server saves to a temp dir
+    and runs the right ingester. No terminal.
+  - **Library** — read-only view of the metadata DB: stats summary,
+    recent sources, recent citations, recent eval runs.
+- [x] **Auto-launch at logon now brings up the full stack** (was
+  just the GUI server before). `install-service.ps1` schedules
+  `rag start --no-browser` so Ollama + Qdrant come up too.
 
 Still P2 (not in this release):
 
@@ -420,7 +439,7 @@ is open; see the question at the end of the install.
 
 ---
 
-## GUI server (P1)
+## GUI server (P1) + P2 polish
 
 A small browser-based UI on top of the same pipeline. Bound to a
 persistent port (8420) so you always know where to find it. The CLI
@@ -428,35 +447,48 @@ commands work exactly the same — the GUI is just another surface
 over the same `ask` / `ingest` / `eval` pipeline.
 
 ```powershell
-# Start the server (foreground, blocking)
-rag serve
-# → http://localhost:8420
+# Bring up the WHOLE stack (Ollama + Qdrant + rag GUI) and open the browser.
+# This is the one command that maps to the desktop shortcut.
+rag start
 
 # Or in another shell, query the running server
 rag status                 # URL, PID, started_at
 rag url                    # just the URL (for piping)
+rag open                   # just open the browser to the running GUI
 ```
 
-### Auto-launch on logon (the whole point)
+### Three tabs, no terminal
 
-The first time, run `install-service.ps1` once and forget about it. After
-that, every time you log in to Windows, the rag GUI starts in the
-background on port 8420.
+- **Ask** — chat input + topic filter. Answers come back with inline
+  `[n]` citation markers; click a marker to scroll to its chunk.
+- **Ingest** — drag PDFs or Markdown files onto the page, or click
+  to pick. The server saves them to a temp dir, runs the right
+  ingester, reports the chunk count. No terminal, no `rag ingest`.
+- **Library** — read-only view of the metadata DB: stats summary,
+  recent sources, recent citations, recent eval runs.
+
+### One-click bring-up (the whole point)
+
+Three ways to get to a running stack, pick whichever is closest:
 
 ```powershell
-# Run ONCE to set up the auto-launch (Task Scheduler task)
+# 1. Desktop shortcut (one-time setup)
+powershell -ExecutionPolicy Bypass -File D:\Tinkering sideprojects\rag\scripts\create-desktop-shortcut.ps1
+# -> puts a `rag` shortcut on your desktop. Double-click -> stack up + browser opens.
+
+# 2. Bare command (or `rag.bat` with no args from any shell)
+rag start
+
+# 3. Auto-launch at logon (one-time setup, then forget about it)
 .\scripts\install-service.ps1
-
-# Or from anywhere:
-powershell -ExecutionPolicy Bypass -File D:\Tinkering sideprojects\rag\scripts\install-service.ps1
-
-# To remove the auto-launch:
-.\scripts\uninstall-service.ps1
+# After this, every logon brings up Ollama + Qdrant + rag GUI
+# (15s delay so the desktop + services have time to settle).
+# To remove: .\scripts\uninstall-service.ps1
 ```
 
-The task triggers at user logon (15s delay, so Ollama + Qdrant have
-time to be reachable), restarts on failure up to 3 times, and runs
-in the interactive session so your browser can open `localhost:8420`.
+All three paths are idempotent: if everything is already up, the
+orchestrator just opens the browser. The Task Scheduler task
+restarts on failure up to 3 times.
 
 ### What the UI looks like
 

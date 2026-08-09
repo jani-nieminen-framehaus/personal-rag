@@ -189,6 +189,22 @@ def test_start_script_file_exists():
     assert p.is_file(), f"missing: {p}"
 
 
+def test_create_desktop_shortcut_script_exists():
+    """The desktop-shortcut script must be present on disk."""
+    from pathlib import Path
+    p = Path(__file__).resolve().parent.parent / "scripts" / "create-desktop-shortcut.ps1"
+    assert p.is_file(), f"missing: {p}"
+
+
+def test_library_endpoints_registered():
+    """The four P2 library endpoints must be present on the FastAPI app."""
+    import serve
+    app = serve.app
+    paths = {getattr(r, "path", "") for r in app.routes}
+    for p in ("/api/sources", "/api/citations", "/api/eval-runs", "/api/stats"):
+        assert p in paths, f"{p} missing; routes: {sorted(paths)}"
+
+
 def test_rag_bat_defaults_to_start_when_no_args():
     """`rag.bat` with no args should call `python cli.py start` (desktop-shortcut UX)."""
     from pathlib import Path
