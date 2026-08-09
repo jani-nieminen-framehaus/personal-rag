@@ -124,6 +124,14 @@ docker run -d --name qdrant -p 6333:6333 `
 From either option, `http://localhost:6333/collections` should return
 `{"result":{"collections":[]}}`.
 
+> **This machine: port 7333, not 6333.** IPv4 `:6333` is squatted by a
+> bound-but-never-listening ghost socket (held by an unrelated local agent
+> process — netstat-invisible; find it with
+> `Get-NetTCPConnection -LocalPort 6333`). Qdrant here runs with
+> `QDRANT__SERVICE__HTTP_PORT=7333` (see `C:\Tools\qdrant\run-qdrant.cmd`),
+> and `config.yaml → store.url` matches. Substitute 7333 in every
+> `localhost:6333` URL on this page.
+
 ### 4. The Python venv (Windows side)
 
 ```powershell
@@ -520,7 +528,8 @@ rag url                                # → http://localhost:8420
 | `bitsandbytes` install fails on Windows | Set `embedder.quant: none` in `config.yaml` (uses fp16 — adds ~10 GB VRAM but no bitsandbytes dep). |
 | `OSError: libcudart.so not found` | CUDA toolkit missing. Install CUDA 12.x runtime, or set `embedder.device: cpu` (slow but works). |
 | `qwen3:30b-a3b` not found by Ollama | `ollama pull qwen3:30b-a3b` — it's a MoE so the pull is large but inference is fast. |
-| `Qdrant connection refused` | Check that `qdrant.exe` is running (or `docker ps` if you used the Docker option). Service should listen on `localhost:6333`. |
+| `Qdrant connection refused` | Check that `qdrant.exe` is running — **on this machine at `localhost:7333`** (see the port note in the Qdrant section). If `qdrant.exe` exits at boot with `os error 10048` but netstat shows nothing, a Bound-state ghost socket is squatting the port: `Get-NetTCPConnection -LocalPort <port>` reveals the owner. |
+| `Torch not compiled with CUDA enabled` | PyPI's Windows `torch` wheel is CPU-only. For GPU: `pip install torch --index-url https://download.pytorch.org/whl/cu126`. Until then the config runs CPU (`device: cpu`, `quant: none`) — slow but correct. |
 | `UnicodeDecodeError` when ingesting | All file IO uses `encoding="utf-8"` already. If you see this, the source file isn't UTF-8 — convert with `iconv` or save-as UTF-8 in your editor. |
 | Eval recall@5 is 0 for every question | Your collection is empty — run `python cli.py ingest --markdown .\samples\notes` first. |
 | Em-dashes / accents look wrong in print output | Windows console code page. Run `chcp 65001` before `python cli.py …` (sets the active code page to UTF-8). |

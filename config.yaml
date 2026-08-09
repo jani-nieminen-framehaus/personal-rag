@@ -13,10 +13,13 @@
 embedder:
   class: providers.embed_qwen3.Qwen3Embedder
   model: Qwen/Qwen3-Embedding-8B
-  # Q4 via bitsandbytes; set quant: "none" to use full precision.
-  quant: q4                       # q4 | q8 | none
+  # Q4 via bitsandbytes (CUDA only); "none" = full precision.
+  # TEMP (smoke run): quant none + cpu — this machine's NVML is currently
+  # broken (nvidia-smi: Unknown Error) and the venv has CPU-only torch.
+  # Flip back to q4/cuda after reinstalling torch+cu126 and fixing the driver.
+  quant: none                     # q4 | q8 | none
   compute_dtype: bfloat16         # bfloat16 | float16 | float32
-  device: cuda                    # cuda | cuda:0 | cuda:1 | cpu
+  device: cpu                     # cuda | cuda:0 | cuda:1 | cpu
   batch_size: 8                   # 8B is heavy; tune to your VRAM
   normalize: true                 # Qwen3 embeddings expect cosine-normalized
   max_seq_length: 8192            # Qwen3-Embedding supports 32k; cap for memory
@@ -60,10 +63,12 @@ generator:
     Never invent citations. Prefer concrete, terse answers.
 
 # ---- Store -------------------------------------------------------------------
-# Qdrant runs on Windows (binary or Docker) or anywhere reachable on :6333.
+# Qdrant runs on Windows (binary or Docker) or anywhere reachable.
+# NOTE: this machine uses :7333 — IPv4 :6333 is squatted by a leaked socket
+# held by another local agent process (see README troubleshooting).
 store:
   class: store.qdrant_store.QdrantStore
-  url: http://localhost:6333
+  url: http://localhost:7333
   collection: kb_p0
   dense_dim: 4096                 # Qwen3-Embedding-8B output dim
   distance: COSINE

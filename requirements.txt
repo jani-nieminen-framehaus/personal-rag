@@ -23,6 +23,10 @@ qdrant-client>=1.10.0,<2
 
 # --- Embeddings (Qwen3-Embedding-8B, Q4 via bitsandbytes) ---
 # sentence-transformers pulls in transformers, tokenizers, etc.
+# NOTE: PyPI's Windows torch wheel is CPU-only. For the 48 GB GPU, install
+# torch from the CUDA index instead (then set embedder.device: cuda and
+# quant: q4 in config.yaml):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
 sentence-transformers>=3.0.0,<4
 transformers>=4.43.0,<5
 torch>=2.3.0,<3
