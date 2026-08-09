@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import sys
+import webbrowser
 from pathlib import Path
 
 import click
@@ -404,6 +406,61 @@ def tray():
     """Run the Windows system tray icon. Left-click opens the GUI."""
     import tray
     tray.run()
+
+
+# -----------------------------------------------------------------------------
+# rag start / rag open - boot orchestrator + browser launcher (P2)
+# -----------------------------------------------------------------------------
+#
+# `rag start` is the "double-click to bring up the whole stack" entry point.
+# On Windows it dispatches to scripts/start_all.ps1 which checks Ollama,
+# Qdrant, and the rag server, starts the ones that aren't running, polls
+# until /api/health says ready, then opens the browser. Idempotent: if
+# everything is already up, it just opens the browser.
+#
+# `rag open` is a quieter version that only opens the browser to the
+# currently-running GUI (errors if the server isn't up).
+
+@cli.command("start")
+@click.option("--no-browser", is_flag=True,
+              help="Don't open the browser at the end (for headless / smoke).")
+def start(no_browser):
+    """Bring up the full rag stack (Ollama + Qdrant + rag server) and open the GUI.
+
+    Idempotent. If everything is already running, just opens the browser.
+    This is the one-click entry point pinned to your desktop.
+    """
+    repo = Path(__file__).resolve().parent
+    if sys.platform == "win32":
+        ps1 = repo / "scripts" / "start_all.ps1"
+        if not ps1.is_file():
+            click.echo(f"start: script missing: {ps1}", err=True)
+            sys.exit(1)
+        args = ["-ExecutionPolicy", "Bypass", "-File", str(ps1)]
+        if no_browser:
+            args += ["-NoBrowser"]
+        rc = subprocess.call(["powershell.exe"] + args)
+        sys.exit(rc)
+    # Non-Windows fallback: just start the rag server (user manages
+    # Ollama + Qdrant themselves).
+    click.echo("start: non-Windows detected; only starting the rag server.")
+    click.echo("start: you'll need to run Ollama and Qdrant separately.")
+    if no_browser:
+        os.environ["RAG_NO_BROWSER"] = "1"
+    import serve as serve_mod
+    serve_mod.run()
+
+
+@cli.command("open")
+def open_cmd():
+    """Open the running rag GUI in your default browser. Exits 1 if not running."""
+    state = _read_service_state()
+    if not state or not _pid_alive(state.get("pid", 0)):
+        click.echo("rag GUI not running. Try: rag start", err=True)
+        sys.exit(1)
+    url = state.get("url") or "http://localhost:8420"
+    webbrowser.open(url)
+    click.echo(f"opened {url}")
 
 
 # -----------------------------------------------------------------------------

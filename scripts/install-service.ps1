@@ -1,18 +1,27 @@
 # =============================================================================
-# install-service.ps1 — register rag GUI in Windows Task Scheduler.
+# install-service.ps1 — register rag in Windows Task Scheduler.
 #
 # Idempotent: running it twice just updates the existing task. To remove
 # the auto-launch, run scripts\uninstall-service.ps1.
 #
-# After this script completes successfully, the rag GUI starts automatically
-# every time you log in to Windows, bound to 127.0.0.1:8420. Find it with
+# The scheduled task runs `rag start --no-browser` at user logon. That
+# orchestrator:
+#   1. Checks Ollama — starts it if not reachable.
+#   2. Checks Qdrant — starts it if not reachable.
+#   3. Spawns the rag GUI server (FastAPI on 127.0.0.1:8420) as a
+#      detached process so closing the scheduled-task process tree
+#      doesn't kill the server.
+#   4. Returns. The server keeps running.
+#
+# After this script completes, every time you log in to Windows, the
+# whole stack comes up in the background. Find the GUI with
 # `rag status` (terminal) or just open http://localhost:8420 in a browser.
 # =============================================================================
 
 $ErrorActionPreference = 'Stop'
 
 $TaskName    = 'rag-gui'
-$Description = 'rag personal RAG GUI server (FastAPI on 127.0.0.1:8420)'
+$Description = 'rag personal RAG stack (Ollama + Qdrant + GUI on 127.0.0.1:8420)'
 $RepoRoot    = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $PythonExe   = Join-Path $RepoRoot '.venv\Scripts\python.exe'
 $CliPath     = Join-Path $RepoRoot 'cli.py'
@@ -25,9 +34,10 @@ if (-not (Test-Path $PythonExe)) {
     exit 1
 }
 
-# Build the action — we run `python -m cli serve` from the repo root
+# Build the action — we run `rag start --no-browser` from the repo root
 # so config.yaml is found and the state file lands in the user's home.
-$ActionArgs = '-m cli serve'
+# `start` does the orchestration (Ollama + Qdrant + rag server).
+$ActionArgs = '-m cli start --no-browser'
 $Action     = New-ScheduledTaskAction `
     -Execute $PythonExe `
     -Argument $ActionArgs `
@@ -72,13 +82,18 @@ try {
 }
 
 Write-Host ""
-Write-Host "  rag GUI scheduled task installed" -ForegroundColor Green
+Write-Host "  rag stack scheduled task installed" -ForegroundColor Green
 Write-Host "  name        : $TaskName"
 Write-Host "  python      : $PythonExe"
 Write-Host "  args        : $ActionArgs"
 Write-Host "  working dir : $RepoRoot"
 Write-Host "  trigger     : AtLogOn (+15s delay)"
 Write-Host "  restart     : up to 3x on failure"
+Write-Host ""
+Write-Host "  on next logon the orchestrator will start:" -ForegroundColor Gray
+Write-Host "    1. Ollama (if not running) -> http://localhost:11434" -ForegroundColor Gray
+Write-Host "    2. Qdrant (if not running) -> http://localhost:7333" -ForegroundColor Gray
+Write-Host "    3. rag GUI server          -> http://localhost:8420" -ForegroundColor Gray
 Write-Host ""
 Write-Host "  next steps:" -ForegroundColor Cyan
 Write-Host "    1. Start it now (no need to log out):" -ForegroundColor Gray

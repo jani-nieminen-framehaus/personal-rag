@@ -4,12 +4,15 @@ REM rag.bat — Windows shiv launcher.
 REM First run: creates the venv + installs deps. After that: just runs cli.py.
 REM
 REM Usage:
+REM     rag                                (no args -> "rag start": bring up
+REM                                          the whole stack and open the GUI)
 REM     rag ask "What was YaRN about?"
 REM     rag ingest --markdown .\samples
 REM     rag eval
+REM     rag serve / start / open / status / tray / stats / etc.
 REM
-REM Drop a shortcut to this file on your taskbar / Start menu / PATH and the
-REM app launches like a real binary, no ceremony.
+REM Drop a shortcut to this file on your taskbar / Start menu / desktop and
+REM double-click -> the full rag stack comes up and the browser opens.
 REM =============================================================================
 setlocal
 set "REPO=%~dp0"
@@ -34,5 +37,10 @@ if not exist "%PYEXE%" (
 )
 
 call "%VENV%\Scripts\activate.bat" >nul
-python "%REPO%cli.py" %*
+REM No args -> default to "start" so a desktop shortcut just works.
+if "%*"=="" (
+    python "%REPO%cli.py" start
+) else (
+    python "%REPO%cli.py" %*
+)
 endlocal

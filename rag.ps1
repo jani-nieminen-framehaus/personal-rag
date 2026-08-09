@@ -4,6 +4,8 @@
 # First run: creates the venv + installs deps. After that: just runs cli.py.
 #
 # Usage:
+#     .\rag.ps1                              (no args -> "rag start": bring up
+#                                              the whole stack and open the GUI)
 #     .\rag.ps1 ask "What was YaRN about?"
 #     .\rag.ps1 ingest --markdown .\samples
 #     .\rag.ps1 eval
@@ -27,5 +29,11 @@ if (-not (Test-Path $pyExe)) {
     Write-Host "[rag] setup complete." -ForegroundColor Green
 }
 
-& $pyExe (Join-Path $repo 'cli.py') @args
+# No args -> default to "start" so a desktop shortcut (or a bare
+# `rag.ps1` from the shell) brings up the whole stack.
+if ($args.Count -eq 0) {
+    & $pyExe (Join-Path $repo 'cli.py') start
+} else {
+    & $pyExe (Join-Path $repo 'cli.py') @args
+}
 exit $LASTEXITCODE
