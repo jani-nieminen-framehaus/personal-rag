@@ -26,3 +26,7 @@ eval/runs/
 # Metadata store (runtime artifact; recreate via `rag ingest` / `rag ask`)
 metadata.sqlite3*
 
+# Smoke / debug artifacts
+test_out.pdf
+samples/test_books/
+
