@@ -227,75 +227,82 @@ python cli.py ingest --markdown D:\path\to\your\notes
 The ingest is **idempotent** — re-running updates chunks in place thanks
 to deterministic UUID5 ids. No duplicates, no manual cleanup.
 
-## Ingesting books (P1 — PDF / EPUB)
+## Ingesting books (PDF)
 
-P0 only ingests Markdown and Zeal. For books (PDFs, EPUBs) the P1 ingester
-will live at `ingest/pdf_dir.py` and `ingest/epub_dir.py` — same `Ingester`
-ABC, same chunking pipeline.
+Drop a single PDF or a folder of PDFs at the CLI:
 
-Where to put the books is your call — the ingester takes a path. Two
-natural patterns:
+```powershell
+# One book
+python cli.py ingest --pdf D:\Books\mybook.pdf
 
-- **Inside the repo**, mirroring the notes tree: `library/<topic>/<author>/<title>.pdf`
-- **External**, with the ingester pointed at any folder:
-  `python cli.py ingest --pdf D:\Library\Photography`
+# A whole library, topics from the parent dir
+python cli.py ingest --pdf D:\Library
+#   D:\Library\photography\book.pdf  -> topic = "photography"
+#   D:\Library\code\patterns.pdf     -> topic = "code"
+```
 
-Topic resolution will reuse the frontmatter pattern, falling back to the
-parent directory. The recommended stack for parsing:
+Mechanics (see `ingest/pdf_dir.py`):
 
-- **PDF**: `pymupdf` (fitz) — handles complex layouts, scans + OCR via
-  Tesseract if you need it.
-- **EPUB**: `ebooklib` — already extracts the chapter structure, which
-  maps cleanly onto our heading-aware chunker.
+- One chunk per page; long pages are split by token count using the
+  same sliding-window strategy as the markdown chunker.
+- Section is `Page N` (or the PDF's own page label if it has one —
+  books sometimes use roman numerals or chapter prefixes).
+- Topic: from the immediate parent dir (single-file ingest falls
+  back to `default_topic`).
+- `doc_type` is `"pdf"`; the chunk's `extra` payload includes the
+  page number and label.
+- Pages with no text layer (scans) are skipped with a debug log.
+  OCR is out of P1 scope; add Tesseract later if you need it.
+- Corrupt PDFs in a directory log a warning and are skipped — one
+  bad file doesn't kill the rest of the ingest.
 
-## The metadata database (P1)
+## The metadata database
 
-The current P0 keeps everything inside Qdrant's payload (chunk text,
-source path, topic, section, doc_type). That works for a few thousand
-chunks; the moment you want to ask things like "what did I cite most
-often last month" or "which sources have I never retrieved", you'll
-want a separate metadata store.
-
-**SQLite is the right answer** for this:
-
-- One file, in the repo (`metadata.sqlite3`). Trivial to back up, copy,
-  inspect with `sqlite3` CLI.
-- Zero infrastructure — no service to run alongside Qdrant.
-- Mature, fast, predictable. Your Framehaus ledger already uses it.
-
-**Not Postgres** unless you already have it running for something else.
-A solo RAG over thousands of chunks doesn't need a server, and the
-operational cost of "remember to back up the DB, run migrations, monitor
-it" isn't worth it at this scale.
-
-The P1 schema will be ~50 lines:
+Every ingest and every `rag ask` writes a small side-channel to a
+SQLite file at `metadata.sqlite3` (override via `metadata.path` in
+`config.yaml`). Three tables:
 
 ```sql
-CREATE TABLE sources (         -- one row per ingested file
-    source_path TEXT PRIMARY KEY,
-    doc_type TEXT,
-    topic TEXT,
-    ingested_at TIMESTAMP,
-    chunk_count INT,
-    etag_or_hash TEXT           -- to detect "file changed, re-ingest"
+CREATE TABLE sources (
+    source_path   TEXT PRIMARY KEY,   -- absolute path
+    doc_type      TEXT,               -- 'markdown' | 'pdf' | 'code_python' | 'zeal'
+    topic         TEXT,               -- the topic this file was indexed under
+    ingested_at   TIMESTAMP,
+    chunk_count   INTEGER,
+    content_hash  TEXT                -- SHA-256 of joined chunk text (first 16 hex)
 );
 
-CREATE TABLE citations (       -- append-only log of every [n] the model emitted
-    id INTEGER PRIMARY KEY,
-    asked_at TIMESTAMP,
-    query TEXT,
-    chunk_id TEXT,
-    rank INT
+CREATE TABLE citations (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    asked_at     TIMESTAMP,
+    query        TEXT,
+    chunk_id     TEXT,
+    source_path  TEXT,
+    rank         INTEGER
 );
 
-CREATE TABLE eval_runs (       -- eval harness results
-    id INTEGER PRIMARY KEY,
-    ran_at TIMESTAMP,
-    n_questions INT,
-    recall_at_5 REAL,
-    mrr REAL
+CREATE TABLE eval_runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ran_at              TIMESTAMP,
+    n_questions         INTEGER,
+    recall_at_5         REAL,
+    mrr                 REAL,
+    recall_at_dense     REAL,
+    faithfulness_proxy  REAL
 );
 ```
+
+Explore it from the CLI:
+
+```powershell
+rag stats                  # counts + most-cited source
+rag sources --limit 20     # catalog of indexed files
+rag citations --limit 20   # recent citations (filter with --source PATH)
+rag eval-runs --limit 10   # recall@5 / MRR over time
+```
+
+Disable the side-channel entirely with `metadata.enabled: false` in
+`config.yaml` — the pipeline silently skips the writes.
 
 ## Ingesting a Zeal docset
 
@@ -342,41 +349,65 @@ rag/
 ├── README.md                # this file
 ├── config.yaml              # SINGLE source of truth for models
 ├── requirements.txt
-├── cli.py                   # `rag ask` / `rag ingest` / `rag eval`
+├── cli.py                   # `rag ask` / `rag ingest` / `rag eval` / etc.
+├── serve.py                 # FastAPI server for the GUI (P1)
+├── tray.py                  # Windows tray icon (pystray + Pillow) (P1)
 ├── rag.bat                  # Windows shiv launcher (cmd)
 ├── rag.ps1                  # Windows shiv launcher (PowerShell)
 ├── core/
 │   ├── interfaces.py        # ABCs: Embedder, Reranker, Generator, Ingester
 │   ├── chunker.py           # heading-aware (md) + AST (py) + whole-file fallback
-│   └── pipeline.py          # config loader, factories, ingest/ask drivers
+│   ├── pipeline.py          # config loader, factories, ingest/ask drivers
+│   └── metadata.py          # SQLite side-channel: sources / citations / eval_runs
 ├── providers/
 │   ├── embed_qwen3.py       # real, Q4 via bitsandbytes
-│   ├── embed_bgem3.py       # P1 stub
-│   ├── rerank_bge.py        # P1 stub
-│   └── llm_local.py         # OpenAI client → Ollama
+│   ├── embed_bgem3.py       # P1 stub (BGE-M3 dense+sparse)
+│   ├── rerank_bge.py        # real, BGE cross-encoder (bge-reranker-base)
+│   └── llm_local.py         # OpenAI client -> Ollama
 ├── ingest/
 │   ├── markdown_dir.py      # walk a notes dir, respect frontmatter
-│   └── zeal_docsets.py      # read Dash-compatible docset SQLite (read-only)
+│   ├── zeal_docsets.py      # read Dash-compatible docset SQLite (read-only)
+│   └── pdf_dir.py           # pymupdf-based PDF ingester (P1)
 ├── store/
 │   └── qdrant_store.py      # dense + reserved sparse slot
 ├── eval/
-│   ├── golden_set.jsonl     # 9 hand-written Q→chunk_id pairs
+│   ├── golden_set.jsonl     # 9 hand-written Q->chunk_id pairs
 │   └── run_ragas.py         # recall@5, MRR, faithfulness proxy
+├── scripts/
+│   ├── install-service.ps1    # Task Scheduler setup (auto-launch at logon)
+│   └── uninstall-service.ps1  # Task Scheduler removal
+├── static/                  # the GUI (vanilla HTML + CSS + JS, no framework)
 └── samples/
     └── notes/               # 5 demo notes (photography, ml, code, operations)
 ```
 
 ---
 
-## P1 roadmap (not in P0)
+## P1 status — what landed in this release
 
-- BGE-reranker-v2 (provider file already stubbed) — flip `reranker.class`
-- BM25 sparse vectors + RRF hybrid search — collection schema already reserves the slot
-- PDF / EPUB ingester (`ingest/pdf_dir.py` + `ingest/epub_dir.py`)
-- Simple graphical UI — see "GUI" section below
-- SQLite metadata layer (sources, citations, eval_runs)
-- NLI-based faithfulness metric (replace the token-overlap proxy)
-- LangSmith-style trace logging
+All four P1 features from the original roadmap are now shipped:
+
+- [x] **BGE cross-encoder reranker** (`providers/rerank_bge.py`) —
+  defaults to `BAAI/bge-reranker-base` (~0.5 GB fp16) so it fits on
+  a 24 GB GPU with the embedder; upgrade commented path to
+  `BAAI/bge-reranker-v2-gemma` for stronger ranking.
+- [x] **PDF ingester** (`ingest/pdf_dir.py`) — `rag ingest --pdf PATH`
+  (file or directory), per-page chunks, deterministic chunk_ids,
+  graceful corrupt-file handling.
+- [x] **SQLite metadata layer** (`core/metadata.py`) — sources,
+  citations, eval_runs; CLI commands `rag stats / sources /
+  citations / eval-runs`; wired into both the CLI and the GUI server.
+- [x] **Browser-based GUI** (FastAPI + vanilla HTML/CSS/JS) — see
+  the "GUI server" section below; auto-launches at logon via the
+  Task Scheduler task that `scripts/install-service.ps1` installs.
+
+Still P2 (not in this release):
+
+- BM25 sparse vectors + RRF hybrid search — collection schema
+  already reserves the slot, no recreate needed when this lands.
+- EPUB ingester (`ingest/epub_dir.py`) — same shape as PDF.
+- NLI-based faithfulness metric (replace the token-overlap proxy).
+- Conversation memory / streaming responses.
 
 ---
 
@@ -441,13 +472,28 @@ in the interactive session so your browser can open `localhost:8420`.
 ### Files
 
 ```
-serve.py                  FastAPI app: /api/ask, /api/eval, /api/health, /api/topics
-static/index.html         the chat UI
-static/style.css          dark theme, terminal-adjacent
-static/app.js             vanilla JS, minimal markdown renderer
+serve.py                       FastAPI app: /api/ask, /api/eval, /api/health, /api/topics
+tray.py                        Windows tray icon (pystray + Pillow)
+static/index.html              the chat UI
+static/style.css               dark theme, terminal-adjacent
+static/app.js                  vanilla JS, minimal markdown renderer
 scripts/install-service.ps1    Task Scheduler setup
 scripts/uninstall-service.ps1  Task Scheduler removal
 ```
+
+### Tray icon (one-click GUI access)
+
+Once the server is auto-launching at logon, the easiest way to reach
+it is a click on the tray icon. After `rag tray` (and you can add
+that to the same Task Scheduler task if you want it always on):
+
+```powershell
+rag tray                      # runs forever; left-click opens the GUI
+```
+
+Right-click menu: **Open rag GUI** / **Run eval** / **Status** /
+**Quit**. The icon is generated programmatically (no binary asset
+to ship) so it works on a fresh clone with no extra files.
 
 The service state lives at `%USERPROFILE%\.rag\state.json` (port, pid,
 started_at, url). The server writes it on startup and clears it on
@@ -517,6 +563,22 @@ rag url                                # → http://localhost:8420
 .\scripts\install-service.ps1
 # After logging out + back in: rag status should still show running
 # To remove: .\scripts\uninstall-service.ps1
+
+# 14. Tray icon (one-click GUI)
+rag tray                               # left-click opens the GUI
+# Or add it to the install-service.ps1 task so it auto-starts at logon.
+
+# 15. PDF ingest
+python cli.py ingest --pdf D:\path\to\some.pdf
+python cli.py ingest --pdf D:\Library  # recursive; topic = parent dir
+#   → one chunk per page (or many, if the page is long)
+
+# 16. Metadata DB (SQLite, side-channel)
+rag stats                              # counts + most-cited source
+rag sources --limit 20                 # catalog of indexed files
+rag citations --limit 20               # recent citations from `rag ask`
+rag eval-runs --limit 10               # recall@5 / MRR over time
+# Add --json to any of the four for machine-readable output.
 ```
 
 ---

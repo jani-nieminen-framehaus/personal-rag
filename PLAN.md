@@ -1,8 +1,12 @@
 # RAG Walking Skeleton — P0 Plan
 
-> Status: P0 implemented and pushed. Three waves of bug fixes landed; see
-> git log on `main` (commits `5880de9`, `f2259e9`, `d5b34fc`).
-> Owner: Jani. Target: runnable P0 with end-to-end `rag ask` over personal notes + Zeal docsets.
+> Status: P0 implemented and pushed. P1 (BGE reranker, PDF ingester,
+> SQLite metadata, browser GUI + tray) also shipped. See git log on
+> `main` (commits `5880de9`, `f2259e9`, `d5b34fc`, `38de978`, `1c775d0`,
+> `fc7401e`, `9423b72`, `e009162`, `acbb58c`, `49f4e65`, `1447af9`,
+> `82c7942`).
+> Owner: Jani. Target: runnable P0 + P1 with end-to-end `rag ask` over
+> personal notes + Zeal docsets + PDFs.
 
 ## 1. Goal & non-goals
 
