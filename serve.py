@@ -188,7 +188,7 @@ class AskResponse(BaseModel):
 
 
 @app.post("/api/ask", response_model=AskResponse)
-async def api_ask(req: AskRequest):
+def api_ask(req: AskRequest):
     if not S.ready:
         raise HTTPException(503, "server not ready")
     pipeline_cfg = (S.config or {}).get("pipeline", {})
@@ -214,7 +214,7 @@ async def api_ask(req: AskRequest):
 # -- /api/eval ---------------------------------------------------------------
 
 @app.get("/api/eval")
-async def api_eval():
+def api_eval():
     """Run the eval harness. Heavy (loads the embedder), so this is a
     separate endpoint that the user can hit explicitly. The pipeline
     keeps the embedder warm in S so this doesn't reload."""
@@ -240,7 +240,7 @@ async def api_eval():
 # -- /api/topics ------------------------------------------------------------
 
 @app.get("/api/topics")
-async def api_topics():
+def api_topics():
     """Return the distinct topics present in the index. The /api/ask
     filter dropdown uses this."""
     if not S.ready:

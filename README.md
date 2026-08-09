@@ -50,7 +50,7 @@ cd D:\Tinkering sideprojects\rag
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt                  # ~6 GB on first run (torch + Qwen3)
-python cli.py ingest --markdown .\samples
+python cli.py ingest --markdown .\samples\notes
 python cli.py ask "What was YaRN about?"
 python cli.py eval
 ```
@@ -168,11 +168,11 @@ If you want the literal `rag.exe` feel: create a Windows shortcut to
 ### 6. First ingest (uses the demo notes)
 
 ```powershell
-python cli.py ingest --markdown .\samples
+python cli.py ingest --markdown .\samples\notes
 # → "done. wrote N chunks into kb_p0."
 ```
 
-You should see ~15 chunks. Open the Qdrant dashboard at
+You should see ~20 chunks. Open the Qdrant dashboard at
 `http://localhost:6333/dashboard` to inspect them.
 
 ### 7. First query
@@ -473,8 +473,8 @@ python cli.py ingest --help
 python cli.py eval --help
 
 # 6. Ingest the sample notes (idempotent)
-python cli.py ingest --markdown .\samples
-# expected: "done. wrote 16 chunks into kb_p0."   (15 markdown + 1 Python AST)
+python cli.py ingest --markdown .\samples\notes
+# expected: "done. wrote 20 chunks into kb_p0."   (14 markdown + 6 Python AST)
 
 # 7. Verify the Qdrant collection
 curl http://localhost:6333/collections/kb_p0
@@ -494,7 +494,7 @@ python cli.py eval
 python cli.py eval --json
 
 # 11. Idempotent re-ingest (re-running shouldn't grow the count)
-python cli.py ingest --markdown .\samples
+python cli.py ingest --markdown .\samples\notes
 # expected: "done. wrote 0 chunks" (or same as before; UUID5 dedupes)
 
 # 12. Swap the embedder in config.yaml to a different model, re-ingest, re-eval
@@ -522,7 +522,7 @@ rag url                                # → http://localhost:8420
 | `qwen3:35b-a3b` not found by Ollama | `ollama pull qwen3:35b-a3b` — it's a MoE so the pull is large but inference is fast. |
 | `Qdrant connection refused` | Check that `qdrant.exe` is running (or `docker ps` if you used the Docker option). Service should listen on `localhost:6333`. |
 | `UnicodeDecodeError` when ingesting | All file IO uses `encoding="utf-8"` already. If you see this, the source file isn't UTF-8 — convert with `iconv` or save-as UTF-8 in your editor. |
-| Eval recall@5 is 0 for every question | Your collection is empty — run `python cli.py ingest --markdown .\samples` first. |
+| Eval recall@5 is 0 for every question | Your collection is empty — run `python cli.py ingest --markdown .\samples\notes` first. |
 | Em-dashes / accents look wrong in print output | Windows console code page. Run `chcp 65001` before `python cli.py …` (sets the active code page to UTF-8). |
 
 ---

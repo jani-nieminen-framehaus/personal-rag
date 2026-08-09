@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -273,12 +274,21 @@ def _pid_alive(pid: int) -> bool:
             import ctypes
             from ctypes import wintypes
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid))
             if handle == 0:
                 return False
-            kernel32.CloseHandle(handle)
-            return True
+            try:
+                # OpenProcess alone succeeds for a just-exited process whose
+                # kernel object hasn't been reaped — ask for the exit code
+                # to distinguish "running" from "zombie".
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                return code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
         except Exception:
             return False
     # Unix: signal 0 is the standard "is the process alive" check.

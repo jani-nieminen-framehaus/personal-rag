@@ -56,6 +56,21 @@ def test_pid_alive_for_current_process():
     assert _pid_alive(os.getpid()) is True
 
 
+def test_pid_alive_for_dead_process():
+    """A process that has exited must report not-alive.
+
+    Regression: the previous os.kill(pid, 0) probe returned silently for
+    a just-exited PID on Windows, so `rag status` reported a crashed
+    server as running.
+    """
+    import subprocess
+    import sys
+    from cli import _pid_alive
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    assert _pid_alive(p.pid) is False
+
+
 # -- FastAPI app shape -----------------------------------------------------
 
 def test_fastapi_app_exists_with_expected_routes():
