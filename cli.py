@@ -162,8 +162,11 @@ def ingest(ctx, markdown_path, zeal_path, recreate, batch_size):
 @cli.command()
 @click.option("--golden", default="eval/golden_set.jsonl", help="Path to golden_set.jsonl.")
 @click.option("--json", "as_json", is_flag=True, help="Print metrics as JSON.")
+@click.option("--with-faithfulness", is_flag=True,
+              help="Also run the (slow) LLM generation step to compute the faithfulness proxy. "
+                   "Requires Ollama to be running with the configured generator model.")
 @click.pass_context
-def eval(ctx, golden, as_json):
+def eval(ctx, golden, as_json, with_faithfulness):
     """Run the eval harness: recall@5, MRR, naive faithfulness."""
     # Lazy import so the eval dependencies don't load on every command.
     from eval import run_ragas
@@ -172,15 +175,17 @@ def eval(ctx, golden, as_json):
     embedder = make_embedder(cfg)
     store = make_store(cfg)
     reranker = make_reranker(cfg)
-    # Generator is not needed for retrieval metrics; we only call it for
-    # the optional faithfulness heuristic.
+    # Generator is only loaded when --with-faithfulness is set. By default
+    # the eval is retrieval-only (no LLM call) so it's fast and works even
+    # when Ollama isn't running.
+    generator = make_generator(cfg) if with_faithfulness else None
 
     metrics = run_ragas.run(
         golden_path=Path(golden),
         embedder=embedder,
         store=store,
         reranker=reranker,
-        generator=None,  # set to make_generator(cfg) if you want the faithfulness score
+        generator=generator,
         top_k_dense=cfg.get("pipeline", {}).get("top_k_dense", 20),
         top_k_final=cfg.get("pipeline", {}).get("top_k_final", 5),
     )

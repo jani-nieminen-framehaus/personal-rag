@@ -85,17 +85,28 @@ class ZealIngester(Ingester):
             rows = cur.fetchall()
             log.info("zeal: %d rows from %s", len(rows), table)
 
+            # Bug #8 fix: dedupe by relative path. The searchIndex table
+            # has multiple rows per file (one per anchor / section), so
+            # naively processing every row would re-read and re-chunk the
+            # same file repeatedly. The first `name` we see becomes the
+            # page title; later rows for the same `path` are ignored.
+            seen_paths: dict[str, str] = {}  # rel -> first name
             for row in rows:
                 rel = row["path"]
                 if not rel:
                     continue
+                rel = rel.replace("\\", "/")
+                if rel in seen_paths:
+                    continue
+                seen_paths[rel] = (row[name_col] if name_col else None) or Path(rel).stem
+
+            log.info("zeal: %d unique pages after dedupe", len(seen_paths))
+
+            for rel, section in seen_paths.items():
                 page_path = self.pages_root / rel
                 if not page_path.is_file():
-                    # Many docsets use forward slashes even on Windows; normalize.
-                    page_path = self.pages_root / rel.replace("\\", "/")
-                    if not page_path.is_file():
-                        log.debug("missing page file: %s", page_path)
-                        continue
+                    log.debug("missing page file: %s", page_path)
+                    continue
                 try:
                     html = page_path.read_text(encoding="utf-8", errors="replace")
                 except OSError as e:
@@ -104,10 +115,11 @@ class ZealIngester(Ingester):
                 text = _html_to_text(html)
                 if not text.strip():
                     continue
-                section = (row[name_col] if name_col else page_path.stem) or page_path.stem
                 # Synthetic "path" so Chunk.source_path is meaningful.
-                synth_path = self.docset_root / page_path.name
-                # Delegate to chunk_whole_file for token-aware splitting.
+                # Bug #8 fix: use the FULL relative path (with subdirs),
+                # not just page_path.name — two pages named index.html in
+                # different subdirs used to collide on chunk_id.
+                synth_path = self.docset_root / rel
                 for c in chunk_whole_file(
                     path=synth_path,
                     text=text,
@@ -117,7 +129,6 @@ class ZealIngester(Ingester):
                     topic_resolver=lambda *_: topic,
                     doc_type="zeal",
                 ):
-                    # Override section to use the page title.
                     c.section = str(section)
                     yield c
 

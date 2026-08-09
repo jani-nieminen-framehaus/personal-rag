@@ -48,7 +48,11 @@ class QdrantStore:
 
     # -- collection management ------------------------------------------------
 
-    def ensure_collection(self, recreate: bool = False) -> None:
+    def ensure_collection(
+        self,
+        recreate: bool = False,
+        expected_dense_dim: int | None = None,
+    ) -> None:
         """Create the collection if missing. Idempotent.
 
         P0 schema:
@@ -57,6 +61,15 @@ class QdrantStore:
 
         Args:
             recreate: if True, drop and recreate (handy for dev wipes).
+            expected_dense_dim: when the collection already exists, this is
+                compared against the stored dense vector size. If they
+                differ (e.g. you swapped the embedding model in config.yaml
+                without `--recreate`), a clear ValueError is raised so you
+                don't get a confusing error from the first upsert.
+
+                Pass the embedder's `dim()` here. The pipeline does this
+                for you via `ingest()` — call this directly only if you're
+                building your own.
         """
         exists = self.client.collection_exists(self.collection)
         if exists and recreate:
@@ -64,19 +77,36 @@ class QdrantStore:
             self.client.delete_collection(self.collection)
             exists = False
         if not exists:
-            log.info("creating collection %s (dense_dim=%d)", self.collection, self.dense_dim)
+            dim = expected_dense_dim if expected_dense_dim is not None else self.dense_dim
+            log.info("creating collection %s (dense_dim=%d)", self.collection, dim)
             self.client.create_collection(
                 collection_name=self.collection,
                 vectors_config={
-                    "dense": VectorParams(size=self.dense_dim, distance=self.distance),
+                    "dense": VectorParams(size=dim, distance=self.distance),
                 },
                 # Placeholder so P1 can populate without schema change.
                 sparse_vectors_config={
                     "sparse": SparseVectorParams(modifier=Modifier.IDF),
                 },
             )
-        else:
-            log.info("collection %s already exists", self.collection)
+            return
+
+        log.info("collection %s already exists", self.collection)
+        # If the caller passed an expected dim, validate against the stored one.
+        # Bug #7 fix: previously we never checked, so swapping embedders
+        # without --recreate would fail at upsert time with a confusing
+        # Qdrant-side error.
+        if expected_dense_dim is not None:
+            info = self.client.get_collection(self.collection)
+            existing = info.config.params.vectors.get("dense")  # type: ignore[union-attr]
+            if existing is not None and existing.size != expected_dense_dim:
+                raise ValueError(
+                    f"collection {self.collection!r} has dense_dim={existing.size} "
+                    f"but the configured embedder produces dim={expected_dense_dim}. "
+                    f"Either change embedder.model in config.yaml to one that "
+                    f"matches {existing.size}, or run `rag ingest --recreate` "
+                    f"to drop and re-create the collection."
+                )
 
     def count(self) -> int:
         """Number of points currently in the collection."""
@@ -177,11 +207,22 @@ class QdrantStore:
 
         Used by `rag ingest` to support `ingest --replace <path>` in the future.
         For P0 the CLI doesn't expose it; it's here so the surface is complete.
+
+        Bug #6 fix: qdrant-client 1.x returns `status` as a string enum
+        ("completed"/"acknowledged"), so `int(result.status)` was raising
+        ValueError. We pre-count the points and return that count instead.
         """
-        result = self.client.delete(
+        flt = Filter(must=[models.FieldCondition(key="source_path", match=models.MatchValue(value=source_path))])
+        # Count the points that will be deleted (the delete response
+        # itself doesn't include a count).
+        count_result = self.client.count(
             collection_name=self.collection,
-            points_selector=models.FilterSelector(
-                filter=Filter(must=[models.FieldCondition(key="source_path", match=models.MatchValue(value=source_path))])
-            ),
+            count_filter=flt,
         )
-        return int(result.status or 0)  # type: ignore[attr-defined]
+        n = int(getattr(count_result, "count", 0) or 0)
+        if n > 0:
+            self.client.delete(
+                collection_name=self.collection,
+                points_selector=models.FilterSelector(filter=flt),
+            )
+        return n

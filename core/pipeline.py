@@ -142,7 +142,11 @@ def ingest(
         progress: optional callback(done, total). `total` is unknown up front
                   for streaming ingesters, so we pass done and -1.
     """
-    store.ensure_collection(recreate=recreate)
+    # Pass the embedder's dim so ensure_collection can validate the
+    # existing collection (or use the dim when creating a new one).
+    # Bug #7 fix: previously the store's config-only dim was used and
+    # the embedder's actual dim was never checked.
+    store.ensure_collection(recreate=recreate, expected_dense_dim=embedder.dim())
 
     # Buffer chunks for batched embedding. We pick the embedder's batch size
     # unless the caller overrides.
@@ -223,6 +227,10 @@ def ask(
             "topic": c.topic,
             "doc_type": c.doc_type,
             "score": round(score_by_id.get(c.chunk_id, 0.0), 4),
+            # Include the chunk text so the faithfulness proxy can measure
+            # answer↔source overlap. Previously this was missing and the
+            # proxy silently fell back to source_path (audit #5).
+            "text": c.text,
         }
         for i, c in enumerate(chunks)
     ]

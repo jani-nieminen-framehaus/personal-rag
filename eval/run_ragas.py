@@ -148,7 +148,10 @@ def run(
             "mrr": m,
         }
         if generator is not None:
-            f = faithfulness_proxy(result.answer, [c["source_path"] for c in result.citations])
+            # Bug #5 fix: pass chunk TEXT (not source_path) so the proxy
+            # measures actual answer↔content overlap. The previous code
+            # measured answer↔file_path overlap, which was meaningless.
+            f = faithfulness_proxy(result.answer, [c["text"] for c in result.citations])
             faithfulness_sum += f
             faithfulness_count += 1
             row["faithfulness_proxy"] = f

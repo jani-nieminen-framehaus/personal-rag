@@ -21,3 +21,4 @@ eval/runs/
 
 # Logs
 *.log
+.venv_tests/
