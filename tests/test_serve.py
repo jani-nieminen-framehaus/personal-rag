@@ -208,6 +208,116 @@ def test_rag_ps1_defaults_to_start_when_no_args():
     assert "cli.py') start" in content
 
 
+# -- /api/ingest (P2) -------------------------------------------------------
+
+def test_api_ingest_route_registered():
+    """The /api/ingest endpoint must exist (P2 GUI upload)."""
+    import serve
+    app = serve.app
+    paths = {getattr(r, "path", "") for r in app.routes}
+    assert "/api/ingest" in paths, f"/api/ingest missing; routes: {paths}"
+
+
+def test_api_ingest_rejects_empty_upload():
+    """POST /api/ingest with no files returns 400."""
+    from fastapi.testclient import TestClient
+    import serve
+    # Force the server into the "ready" state without loading the real
+    # ABCs (which would download models and take minutes).
+    serve.S.ready = True
+    try:
+        client = TestClient(serve.app)
+        # No files key at all.
+        r = client.post("/api/ingest", files=[])
+        # FastAPI returns 422 for missing required parameter; 400 for
+        # empty list. Either is acceptable for "no files".
+        assert r.status_code in (400, 422)
+    finally:
+        serve.S.ready = False
+
+
+def test_api_ingest_rejects_when_not_ready():
+    """POST /api/ingest returns 503 when the server hasn't finished startup."""
+    from fastapi.testclient import TestClient
+    import serve
+    # Make sure ready is False.
+    serve.S.ready = False
+    client = TestClient(serve.app)
+    # Use a dummy in-memory file; the ready check happens first.
+    r = client.post(
+        "/api/ingest",
+        files=[("files", ("test.md", b"# hello\nbody\n"))],
+    )
+    assert r.status_code == 503
+
+
+def test_api_ingest_handles_unsupported_extensions():
+    """Unsupported file types are reported in `skipped`, not in `files`."""
+    from fastapi.testclient import TestClient
+    import serve
+    serve.S.ready = True
+    class _NopEmbedder:
+        def dim(self): return 4
+        def embed(self, texts): return [[0.0] * 4 for _ in texts]
+        def embed_query(self, t): return [0.0] * 4
+        def embed_documents(self, texts): return [[0.0] * 4 for _ in texts]
+    class _NopStore:
+        collection = "test"
+        def ensure_collection(self, recreate=False, expected_dense_dim=None): pass
+        def upsert_chunks(self, chunks, vectors): return len(chunks)
+    try:
+        serve.S.embedder = _NopEmbedder()
+        serve.S.store = _NopStore()
+        client = TestClient(serve.app)
+        r = client.post(
+            "/api/ingest",
+            files=[("files", ("foo.txt", b"hi"))],  # not supported
+        )
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["ingested"] == 0
+        assert "foo.txt" in j["skipped"]
+        assert j["chunks"] == 0
+    finally:
+        serve.S.ready = False
+        serve.S.embedder = None
+        serve.S.store = None
+
+
+def test_api_ingest_uploads_markdown():
+    """A markdown upload should be accepted and 'ingested' via the nop store."""
+    from fastapi.testclient import TestClient
+    import serve
+    serve.S.ready = True
+    class _NopEmbedder:
+        def dim(self): return 4
+        def embed(self, texts): return [[0.0] * 4 for _ in texts]
+        def embed_query(self, t): return [0.0] * 4
+        def embed_documents(self, texts): return [[0.0] * 4 for _ in texts]
+    class _NopStore:
+        collection = "test"
+        def ensure_collection(self, recreate=False, expected_dense_dim=None): pass
+        def upsert_chunks(self, chunks, vectors): return len(chunks)
+    try:
+        serve.S.embedder = _NopEmbedder()
+        serve.S.store = _NopStore()
+        client = TestClient(serve.app)
+        r = client.post(
+            "/api/ingest",
+            files=[("files", ("notes.md", b"# Hello\nbody of the note\n"))],
+        )
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["ingested"] == 1
+        assert j["chunks"] >= 1
+        assert "notes.md" in j["files"]
+        assert "md" in j["types"]
+    finally:
+        serve.S.ready = False
+        serve.S.embedder = None
+        serve.S.store = None
+
+
 def test_static_dir_is_mounted():
     """The static dir must be served at /static/* (UI is there)."""
     import serve

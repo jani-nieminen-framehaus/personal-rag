@@ -15,20 +15,23 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import socket
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from core.pipeline import (
     ask as ask_pipeline,
+    ingest as ingest_pipeline,
     load_config,
     make_embedder,
     make_generator,
@@ -242,6 +245,124 @@ def api_eval():
     return metrics
 
 
+# -- /api/ingest ------------------------------------------------------------
+#
+# P2 GUI ingest: file upload from the browser, no terminal required.
+# Accepts one or more uploaded files (multipart/form-data), saves them
+# to a temp dir, and runs the appropriate ingester on the saved files.
+#
+# Supported types (detected by extension):
+#   .pdf       -> PdfDirIngester (per-page chunks)
+#   .md / .markdown / .py -> MarkdownDirIngester (heading/AST chunks)
+#
+# All chunks land in the same Qdrant collection, so PDFs and notes
+# coexist. Re-ingesting the same file is a no-op (deterministic
+# chunk_ids).
+
+@app.post("/api/ingest")
+async def api_ingest(files: list[UploadFile] = File(...)):
+    """Upload one or more files and ingest them into the index.
+
+    Returns {ingested: N, chunks: M, files: [name, ...], skipped: [...]}.
+    Skipped files are bad-extension / unreadable / not found.
+    """
+    if not S.ready:
+        raise HTTPException(503, "server not ready")
+    if not files:
+        raise HTTPException(400, "no files uploaded")
+
+    # Save the uploads to a temp dir, partitioned by type so the
+    # right ingester can pick each one up. Cleanup in finally.
+    work = Path(tempfile.mkdtemp(prefix="rag-ingest-"))
+    try:
+        saved: list[Path] = []
+        skipped: list[str] = []
+        for f in files:
+            name = Path(f.filename or "").name
+            if not name:
+                skipped.append("<empty>")
+                continue
+            ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
+            if ext not in {"pdf", "md", "markdown", "py"}:
+                skipped.append(name)
+                continue
+            # Bucket by extension so each ingester sees a clean dir.
+            bucket = work / ext
+            bucket.mkdir(exist_ok=True)
+            dst = bucket / name
+            try:
+                content = await f.read()
+                dst.write_bytes(content)
+                saved.append(dst)
+            except Exception as e:
+                log.warning("ingest: failed to save %s: %s", name, e)
+                skipped.append(name)
+
+        # Run the right ingester on each bucket.
+        chunking = (S.config or {}).get("chunking", {})
+        ing = (S.config or {}).get("ingest", {})
+        total = 0
+        ran_for: list[str] = []
+        for ext, ing_cls, doc_type in (
+            ("pdf", "PdfDirIngester", "pdf"),
+            ("md", "MarkdownDirIngester", "markdown"),
+            ("markdown", "MarkdownDirIngester", "markdown"),
+            ("py", "MarkdownDirIngester", "markdown"),
+        ):
+            bucket = work / ext
+            if not bucket.is_dir():
+                continue
+            files_here = list(bucket.iterdir())
+            if not files_here:
+                continue
+            ran_for.append(ext)
+            if ing_cls == "PdfDirIngester":
+                from ingest.pdf_dir import PdfDirIngester
+                inst = PdfDirIngester(
+                    path=str(bucket),
+                    target_tokens=chunking.get("target_tokens", 768),
+                    overlap_pct=chunking.get("overlap_pct", 12),
+                    min_chunk_tokens=chunking.get("min_chunk_tokens", 32),
+                    default_topic=ing.get("default_topic", "default"),
+                    max_chunks_per_doc=chunking.get("max_chunks_per_doc", 2000),
+                )
+            else:
+                from ingest.markdown_dir import MarkdownDirIngester
+                inst = MarkdownDirIngester(
+                    root=str(bucket),
+                    target_tokens=chunking.get("target_tokens", 768),
+                    overlap_pct=chunking.get("overlap_pct", 12),
+                    min_chunk_tokens=chunking.get("min_chunk_tokens", 32),
+                    default_topic=ing.get("default_topic", "default"),
+                    frontmatter_topic_key=ing.get("markdown", {}).get("frontmatter_topic_key", "topic"),
+                    max_chunks_per_doc=chunking.get("max_chunks_per_doc", 2000),
+                )
+            # Don't recreate the collection when called from the GUI -
+            # it might already hold the user's previous ingests.
+            try:
+                n = ingest_pipeline(
+                    inst, S.embedder, S.store,
+                    recreate=False, batch_size=None, metadata=S.metadata,
+                )
+                total += n
+            except Exception as e:
+                log.exception("ingest: %s ingester failed: %s", ext, e)
+                raise HTTPException(500, f"{ext} ingest failed: {e}")
+        return {
+            "ingested": len(saved),
+            "chunks": total,
+            "files": [p.name for p in saved],
+            "skipped": skipped,
+            "types": ran_for,
+        }
+    finally:
+        # Best-effort cleanup of the temp work dir.
+        try:
+            shutil.rmtree(work, ignore_errors=True)
+        except Exception:
+            pass
+
+
 # -- /api/topics ------------------------------------------------------------
 
 @app.get("/api/topics")
@@ -269,6 +390,45 @@ def api_topics():
         if offset is None:
             break
     return sorted(seen)
+
+
+# -- /api/library: sources / citations / eval-runs / stats (P2) ------------
+#
+# All four read from the metadata store. The GUI Library tab calls them
+# in parallel on tab activation. Each one returns [] (or a sensible empty
+# payload) when the metadata store is disabled or empty.
+
+def _ensure_metadata():
+    """Return the metadata store, or raise 503 if disabled."""
+    if not S.ready:
+        raise HTTPException(503, "server not ready")
+    if S.metadata is None:
+        raise HTTPException(503, "metadata store disabled in config.yaml")
+    return S.metadata
+
+
+@app.get("/api/sources")
+def api_sources(limit: int = 100):
+    md = _ensure_metadata()
+    return md.get_sources(limit=limit)
+
+
+@app.get("/api/citations")
+def api_citations(limit: int = 50, source_path: str | None = None):
+    md = _ensure_metadata()
+    return md.get_citations(limit=limit, source_path=source_path)
+
+
+@app.get("/api/eval-runs")
+def api_eval_runs(limit: int = 20):
+    md = _ensure_metadata()
+    return md.get_eval_runs(limit=limit)
+
+
+@app.get("/api/stats")
+def api_stats():
+    md = _ensure_metadata()
+    return md.get_stats()
 
 
 # -----------------------------------------------------------------------------

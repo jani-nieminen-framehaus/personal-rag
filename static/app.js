@@ -1,20 +1,23 @@
-// rag UI — vanilla JS, no framework. ~150 lines.
+// rag UI - vanilla JS, no framework.
+//
+// Tabs: Ask | Ingest | Library (P2).
+//   Ask:     chat-style ask with topic filter + inline [n] citations.
+//   Ingest:  file picker + drag-drop. Uploads to /api/ingest.
+//   Library: read-only view of sources / citations / eval runs / stats.
 
 const $ = (id) => document.getElementById(id);
-const chat = $("chat");
-const form = $("form");
-const queryInput = $("query");
-const topicSelect = $("topic");
-const statusDot = $("statusDot");
-const statusText = $("statusText");
-const evalPanel = $("evalPanel");
-const evalOutput = $("evalOutput");
 
-// -- markdown renderer (minimal, no deps) ----------------------------------
+// ---- state ----------------------------------------------------------------
+
+const state = {
+  files: [],            // queued File objects for ingest
+};
+
+// ---- markdown renderer (minimal, no deps) --------------------------------
 //
 // Handles: **bold**, *italic*, `code`, ```fenced```, bullet lists, [n]
 // citation markers (kept as anchors for click-to-source).
-// Doesn't try to be CommonMark — just good enough for the LLM's output.
+// Doesn't try to be CommonMark - just good enough for the LLM's output.
 
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({
@@ -23,34 +26,27 @@ function escapeHtml(s) {
 }
 
 function renderInline(s) {
-  // code first (so we don't bold inside code)
   s = s.replace(/`([^`]+)`/g, (_, code) => `<code>${escapeHtml(code)}</code>`);
-  // bold
   s = s.replace(/\*\*([^*]+)\*\*/g, (_, t) => `<strong>${t}</strong>`);
-  // italic
   s = s.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, (_, t) => `<em>${t}</em>`);
-  // citation marker [n] -> clickable anchor
   s = s.replace(/\[(\d+)\]/g, (_, n) => `<a class="cite" data-n="${n}" href="#cite-${n}">[${n}]</a>`);
   return s;
 }
 
 function renderMarkdown(text) {
-  // Split on fenced code blocks first.
   const parts = text.split(/(```[\s\S]*?```)/g);
   const out = [];
   for (const part of parts) {
     if (part.startsWith("```") && part.endsWith("```")) {
-      const inner = part.slice(3, -3).replace(/^.*\n/, "");  // drop language tag line
+      const inner = part.slice(3, -3).replace(/^.*\n/, "");
       out.push(`<pre><code>${escapeHtml(inner)}</code></pre>`);
     } else {
-      // paragraphs and bullet lists
       const lines = part.split("\n");
       let buf = [];
       let inList = false;
       const flush = () => {
         if (!buf.length) return;
-        const html = buf.join("<br>");
-        out.push(`<p>${renderInline(html)}</p>`);
+        out.push(`<p>${renderInline(buf.join("<br>"))}</p>`);
         buf = [];
       };
       for (const line of lines) {
@@ -70,7 +66,7 @@ function renderMarkdown(text) {
   return out.join("");
 }
 
-// -- chat state -----------------------------------------------------------
+// ---- chat -----------------------------------------------------------------
 
 function addMessage(role, bodyHtml, citations = []) {
   const div = document.createElement("div");
@@ -96,23 +92,12 @@ function addMessage(role, bodyHtml, citations = []) {
     }
     div.appendChild(list);
   }
-  // replace empty placeholder
-  const empty = chat.querySelector(".empty");
+  const empty = $("chat").querySelector(".empty");
   if (empty) empty.remove();
-  chat.appendChild(div);
-  chat.scrollTop = chat.scrollHeight;
+  $("chat").appendChild(div);
+  $("chat").scrollTop = $("chat").scrollHeight;
   return div;
 }
-
-function addError(msg) {
-  const div = document.createElement("div");
-  div.className = "error";
-  div.textContent = msg;
-  chat.appendChild(div);
-  chat.scrollTop = chat.scrollHeight;
-}
-
-// -- ask ------------------------------------------------------------------
 
 async function ask(query, topic) {
   const body = { query };
@@ -122,24 +107,20 @@ async function ask(query, topic) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`ask failed: ${res.status} ${t}`);
-  }
+  if (!res.ok) throw new Error(`ask failed: ${res.status} ${await res.text()}`);
   return res.json();
 }
 
-form.addEventListener("submit", async (e) => {
+$("form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const q = queryInput.value.trim();
+  const q = $("query").value.trim();
   if (!q) return;
   addMessage("user", escapeHtml(q));
-  queryInput.value = "";
-  const thinking = addMessage("assistant", '<span class="thinking">thinking…</span>');
+  $("query").value = "";
+  const thinking = addMessage("assistant", '<span class="thinking">thinking...</span>');
   try {
-    const result = await ask(q, topicSelect.value);
+    const result = await ask(q, $("topic").value);
     thinking.querySelector(".body").innerHTML = renderMarkdown(result.answer);
-    // attach citations to the same message
     const list = document.createElement("div");
     list.className = "cite-list";
     for (const c of result.citations) {
@@ -158,21 +139,21 @@ form.addEventListener("submit", async (e) => {
       list.appendChild(item);
     }
     thinking.appendChild(list);
-    chat.scrollTop = chat.scrollHeight;
+    $("chat").scrollTop = $("chat").scrollHeight;
   } catch (err) {
     thinking.querySelector(".body").innerHTML = `<span class="error">${escapeHtml(err.message)}</span>`;
   }
 });
 
-// -- clear / eval --------------------------------------------------------
-
 $("clearBtn").addEventListener("click", () => {
-  chat.innerHTML = '<div class="empty"><p>Ask a question. Citations will appear below the answer.</p></div>';
+  $("chat").innerHTML = '<div class="empty"><p>Ask a question. Citations will appear below the answer.</p></div>';
 });
 
+// ---- eval panel -----------------------------------------------------------
+
 $("evalBtn").addEventListener("click", async () => {
-  evalPanel.classList.remove("hidden");
-  evalOutput.textContent = "running…";
+  $("evalPanel").classList.remove("hidden");
+  $("evalOutput").textContent = "running...";
   try {
     const res = await fetch("/api/eval");
     if (!res.ok) throw new Error(`eval failed: ${res.status}`);
@@ -181,17 +162,253 @@ $("evalBtn").addEventListener("click", async () => {
     if (m.faithfulness_proxy !== undefined) out += `faithfulness  : ${m.faithfulness_proxy}\n`;
     out += `\nper-question (${m.n_questions}):\n`;
     for (const r of m.per_question) {
-      out += `  ${r.recall_at_5 >= 1 ? "✓" : r.recall_at_5 > 0 ? "·" : "✗"} ${r.question}\n`;
+      out += `  ${r.recall_at_5 >= 1 ? "OK" : r.recall_at_5 > 0 ? "~" : "X"} ${r.question}\n`;
     }
-    evalOutput.textContent = out;
+    $("evalOutput").textContent = out;
   } catch (err) {
-    evalOutput.textContent = `error: ${err.message}`;
+    $("evalOutput").textContent = `error: ${err.message}`;
   }
 });
 
-$("evalClose").addEventListener("click", () => evalPanel.classList.add("hidden"));
+$("evalClose").addEventListener("click", () => $("evalPanel").classList.add("hidden"));
 
-// -- health + topics on load ---------------------------------------------
+// ---- tabs (P2) ------------------------------------------------------------
+
+document.querySelectorAll(".tab").forEach((tab) => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+    tab.classList.add("active");
+    const target = tab.dataset.tab;
+    $(`tab-${target}`).classList.add("active");
+    if (target === "library") refreshLibrary();
+  });
+});
+
+// ---- ingest (P2) ----------------------------------------------------------
+
+const dropzone = $("dropzone");
+const filePicker = $("filePicker");
+const ingestList = $("ingestList");
+const ingestBtn = $("ingestBtn");
+const ingestClear = $("ingestClear");
+const ingestStatus = $("ingestStatus");
+const ingestResult = $("ingestResult");
+
+function humanSize(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function addFiles(files) {
+  // Filter to supported extensions.
+  const allowed = new Set([".pdf", ".md", ".markdown", ".py"]);
+  for (const f of files) {
+    const name = (f.name || "").toLowerCase();
+    const dot = name.lastIndexOf(".");
+    const ext = dot >= 0 ? name.slice(dot) : "";
+    if (!allowed.has(ext)) continue;
+    // De-dupe by name + size.
+    if (state.files.some((g) => g.name === f.name && g.size === f.size)) continue;
+    state.files.push(f);
+  }
+  renderIngestList();
+}
+
+function removeFile(idx) {
+  state.files.splice(idx, 1);
+  renderIngestList();
+}
+
+function renderIngestList() {
+  ingestList.innerHTML = "";
+  state.files.forEach((f, idx) => {
+    const row = document.createElement("div");
+    row.className = "ingest-item";
+    row.innerHTML = `
+      <span class="name">${escapeHtml(f.name)}</span>
+      <span class="size">${humanSize(f.size)}</span>
+      <button class="remove" title="remove">&times;</button>
+    `;
+    row.querySelector(".remove").addEventListener("click", () => removeFile(idx));
+    ingestList.appendChild(row);
+  });
+  ingestBtn.disabled = state.files.length === 0;
+  ingestClear.disabled = state.files.length === 0;
+  ingestStatus.textContent = state.files.length
+    ? `${state.files.length} file(s) queued`
+    : "";
+}
+
+function clearFiles() {
+  state.files = [];
+  ingestResult.className = "ingest-result";
+  ingestResult.textContent = "";
+  renderIngestList();
+}
+
+dropzone.addEventListener("click", () => filePicker.click());
+dropzone.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    filePicker.click();
+  }
+});
+filePicker.addEventListener("change", () => {
+  if (filePicker.files && filePicker.files.length) {
+    addFiles(Array.from(filePicker.files));
+    filePicker.value = "";  // allow re-picking the same file
+  }
+});
+["dragenter", "dragover"].forEach((evt) =>
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropzone.classList.add("dragover");
+  })
+);
+["dragleave", "drop"].forEach((evt) =>
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropzone.classList.remove("dragover");
+  })
+);
+dropzone.addEventListener("drop", (e) => {
+  if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+    addFiles(Array.from(e.dataTransfer.files));
+  }
+});
+
+ingestClear.addEventListener("click", clearFiles);
+
+ingestBtn.addEventListener("click", async () => {
+  if (state.files.length === 0) return;
+  ingestBtn.disabled = true;
+  ingestClear.disabled = true;
+  ingestStatus.textContent = "uploading + embedding (this may take a while)...";
+  ingestResult.className = "ingest-result";
+  ingestResult.textContent = "";
+  const fd = new FormData();
+  for (const f of state.files) fd.append("files", f, f.name);
+  try {
+    const res = await fetch("/api/ingest", { method: "POST", body: fd });
+    const j = await res.json();
+    if (!res.ok) {
+      ingestResult.className = "ingest-result err";
+      ingestResult.textContent = `error: ${j.detail || res.status}`;
+    } else {
+      ingestResult.className = "ingest-result ok";
+      const skipped = (j.skipped || []).length
+        ? `\nskipped (unsupported extension or read failure): ${(j.skipped || []).join(", ")}`
+        : "";
+      ingestResult.textContent =
+        `ingested ${j.ingested} file(s) -> ${j.chunks} chunk(s) in the index.\n` +
+        `types: ${(j.types || []).join(", ") || "-"}${skipped}`;
+      // Clear the queue on success.
+      state.files = [];
+      renderIngestList();
+      // Refresh topics so the Ask dropdown picks up new content.
+      loadTopics();
+    }
+  } catch (err) {
+    ingestResult.className = "ingest-result err";
+    ingestResult.textContent = `error: ${err.message}`;
+  } finally {
+    ingestBtn.disabled = state.files.length === 0;
+    ingestClear.disabled = state.files.length === 0;
+    ingestStatus.textContent = state.files.length
+      ? `${state.files.length} file(s) queued`
+      : "done";
+  }
+});
+
+// ---- library (P2) ---------------------------------------------------------
+
+async function refreshLibrary() {
+  $("libraryStats").textContent = "loading...";
+  $("librarySources").textContent = "loading...";
+  $("libraryCitations").textContent = "loading...";
+  $("libraryEval").textContent = "loading...";
+  try {
+    const [statsRes, sourcesRes, citationsRes, evalRes] = await Promise.all([
+      fetch("/api/stats").then((r) => r.ok ? r.json() : null),
+      fetch("/api/sources").then((r) => r.ok ? r.json() : []),
+      fetch("/api/citations").then((r) => r.ok ? r.json() : []),
+      fetch("/api/eval-runs").then((r) => r.ok ? r.json() : []),
+    ]);
+    renderStats(statsRes);
+    renderSources(sourcesRes);
+    renderCitations(citationsRes);
+    renderEvalRuns(evalRes);
+  } catch (err) {
+    $("libraryStats").textContent = `error: ${err.message}`;
+  }
+}
+
+function renderStats(s) {
+  if (!s) { $("libraryStats").textContent = "(no metadata DB)"; return; }
+  $("libraryStats").innerHTML =
+    `<span class="num">${s.total_sources ?? 0}</span> sources  ` +
+    `<span class="num">${s.total_citations ?? 0}</span> citations  ` +
+    `<span class="num">${s.total_eval_runs ?? 0}</span> eval runs`;
+}
+
+function renderSources(rows) {
+  if (!rows.length) {
+    $("librarySources").innerHTML = '<div class="library-row empty">(no sources yet)</div>';
+    return;
+  }
+  $("librarySources").innerHTML = rows.map((r) => {
+    const ts = (r.ingested_at || "").replace("T", " ").slice(0, 19);
+    const topic = r.topic || "-";
+    return `<div class="library-row">
+      <span class="ts">${escapeHtml(ts)}</span>
+      <span class="topic">${escapeHtml(topic)}</span>
+      <span>chunks=${r.chunk_count}</span>
+      <span>${escapeHtml(r.source_path)}</span>
+    </div>`;
+  }).join("");
+}
+
+function renderCitations(rows) {
+  if (!rows.length) {
+    $("libraryCitations").innerHTML = '<div class="library-row empty">(no citations yet)</div>';
+    return;
+  }
+  $("libraryCitations").innerHTML = rows.map((r) => {
+    const ts = (r.asked_at || "").replace("T", " ").slice(0, 19);
+    const q = r.query || "";
+    const qShort = q.length > 50 ? q.slice(0, 47) + "..." : q;
+    return `<div class="library-row">
+      <span class="ts">${escapeHtml(ts)}</span>
+      <span>rank=${r.rank}</span>
+      <span>chunk=${(r.chunk_id || "").slice(0, 8)}</span>
+      <span>q=${escapeHtml(qShort)}</span>
+    </div>`;
+  }).join("");
+}
+
+function renderEvalRuns(rows) {
+  if (!rows.length) {
+    $("libraryEval").innerHTML = '<div class="library-row empty">(no eval runs yet)</div>';
+    return;
+  }
+  $("libraryEval").innerHTML = rows.map((r) => {
+    const ts = (r.ran_at || "").replace("T", " ").slice(0, 19);
+    const rd = r.recall_at_dense != null ? ` recall@dense=${r.recall_at_dense}` : "";
+    return `<div class="library-row">
+      <span class="ts">${escapeHtml(ts)}</span>
+      <span>n=${r.n_questions}</span>
+      <span>recall@5=${r.recall_at_5}</span>
+      <span>mrr=${r.mrr}</span>
+      <span>${rd}</span>
+    </div>`;
+  }).join("");
+}
+
+// ---- health + topics on load ---------------------------------------------
 
 async function checkHealth() {
   try {
@@ -199,15 +416,15 @@ async function checkHealth() {
     if (!res.ok) throw new Error("not ready");
     const j = await res.json();
     if (j.ready) {
-      statusDot.className = "status-dot ready";
-      statusText.textContent = `ready · ${j.url}`;
+      $("statusDot").className = "status-dot ready";
+      $("statusText").textContent = `ready - ${j.url}`;
     } else {
-      statusDot.className = "status-dot error";
-      statusText.textContent = "not ready";
+      $("statusDot").className = "status-dot error";
+      $("statusText").textContent = "not ready";
     }
   } catch {
-    statusDot.className = "status-dot error";
-    statusText.textContent = "server unreachable";
+    $("statusDot").className = "status-dot error";
+    $("statusText").textContent = "server unreachable";
   }
 }
 
@@ -216,15 +433,18 @@ async function loadTopics() {
     const res = await fetch("/api/topics");
     if (!res.ok) return;
     const topics = await res.json();
+    const sel = $("topic");
+    // Wipe any existing options except the "all" placeholder.
+    while (sel.options.length > 1) sel.remove(1);
     for (const t of topics) {
       const opt = document.createElement("option");
       opt.value = t;
       opt.textContent = t;
-      topicSelect.appendChild(opt);
+      sel.appendChild(opt);
     }
-  } catch { /* fine — no topics if collection is empty */ }
+  } catch { /* fine - no topics if collection is empty */ }
 }
 
 checkHealth();
 loadTopics();
-setInterval(checkHealth, 30_000);  // refresh status every 30s
+setInterval(checkHealth, 30000);
