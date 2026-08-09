@@ -60,7 +60,7 @@
                                    │ top-5
                                    ▼
                             ┌──────────────┐
-                            │  Generator   │   qwen3:35b-a3b via
+                            │  Generator   │   qwen3:30b-a3b via
                             │  prompt+[n]  │   Ollama OpenAI endpoint
                             └──────┬───────┘
                                    │ answer + [n] → footer citation list
@@ -158,7 +158,7 @@ Three services, all on the Windows host. No WSL2, no Docker Desktop.
 
 ```powershell
 # 1. Ollama (Windows installer from ollama.com/download)
-ollama pull qwen3:35b-a3b
+ollama pull qwen3:30b-a3b
 
 # 2. Qdrant — Windows binary, no Docker
 Invoke-WebRequest -Uri "https://github.com/qdrant/qdrant/releases/latest/download/qdrant-x86_64-pc-windows-msvc.zip" -OutFile "$env:TEMP\qdrant.zip"
@@ -174,7 +174,7 @@ pip install -r requirements.txt
 
 ## 8. Verification checklist (preview — full version at end of build)
 
-1. `ollama list` shows `qwen3:35b-a3b`.
+1. `ollama list` shows `qwen3:30b-a3b`.
 2. `curl http://localhost:6333/collections` returns `{"result":{"collections":[]}}`.
 3. `python cli.py ingest --markdown ./samples` creates chunks, no errors.
 4. `python cli.py ask "What is exposure compensation?"` returns answer with `[n]` markers and a footer.

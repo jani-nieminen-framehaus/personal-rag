@@ -40,7 +40,7 @@ Design notes in [`PLAN.md`](./PLAN.md).
 
 ```powershell
 # 1. Ollama (generator) — install from https://ollama.com/download
-ollama pull qwen3:35b-a3b                       # ~20 GB one-time
+ollama pull qwen3:30b-a3b                       # ~20 GB one-time
 
 # 2. Qdrant (vector store) — see full setup for the two install options
 #    Quick path: download the Windows binary, run it, leave it on :6333
@@ -79,7 +79,7 @@ The Windows installer handles GPU passthrough correctly on your 48 GB rig.
 ```powershell
 # download from https://ollama.com/download (Windows installer)
 # then in a normal terminal:
-ollama pull qwen3:35b-a3b        # ~20 GB, one-time
+ollama pull qwen3:30b-a3b        # ~20 GB, one-time
 ollama list                       # confirm it's there
 ```
 
@@ -460,8 +460,8 @@ python --version                           # → Python 3.11.x or 3.12.x
 python -c "import torch, transformers, sentence_transformers, qdrant_client, openai, yaml; print('deps ok')"
 
 # 3. Ollama is running with the generator model
-ollama list                                 # → qwen3:35b-a3b  present
-curl http://localhost:11434/api/tags        # → JSON listing qwen3:35b-a3b
+ollama list                                 # → qwen3:30b-a3b  present
+curl http://localhost:11434/api/tags        # → JSON listing qwen3:30b-a3b
 
 # 4. Qdrant is up and reachable
 curl http://localhost:6333/collections      # → {"result":{"collections":[]}}
@@ -519,7 +519,7 @@ rag url                                # → http://localhost:8420
 | --- | --- |
 | `bitsandbytes` install fails on Windows | Set `embedder.quant: none` in `config.yaml` (uses fp16 — adds ~10 GB VRAM but no bitsandbytes dep). |
 | `OSError: libcudart.so not found` | CUDA toolkit missing. Install CUDA 12.x runtime, or set `embedder.device: cpu` (slow but works). |
-| `qwen3:35b-a3b` not found by Ollama | `ollama pull qwen3:35b-a3b` — it's a MoE so the pull is large but inference is fast. |
+| `qwen3:30b-a3b` not found by Ollama | `ollama pull qwen3:30b-a3b` — it's a MoE so the pull is large but inference is fast. |
 | `Qdrant connection refused` | Check that `qdrant.exe` is running (or `docker ps` if you used the Docker option). Service should listen on `localhost:6333`. |
 | `UnicodeDecodeError` when ingesting | All file IO uses `encoding="utf-8"` already. If you see this, the source file isn't UTF-8 — convert with `iconv` or save-as UTF-8 in your editor. |
 | Eval recall@5 is 0 for every question | Your collection is empty — run `python cli.py ingest --markdown .\samples\notes` first. |

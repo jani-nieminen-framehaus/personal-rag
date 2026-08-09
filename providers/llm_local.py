@@ -8,7 +8,7 @@ later point at LiteLLM, vLLM, an OpenAI-compatible cloud API, etc.
 Config (config.yaml → generator):
     base_url: http://localhost:11434/v1
     api_key:  ollama                # any string; Ollama ignores it
-    model:    qwen3:35b-a3b
+    model:    qwen3:30b-a3b
     system_prompt: ...
     temperature, max_tokens, timeout_s
 """
@@ -35,7 +35,7 @@ class LocalGenerator(Generator):
         self,
         base_url: str = "http://localhost:11434/v1",
         api_key: str = "ollama",
-        model: str = "qwen3:35b-a3b",
+        model: str = "qwen3:30b-a3b",
         temperature: float = 0.2,
         max_tokens: int = 1024,
         timeout_s: int = 120,

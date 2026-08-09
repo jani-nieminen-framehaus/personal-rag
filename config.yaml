@@ -42,13 +42,13 @@ reranker:
   top_k: 5                        # final count sent to the generator
 
 # ---- Generator ---------------------------------------------------------------
-# P0 default: qwen3:35b-a3b via Ollama's OpenAI-compatible endpoint.
-# The 35B-A3B is a MoE (3B active) — fast + strong, fits in ~20GB VRAM.
+# P0 default: qwen3:30b-a3b via Ollama's OpenAI-compatible endpoint.
+# The 30B-A3B is a MoE (3B active) — fast + strong, fits in ~20GB VRAM.
 generator:
   class: providers.llm_local.LocalGenerator
   base_url: http://localhost:11434/v1
   api_key: ollama                 # any string; Ollama ignores it
-  model: qwen3:35b-a3b
+  model: qwen3:30b-a3b
   temperature: 0.2
   max_tokens: 1024
   timeout_s: 120
