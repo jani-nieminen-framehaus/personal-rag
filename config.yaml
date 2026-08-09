@@ -100,6 +100,13 @@ ingest:
     # Standard Dash-compatible docsets (Zeal uses the same schema).
     sqlite_filename: docSet.dsidx
     pages_dirname: Contents/Resources/Documents
+  pdf:
+    # PDFs have no frontmatter; topic comes from the parent dir name.
+    # The chunker shares target/overlap/min_chunk_tokens with markdown.
+    # Per-page chunks; pages with no text layer are skipped (with a
+    # debug log) so scanned PDFs need OCR which is out of P1 scope.
+    # Example: rag ingest --pdf D:\Library\Photography
+    #          rag ingest --pdf D:\Books\mybook.pdf
 
 # ---- Pipeline ----------------------------------------------------------------
 pipeline:

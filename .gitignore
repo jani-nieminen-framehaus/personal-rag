@@ -22,3 +22,7 @@ eval/runs/
 # Logs
 *.log
 .venv_tests/
+
+# Metadata store (runtime artifact; recreate via `rag ingest` / `rag ask`)
+metadata.sqlite3*
+

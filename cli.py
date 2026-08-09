@@ -33,6 +33,7 @@ from core.pipeline import (
 from core.metadata import MetadataStore
 from ingest.markdown_dir import MarkdownDirIngester
 from ingest.zeal_docsets import ZealIngester
+from ingest.pdf_dir import PdfDirIngester
 
 
 # Persistent service state for the GUI. Lives in the user's home so
@@ -124,13 +125,14 @@ def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json):
 @cli.command()
 @click.option("--markdown", "markdown_path", default=None, help="Directory of .md files to ingest.")
 @click.option("--zeal", "zeal_path", default=None, help="Path to a .docset directory.")
+@click.option("--pdf", "pdf_path", default=None, help="Path to a single .pdf file OR a directory of PDFs.")
 @click.option("--recreate", is_flag=True, help="Drop and recreate the collection before ingest.")
 @click.option("--batch-size", default=None, type=int, help="Override embedder batch size.")
 @click.pass_context
-def ingest(ctx, markdown_path, zeal_path, recreate, batch_size):
-    """Ingest Markdown notes and/or Zeal docsets into the index."""
-    if not markdown_path and not zeal_path:
-        raise click.UsageError("pass at least one of --markdown or --zeal")
+def ingest(ctx, markdown_path, zeal_path, pdf_path, recreate, batch_size):
+    """Ingest Markdown notes, Zeal docsets, and/or PDFs into the index."""
+    if not (markdown_path or zeal_path or pdf_path):
+        raise click.UsageError("pass at least one of --markdown, --zeal, or --pdf")
 
     cfg = ctx.obj["config"]
     ch = cfg.get("chunking", {})
@@ -173,6 +175,25 @@ def ingest(ctx, markdown_path, zeal_path, recreate, batch_size):
         total += ingest_pipeline(
             zi, embedder, store,
             recreate=False, batch_size=batch_size, metadata=metadata,
+        )
+
+    if pdf_path:
+        pi = PdfDirIngester(
+            path=pdf_path,
+            target_tokens=ch.get("target_tokens", 768),
+            overlap_pct=ch.get("overlap_pct", 12),
+            min_chunk_tokens=ch.get("min_chunk_tokens", 32),
+            default_topic=ing.get("default_topic", "default"),
+            max_chunks_per_doc=ch.get("max_chunks_per_doc", 2000),
+        )
+        click.echo(f"ingesting PDF from {pdf_path} …")
+        # If this is the only source, --recreate is honored. If the
+        # user chained with --markdown / --zeal, the collection
+        # already exists and recreating would wipe their work.
+        rec = recreate if not (markdown_path or zeal_path) else False
+        total += ingest_pipeline(
+            pi, embedder, store,
+            recreate=rec, batch_size=batch_size, metadata=metadata,
         )
 
     if metadata is not None:
