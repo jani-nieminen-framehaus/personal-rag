@@ -15,8 +15,8 @@ model can be extended from 4k to 64k–128k context with minimal
 fine-tuning [1][2].
 
 --- citations ---
-1. samples/notes/ml/yarn.md :: YaRN — Yet another RoPE extensioN  (topic=ml, score=0.871, chunk=ff92cf24…)
-2. samples/notes/ml/yarn.md :: The idea  (topic=ml, score=0.843, chunk=fb22cef3…)
+1. samples/notes/ml/yarn.md :: YaRN — Yet another RoPE extensioN  (topic=ml, score=0.871, chunk=b6a5ab0b…)
+2. samples/notes/ml/yarn.md :: The idea  (topic=ml, score=0.843, chunk=079aa336…)
 ```
 
 ---

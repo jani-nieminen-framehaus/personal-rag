@@ -1,0 +1,9 @@
+{"question": "What was YaRN about?", "topic": "ml", "relevant": [{"path": "ml/yarn.md", "section": "YaRN — Yet another RoPE extensioN"}, {"path": "ml/yarn.md", "section": "The idea"}]}
+{"question": "Why does naive position interpolation hurt short-context perplexity?", "topic": "ml", "relevant": [{"path": "ml/yarn.md", "section": "The problem"}]}
+{"question": "How does QLoRA make 4-bit finetuning work?", "topic": "ml", "relevant": [{"path": "ml/qLoRA.md", "section": "QLoRA"}, {"path": "ml/qLoRA.md", "section": "The trick"}]}
+{"question": "When should I reach for QLoRA instead of full finetuning?", "topic": "ml", "relevant": [{"path": "ml/qLoRA.md", "section": "When to use it"}]}
+{"question": "What is exposure compensation and when do I use it?", "topic": "photography", "relevant": [{"path": "photography/exposure.md", "section": "Exposure"}, {"path": "photography/exposure.md", "section": "Exposure compensation"}]}
+{"question": "When should I switch to spot metering?", "topic": "photography", "relevant": [{"path": "photography/exposure.md", "section": "Metering modes"}]}
+{"question": "How do I keep ISO low when shooting in low light?", "topic": "photography", "relevant": [{"path": "photography/exposure.md", "section": "Low light"}]}
+{"question": "What's the morning routine for a solo photographer?", "topic": "operations", "relevant": [{"path": "operations/daily_rituals.md", "section": "Before the day starts"}]}
+{"question": "How do I open a SQLite connection in my Python pipeline?", "topic": "code", "relevant": [{"path": "code/framehaus_pipeline.py", "section": "function connect"}]}

@@ -23,14 +23,27 @@ CHUNK_NS = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
 
 def make_chunk_id(source_path: str, section: str, index: int) -> str:
-    """Deterministic chunk id. Same inputs → same id, forever."""
-    key = f"{source_path}::{section}::{index}"
+    """Deterministic chunk id. Same inputs → same id, forever.
+
+    The source_path is normalized to forward slashes internally so the
+    same logical file hashes to the same id regardless of:
+      - where the repo is cloned (absolute vs relative)
+      - Windows vs Unix path separators
+    The caller should still pass the ROOT-RELATIVE path (so two repos
+    with different roots don't collide) — this normalization is just
+    defensive against slash-style differences.
+    """
+    norm = source_path.replace("\\", "/")
+    key = f"{norm}::{section}::{index}"
     return str(uuid.uuid5(CHUNK_NS, key))
 
 
 def make_parent_id(source_path: str) -> str:
-    """Deterministic doc-level id, one per source file."""
-    return str(uuid.uuid5(CHUNK_NS, f"parent::{source_path}"))
+    """Deterministic doc-level id, one per source file.
+
+    Same normalization rules as make_chunk_id."""
+    norm = source_path.replace("\\", "/")
+    return str(uuid.uuid5(CHUNK_NS, f"parent::{norm}"))
 
 
 # -----------------------------------------------------------------------------

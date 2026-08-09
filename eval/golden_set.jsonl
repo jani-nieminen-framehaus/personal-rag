@@ -1,9 +1,9 @@
-{"question": "What was YaRN about?", "relevant_chunk_ids": ["ff92cf24-a1f3-5b6e-88fd-45b11b6e4a12", "fb22cef3-924c-5920-8024-54f463f13557"], "topic": "ml"}
-{"question": "Why does naive position interpolation hurt short-context perplexity?", "relevant_chunk_ids": ["6322fdb7-a854-556a-ab50-acdd4d90c5b1"], "topic": "ml"}
-{"question": "How does QLoRA make 4-bit finetuning work?", "relevant_chunk_ids": ["5a68db04-b022-5ca1-b63e-430817c8c7d2", "e676d8f2-6b78-53c4-b539-5cae8678170b"], "topic": "ml"}
-{"question": "When should I reach for QLoRA instead of full finetuning?", "relevant_chunk_ids": ["e858615d-6db9-51c9-9cd2-d3b0e053bc3d"], "topic": "ml"}
-{"question": "What is exposure compensation and when do I use it?", "relevant_chunk_ids": ["97809ebe-639f-576f-aa17-668b17ed55df", "4b1fd8c8-cc81-594b-8e01-59c5141baffc"], "topic": "photography"}
-{"question": "When should I switch to spot metering?", "relevant_chunk_ids": ["a0a61042-899e-5b79-85b8-e5b95c6ea313"], "topic": "photography"}
-{"question": "How do I keep ISO low when shooting in low light?", "relevant_chunk_ids": ["af700a71-50f2-545e-b92b-2a7dac9dc4df"], "topic": "photography"}
-{"question": "What's the morning routine for a solo photographer?", "relevant_chunk_ids": ["84b6e052-dca9-5c03-8ffe-fcbbf9c270b0"], "topic": "operations"}
-{"question": "How do I open a SQLite connection in my Python pipeline?", "relevant_chunk_ids": ["b8cf0d82-e504-571e-9c42-cf3f49a8d1e5"], "topic": "code"}
+{"question": "What was YaRN about?", "relevant_chunk_ids": ["b6a5ab0b-f9d3-5368-a04d-a1f82858dbb6", "079aa336-3534-5cb7-9cd2-5aa2beb3aba1"], "topic": "ml"}
+{"question": "Why does naive position interpolation hurt short-context perplexity?", "relevant_chunk_ids": ["fed7e9b1-73b5-5bd5-a2f2-d8bfbc0f35e2"], "topic": "ml"}
+{"question": "How does QLoRA make 4-bit finetuning work?", "relevant_chunk_ids": ["754f66c4-e07c-5cbf-9fc3-84a071405d62", "979e7d3c-3d1a-5659-8a0f-59eeec7df25e"], "topic": "ml"}
+{"question": "When should I reach for QLoRA instead of full finetuning?", "relevant_chunk_ids": ["1bfa44ef-7f33-562d-af30-65b6ed9bb4ab"], "topic": "ml"}
+{"question": "What is exposure compensation and when do I use it?", "relevant_chunk_ids": ["7d8d24ef-3bc3-5287-b868-8cffe8ef57fe", "61e43634-5b4e-5281-bb53-0551ef794c3d"], "topic": "photography"}
+{"question": "When should I switch to spot metering?", "relevant_chunk_ids": ["608c1b5d-b9e1-52ea-aab7-be50a1afd1d4"], "topic": "photography"}
+{"question": "How do I keep ISO low when shooting in low light?", "relevant_chunk_ids": ["d13ce87d-647d-5825-ab1c-f13ee58192c3"], "topic": "photography"}
+{"question": "What's the morning routine for a solo photographer?", "relevant_chunk_ids": ["5b9b47ec-96fa-58e9-bf5a-9fc66a63f74c"], "topic": "operations"}
+{"question": "How do I open a SQLite connection in my Python pipeline?", "relevant_chunk_ids": ["693c2b17-98b8-5f73-bf79-78d6c712c308"], "topic": "code"}

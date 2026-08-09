@@ -61,6 +61,15 @@ class MarkdownDirIngester(Ingester):
         files = sorted(self._walk())
         log.info("markdown: found %d files under %s", len(files), self.root)
         for path in files:
+            # Root-relative, forward-slash path. Used for chunk_id so the
+            # same logical file hashes to the same id regardless of where
+            # the repo is cloned. Bug #1 from the audit.
+            try:
+                id_path = path.relative_to(self.root).as_posix()
+            except ValueError:
+                # File is outside the ingester root (shouldn't happen, but
+                # fall back to the absolute path rather than crash).
+                id_path = str(path)
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError as e:
@@ -74,6 +83,7 @@ class MarkdownDirIngester(Ingester):
                     overlap_pct=self.overlap_pct,
                     min_size=self.min_chunk_tokens,
                     topic_resolver=self._resolve_topic,
+                    id_path=id_path,
                 )
             except Exception as e:
                 log.warning("chunking failed for %s: %s — skipping", path, e)
@@ -106,12 +116,16 @@ class MarkdownDirIngester(Ingester):
         fm_topic = frontmatter.get(self.frontmatter_topic_key) if frontmatter else None
         if isinstance(fm_topic, str) and fm_topic.strip():
             return fm_topic.strip().lower()
-        # 2. Parent directory name (relative to ingester root).
+        # 2. IMMEDIATE parent directory name (relative to ingester root).
+        #    Bug #4 from the audit: previously this used parts[0] which
+        #    returned the top-level directory under the ingester root, not
+        #    the file's actual parent. With the old code, samples/notes/code/
+        #    foo.py resolved to topic "notes" instead of "code".
         try:
             rel = path.relative_to(self.root)
             parts = rel.parts
             if len(parts) >= 2:
-                return parts[0].lower()
+                return parts[-2].lower()
         except ValueError:
             pass
         # 3. Default.
