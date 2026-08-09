@@ -359,6 +359,13 @@ def url():
     click.echo(state["url"])
 
 
+@cli.command()
+def tray():
+    """Run the Windows system tray icon. Left-click opens the GUI."""
+    import tray
+    tray.run()
+
+
 # -----------------------------------------------------------------------------
 # main
 # -----------------------------------------------------------------------------
