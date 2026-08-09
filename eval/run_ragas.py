@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -200,6 +201,13 @@ def run(
 # -----------------------------------------------------------------------------
 
 def print_report(metrics: dict[str, Any]) -> None:
+    # Windows console defaults to cp1252 which can't encode the
+    # check/cross marks below. Reconfigure stdout to UTF-8 if we
+    # can (3.7+); older Pythons would just need `chcp 65001`.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
     print("=" * 60)
     print(f"  RAG eval — {metrics['n_questions']} questions")
     print("=" * 60)

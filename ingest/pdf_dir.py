@@ -114,9 +114,11 @@ class PdfDirIngester(Ingester):
 
     def _iter_one_pdf(self, file: Path) -> Iterator[Chunk]:
         # pymupdf is imported lazily so the rest of the system can
-        # run on a machine that doesn't have it installed.
+        # run on a machine that doesn't have it installed. Modern
+        # pymupdf prefers the `pymupdf` name; the legacy `fitz` shim
+        # still works but emits a deprecation warning.
         try:
-            import fitz  # type: ignore[import-not-found]
+            import pymupdf  # type: ignore[import-not-found]
         except ImportError as e:
             raise RuntimeError(
                 "pymupdf is not installed. Run `pip install pymupdf` to enable PDF ingest."
@@ -135,7 +137,7 @@ class PdfDirIngester(Ingester):
         topic = self._resolve_topic(file)
         parent_id = make_parent_id(id_path)
 
-        doc = fitz.open(str(file))
+        doc = pymupdf.open(str(file))
         try:
             chunk_index = 0
             page_count = len(doc)
