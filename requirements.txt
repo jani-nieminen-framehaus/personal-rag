@@ -13,6 +13,11 @@ click>=8.1.7,<9
 # --- LLM (Ollama via OpenAI-compatible endpoint) ---
 openai>=1.40.0,<2
 
+# --- GUI server (FastAPI, P1) ---
+fastapi>=0.110.0,<1
+uvicorn[standard]>=0.27.0,<1
+python-multipart>=0.0.9,<1
+
 # --- Vector store ---
 qdrant-client>=1.10.0,<2
 

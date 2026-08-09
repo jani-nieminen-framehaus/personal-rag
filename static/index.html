@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rag</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>rag</h1>
+      <div class="status-row">
+        <span class="status-dot" id="statusDot"></span>
+        <span class="status-text" id="statusText">checking...</span>
+        <span class="spacer"></span>
+        <button id="evalBtn" class="ghost">run eval</button>
+        <button id="clearBtn" class="ghost">clear</button>
+      </div>
+    </header>
+
+    <main>
+      <div class="chat" id="chat">
+        <div class="empty">
+          <p>Ask a question. Citations will appear below the answer.</p>
+          <p class="hint">Try: <code>What was YaRN about?</code> or <code>How do I keep ISO low in low light?</code></p>
+        </div>
+      </div>
+
+      <form id="form" autocomplete="off">
+        <select id="topic" title="Filter by topic">
+          <option value="">all topics</option>
+        </select>
+        <input type="text" id="query" placeholder="Ask the rag..." autofocus>
+        <button type="submit">ask</button>
+      </form>
+    </main>
+
+    <div id="evalPanel" class="eval-panel hidden">
+      <h2>eval</h2>
+      <pre id="evalOutput">loading...</pre>
+      <button id="evalClose" class="ghost">close</button>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

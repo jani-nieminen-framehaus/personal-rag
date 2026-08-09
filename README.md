@@ -381,6 +381,73 @@ is open; see the question at the end of the install.
 
 ---
 
+## GUI server (P1)
+
+A small browser-based UI on top of the same pipeline. Bound to a
+persistent port (8420) so you always know where to find it. The CLI
+commands work exactly the same — the GUI is just another surface
+over the same `ask` / `ingest` / `eval` pipeline.
+
+```powershell
+# Start the server (foreground, blocking)
+rag serve
+# → http://localhost:8420
+
+# Or in another shell, query the running server
+rag status                 # URL, PID, started_at
+rag url                    # just the URL (for piping)
+```
+
+### Auto-launch on logon (the whole point)
+
+The first time, run `install-service.ps1` once and forget about it. After
+that, every time you log in to Windows, the rag GUI starts in the
+background on port 8420.
+
+```powershell
+# Run ONCE to set up the auto-launch (Task Scheduler task)
+.\scripts\install-service.ps1
+
+# Or from anywhere:
+powershell -ExecutionPolicy Bypass -File D:\Tinkering sideprojects\rag\scripts\install-service.ps1
+
+# To remove the auto-launch:
+.\scripts\uninstall-service.ps1
+```
+
+The task triggers at user logon (15s delay, so Ollama + Qdrant have
+time to be reachable), restarts on failure up to 3 times, and runs
+in the interactive session so your browser can open `localhost:8420`.
+
+### What the UI looks like
+
+- **Chat input + topic filter** at the bottom; type a question, hit `ask`.
+- **Answer** appears with `[1] [2]` clickable markers that scroll to the
+  citation in the list below.
+- **Citation list** per answer: source path, section, score, and the
+  full chunk text (click to expand).
+- **run eval** button (top right) opens a side panel with the current
+  recall@5 / MRR / per-question breakdown.
+- **No framework** — vanilla HTML + CSS + a small JS file. ~250 lines total.
+
+### Files
+
+```
+serve.py                  FastAPI app: /api/ask, /api/eval, /api/health, /api/topics
+static/index.html         the chat UI
+static/style.css          dark theme, terminal-adjacent
+static/app.js             vanilla JS, minimal markdown renderer
+scripts/install-service.ps1    Task Scheduler setup
+scripts/uninstall-service.ps1  Task Scheduler removal
+```
+
+The service state lives at `%USERPROFILE%\.rag\state.json` (port, pid,
+started_at, url). The server writes it on startup and clears it on
+clean shutdown, so `rag status` and `rag url` can find the running
+server from any shell.
+
+---
+
 ## Verification checklist (line by line)
 
 Run from `D:\Tinkering sideprojects\rag` with the venv active.
@@ -432,6 +499,16 @@ python cli.py ingest --markdown .\samples
 
 # 12. Swap the embedder in config.yaml to a different model, re-ingest, re-eval
 #     → confirms model swap is config-only
+
+# 13. GUI server (P1)
+python cli.py serve                     # foreground; visit http://localhost:8420
+# in another shell:
+rag status                             # → running, url=http://localhost:8420
+rag url                                # → http://localhost:8420
+# Auto-launch on logon (one-time):
+.\scripts\install-service.ps1
+# After logging out + back in: rag status should still show running
+# To remove: .\scripts\uninstall-service.ps1
 ```
 
 ---

@@ -32,6 +32,14 @@ from ingest.markdown_dir import MarkdownDirIngester
 from ingest.zeal_docsets import ZealIngester
 
 
+# Persistent service state for the GUI. Lives in the user's home so
+# `rag status` works from any CWD. The server writes this on startup,
+# clears it on clean shutdown. PIDs guard against stale state during
+# restarts — we only clear on exit if the PID in the file is ours.
+SERVICE_STATE_DIR = Path.home() / ".rag"
+SERVICE_STATE_FILE = SERVICE_STATE_DIR / "state.json"
+
+
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -226,6 +234,119 @@ def eval(ctx, golden, as_json, with_faithfulness):
         click.echo(json.dumps(metrics, indent=2))
     else:
         run_ragas.print_report(metrics)
+
+
+# -----------------------------------------------------------------------------
+# rag serve / rag status / rag url
+# -----------------------------------------------------------------------------
+#
+# P1 GUI: the server runs as a long-lived process on a persistent port
+# (default 8420). It writes its PID + URL to ~/.rag/state.json on
+# startup so `rag status` and `rag url` can find it from any shell.
+# The Task Scheduler task (created by scripts/install-service.ps1)
+# starts the server at user logon.
+
+def _read_service_state() -> dict | None:
+    """Read the service state file. Returns None if absent or invalid."""
+    if not SERVICE_STATE_FILE.is_file():
+        return None
+    try:
+        return json.loads(SERVICE_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort check: is the given PID still running on this host?
+
+    On Windows, `os.kill(pid, 0)` raises ValueError (the signal-0 trick
+    is a Unix idiom). We fall back to the Win32 OpenProcess API.
+    On Unix, signal 0 is the standard check.
+    """
+    if not pid or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        # Win32 OpenProcess. Returns 0 (NULL handle) if the process
+        # doesn't exist or we don't have access. PROCESS_QUERY_LIMITED_
+        # INFORMATION is enough to check existence without elevated rights.
+        try:
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid))
+            if handle == 0:
+                return False
+            kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+    # Unix: signal 0 is the standard "is the process alive" check.
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True   # exists, we just don't own it
+    except OSError:
+        return False
+
+
+@cli.command()
+@click.option("--port", default=None, type=int, help="Port to bind (default 8420, or $RAG_PORT).")
+@click.option("--host", default=None, help="Host to bind (default 127.0.0.1, or $RAG_HOST). Use 0.0.0.0 for LAN access.")
+def serve(port, host):
+    """Start the GUI server (FastAPI). Long-running; usually auto-launched."""
+    if port is not None:
+        os.environ["RAG_PORT"] = str(port)
+    if host is not None:
+        os.environ["RAG_HOST"] = host
+    # The serve module reads RAG_PORT / RAG_HOST env at run().
+    import serve as serve_mod
+    serve_mod.run()
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, help="Output JSON instead of a human-readable line.")
+def status(as_json):
+    """Show the running rag GUI service: URL, PID, started_at, health."""
+    state = _read_service_state()
+    if not state:
+        if as_json:
+            click.echo(json.dumps({"running": False}, indent=2))
+        else:
+            click.echo("rag GUI: not running (no state file at ~/.rag/state.json)")
+            click.echo("hint:  rag serve          # start it now")
+            click.echo("       scripts\\install-service.ps1  # auto-launch on logon")
+        return
+
+    pid = state.get("pid")
+    alive = _pid_alive(pid) if pid else False
+    if as_json:
+        click.echo(json.dumps({**state, "alive": alive}, indent=2))
+    else:
+        if alive:
+            click.echo(f"rag GUI: running")
+            click.echo(f"  url        : {state.get('url')}")
+            if state.get("lan_url"):
+                click.echo(f"  lan        : {state.get('lan_url')}")
+            click.echo(f"  pid        : {pid}")
+            click.echo(f"  started_at : {state.get('started_at')}")
+        else:
+            click.echo(f"rag GUI: state file says pid {pid} but no process is running")
+            click.echo(f"  started_at : {state.get('started_at')}")
+            click.echo("hint: rm ~/.rag/state.json  # clean up the stale state, then `rag serve`")
+
+
+@cli.command()
+def url():
+    """Print the GUI URL to stdout (for piping into the browser). Exits 1 if not running."""
+    state = _read_service_state()
+    if not state or not _pid_alive(state.get("pid", 0)):
+        click.echo("rag GUI not running", err=True)
+        sys.exit(1)
+    click.echo(state["url"])
 
 
 # -----------------------------------------------------------------------------
