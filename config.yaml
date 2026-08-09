@@ -1,0 +1,98 @@
+# =============================================================================
+# RAG Walking Skeleton — P0 configuration
+# =============================================================================
+# This file is the SINGLE SOURCE OF TRUTH for model choices and runtime params.
+# To swap a model: change the model name + provider class, nothing else.
+# To add a new model family: implement the matching ABC in providers/, then
+# point provider.class at it.
+# =============================================================================
+
+# ---- Embedder ----------------------------------------------------------------
+# P0 default: Qwen3-Embedding-8B (Q4). Strong on technical/code/multilingual.
+# Drop in any sentence-transformers-compatible model by changing `model`.
+embedder:
+  class: providers.embed_qwen3.Qwen3Embedder
+  model: Qwen/Qwen3-Embedding-8B
+  # Q4 via bitsandbytes; set quant: "none" to use full precision.
+  quant: q4                       # q4 | q8 | none
+  compute_dtype: bfloat16         # bfloat16 | float16 | float32
+  device: cuda                    # cuda | cuda:0 | cuda:1 | cpu
+  batch_size: 8                   # 8B is heavy; tune to your VRAM
+  normalize: true                 # Qwen3 embeddings expect cosine-normalized
+  max_seq_length: 8192            # Qwen3-Embedding supports 32k; cap for memory
+  # P1 alternative (uncomment + change class to switch):
+  # class: providers.embed_bgem3.BgeM3Embedder
+  # model: BAAI/bge-m3
+
+# ---- Reranker ----------------------------------------------------------------
+# P0: passthrough. P1: real BGE-reranker-v2.
+reranker:
+  class: core.pipeline.PassthroughReranker
+  # P1 (uncomment + change class to switch):
+  # class: providers.rerank_bge.BgeReranker
+  # model: BAAI/bge-reranker-v2-gemma
+  # device: cuda
+  # top_k: 5
+  top_k: 5                        # final count sent to the generator
+
+# ---- Generator ---------------------------------------------------------------
+# P0 default: qwen3:35b-a3b via Ollama's OpenAI-compatible endpoint.
+# The 35B-A3B is a MoE (3B active) — fast + strong, fits in ~20GB VRAM.
+generator:
+  class: providers.llm_local.LocalGenerator
+  base_url: http://localhost:11434/v1
+  api_key: ollama                 # any string; Ollama ignores it
+  model: qwen3:35b-a3b
+  temperature: 0.2
+  max_tokens: 1024
+  timeout_s: 120
+  system_prompt: |
+    You are a careful research assistant answering from a personal knowledge
+    base. Use ONLY the numbered sources the user provides. Cite inline with
+    [n] markers that match the source numbers. If a source supports the
+    claim, cite it; if no source supports the claim, say so explicitly.
+    Never invent citations. Prefer concrete, terse answers.
+
+# ---- Store -------------------------------------------------------------------
+# Qdrant runs on Windows (binary or Docker) or anywhere reachable on :6333.
+store:
+  class: store.qdrant_store.QdrantStore
+  url: http://localhost:6333
+  collection: kb_p0
+  dense_dim: 4096                 # Qwen3-Embedding-8B output dim
+  distance: COSINE
+  # P1 will add a named sparse vector here without re-ingesting dense.
+
+# ---- Chunking ----------------------------------------------------------------
+# Token counting via tiktoken cl100k (~accurate for sizing, fast).
+# Real tokenizer swap is a P1 thing if you want exact-Qwen token counts.
+chunking:
+  target_tokens: 768              # 512–1024 range; 768 is the sweet spot
+  overlap_pct: 12                 # ~12% overlap
+  min_chunk_tokens: 32            # tiny chunks below this are merged up
+  max_chunks_per_doc: 2000        # safety cap to avoid runaway on huge files
+  python:
+    split_on: [function, async_function, class, method]   # ast node types
+
+# ---- Ingest ------------------------------------------------------------------
+# P0 ingests Markdown notes and Zeal docset SQLite files.
+ingest:
+  default_topic: default
+  markdown:
+    # If your notes have YAML frontmatter with a `topic:` field, it wins.
+    # Otherwise the parent directory name is used; finally default_topic.
+    frontmatter_topic_key: topic
+  zeal:
+    # Standard Dash-compatible docsets (Zeal uses the same schema).
+    sqlite_filename: docSet.dsidx
+    pages_dirname: Contents/Resources/Documents
+
+# ---- Pipeline ----------------------------------------------------------------
+pipeline:
+  top_k_dense: 20                 # how many dense hits before rerank
+  top_k_final: 5                  # how many after rerank → generator
+  citation_style: bracket         # bracket | superscript — bracket is the default
+
+# ---- Logging -----------------------------------------------------------------
+logging:
+  level: INFO                     # DEBUG | INFO | WARNING | ERROR

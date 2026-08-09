@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Eval runs (keep golden_set.jsonl; ignore ad-hoc reports)
+eval/runs/
+*.eval.json
+
+# Logs
+*.log
