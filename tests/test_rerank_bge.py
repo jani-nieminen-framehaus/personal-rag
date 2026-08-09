@@ -3,12 +3,34 @@
 We mock the CrossEncoder to keep the test fast and CI-friendly
 (no model download, no GPU). The mock returns predetermined scores
 so we can assert the reorder + top_k behavior deterministically.
+
+The test venv does NOT have `sentence_transformers` installed (the
+real .venv does, but the test venv is a slim subset for fast CI).
+The `with patch("sentence_transformers.CrossEncoder", ...)` lines
+require the module to be importable, so we inject a stub into
+sys.modules at the top of this file. The stub has just enough
+surface for `patch` to find the attribute and for the reranker's
+lazy `from sentence_transformers import CrossEncoder` to succeed
+inside the patch context (BgeReranker does the import lazily in
+`__init__`, so we don't trigger it at module import time).
 """
 from __future__ import annotations
 
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# Inject a `sentence_transformers` stub into sys.modules so the
+# `with patch("sentence_transformers.CrossEncoder", ...)` lines in
+# the tests below can find the attribute. The CrossEncoder class
+# itself is replaced by the per-test MagicMock, so this stub is
+# only a placeholder.
+if "sentence_transformers" not in sys.modules:
+    _stub = types.ModuleType("sentence_transformers")
+    _stub.CrossEncoder = MagicMock()  # placeholder; tests override it
+    sys.modules["sentence_transformers"] = _stub
 
 from core.interfaces import Chunk
 from providers.rerank_bge import BgeReranker
