@@ -32,6 +32,7 @@ from core.pipeline import (
     load_config,
     make_embedder,
     make_generator,
+    make_metadata,
     make_reranker,
     make_store,
 )
@@ -62,6 +63,7 @@ class _Singletons:
     store = None
     reranker = None
     generator = None
+    metadata = None
     ready: bool = False
     started_at: str | None = None
 
@@ -122,6 +124,7 @@ async def lifespan(app: FastAPI):
     S.store = make_store(S.config)
     S.reranker = make_reranker(S.config)
     S.generator = make_generator(S.config)
+    S.metadata = make_metadata(S.config)
     S.ready = True
     log.info("ABCs loaded; ready for traffic")
 
@@ -203,6 +206,7 @@ def api_ask(req: AskRequest):
         top_k_dense=top_k_dense,
         top_k_final=top_k_final,
         topic=req.topic,
+        metadata=S.metadata,
     )
     return AskResponse(
         answer=result.answer,
@@ -233,6 +237,7 @@ def api_eval():
         generator=None,  # retrieval-only eval
         top_k_dense=(S.config or {}).get("pipeline", {}).get("top_k_dense", 20),
         top_k_final=(S.config or {}).get("pipeline", {}).get("top_k_final", 5),
+        metadata=S.metadata,
     )
     return metrics
 

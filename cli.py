@@ -24,11 +24,13 @@ from core.pipeline import (
     make_reranker,
     make_generator,
     make_store,
+    make_metadata,
     format_citation_footer,
     ask as ask_pipeline,
     ingest as ingest_pipeline,
     DEFAULT_CONFIG_PATH,
 )
+from core.metadata import MetadataStore
 from ingest.markdown_dir import MarkdownDirIngester
 from ingest.zeal_docsets import ZealIngester
 
@@ -89,6 +91,7 @@ def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json):
     store = make_store(cfg)
     reranker = make_reranker(cfg)
     generator = make_generator(cfg)
+    metadata = make_metadata(cfg)
 
     result = ask_pipeline(
         query,
@@ -99,7 +102,10 @@ def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json):
         top_k_dense=top_k_dense,
         top_k_final=top_k_final,
         topic=topic,
+        metadata=metadata,
     )
+    if metadata is not None:
+        metadata.close()
 
     if as_json:
         click.echo(json.dumps({"answer": result.answer, "citations": result.citations}, indent=2))
@@ -132,6 +138,7 @@ def ingest(ctx, markdown_path, zeal_path, recreate, batch_size):
 
     embedder = make_embedder(cfg)
     store = make_store(cfg)
+    metadata = make_metadata(cfg)
     total = 0
 
     if markdown_path:
@@ -145,7 +152,10 @@ def ingest(ctx, markdown_path, zeal_path, recreate, batch_size):
             max_chunks_per_doc=ch.get("max_chunks_per_doc", 2000),
         )
         click.echo(f"ingesting markdown from {markdown_path} …")
-        total += ingest_pipeline(mi, embedder, store, recreate=recreate, batch_size=batch_size)
+        total += ingest_pipeline(
+            mi, embedder, store,
+            recreate=recreate, batch_size=batch_size, metadata=metadata,
+        )
 
     if zeal_path:
         zi = ZealIngester(
@@ -160,8 +170,13 @@ def ingest(ctx, markdown_path, zeal_path, recreate, batch_size):
         click.echo(f"ingesting zeal docset at {zeal_path} …")
         # For Zeal we don't recreate on the second source — only the first call
         # should be allowed to recreate. Idempotent because of UUID5 ids.
-        total += ingest_pipeline(zi, embedder, store, recreate=False, batch_size=batch_size)
+        total += ingest_pipeline(
+            zi, embedder, store,
+            recreate=False, batch_size=batch_size, metadata=metadata,
+        )
 
+    if metadata is not None:
+        metadata.close()
     click.echo(f"done. wrote {total} chunks into {store.collection}.")
 
 
@@ -217,6 +232,7 @@ def eval(ctx, golden, as_json, with_faithfulness):
     embedder = make_embedder(cfg)
     store = make_store(cfg)
     reranker = make_reranker(cfg)
+    metadata = make_metadata(cfg)
     # Generator is only loaded when --with-faithfulness is set. By default
     # the eval is retrieval-only (no LLM call) so it's fast and works even
     # when Ollama isn't running.
@@ -230,7 +246,10 @@ def eval(ctx, golden, as_json, with_faithfulness):
         generator=generator,
         top_k_dense=cfg.get("pipeline", {}).get("top_k_dense", 20),
         top_k_final=cfg.get("pipeline", {}).get("top_k_final", 5),
+        metadata=metadata,
     )
+    if metadata is not None:
+        metadata.close()
     if as_json:
         click.echo(json.dumps(metrics, indent=2))
     else:
@@ -364,6 +383,134 @@ def tray():
     """Run the Windows system tray icon. Left-click opens the GUI."""
     import tray
     tray.run()
+
+
+# -----------------------------------------------------------------------------
+# rag citations / rag sources / rag stats / rag eval-runs
+# -----------------------------------------------------------------------------
+#
+# All four read from the SQLite metadata store. They exit 1 with a friendly
+# message if metadata is disabled in config.yaml.
+
+def _open_metadata(cfg: dict) -> MetadataStore:
+    """Open the metadata store, or raise click.UsageError if disabled."""
+    meta_cfg = cfg.get("metadata", {}) or {}
+    if not meta_cfg.get("enabled", True):
+        raise click.UsageError(
+            "metadata is disabled in config.yaml. Set `metadata.enabled: true` to use this command."
+        )
+    return MetadataStore(meta_cfg.get("path", "./metadata.sqlite3"))
+
+
+@cli.command("citations")
+@click.option("--limit", default=20, type=int, help="Max rows to show (default 20).")
+@click.option("--source", "source_path", default=None, help="Filter to one source_path.")
+@click.option("--json", "as_json", is_flag=True, help="Print as JSON.")
+@click.pass_context
+def citations(ctx, limit, source_path, as_json):
+    """Show recent citations logged by `rag ask`."""
+    cfg = ctx.obj["config"]
+    md = _open_metadata(cfg)
+    try:
+        rows = md.get_citations(limit=limit, source_path=source_path)
+    finally:
+        md.close()
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        click.echo("(no citations yet — run `rag ask` a few times first)")
+        return
+    click.echo(f"{len(rows)} recent citation(s):")
+    for r in rows:
+        q = (r["query"] or "").strip()
+        if len(q) > 60:
+            q = q[:57] + "…"
+        click.echo(
+            f"  [{r['rank']}] {r['source_path']}  ::  {q!r}  ({r['asked_at']})"
+        )
+
+
+@cli.command("sources")
+@click.option("--limit", default=50, type=int, help="Max rows to show (default 50).")
+@click.option("--json", "as_json", is_flag=True, help="Print as JSON.")
+@click.pass_context
+def sources(ctx, limit, as_json):
+    """Show the catalog of files indexed by `rag ingest`."""
+    cfg = ctx.obj["config"]
+    md = _open_metadata(cfg)
+    try:
+        rows = md.get_sources(limit=limit)
+    finally:
+        md.close()
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        click.echo("(no sources yet — run `rag ingest --markdown …` first)")
+        return
+    click.echo(f"{len(rows)} indexed source(s):")
+    for r in rows:
+        click.echo(
+            f"  {r['ingested_at']}  topic={r['topic']:<14}  "
+            f"chunks={r['chunk_count']:<5}  {r['source_path']}"
+        )
+
+
+@cli.command("stats")
+@click.option("--json", "as_json", is_flag=True, help="Print as JSON.")
+@click.pass_context
+def stats(ctx, as_json):
+    """Show overall counts + the most-cited source."""
+    cfg = ctx.obj["config"]
+    md = _open_metadata(cfg)
+    try:
+        s = md.get_stats()
+    finally:
+        md.close()
+    if as_json:
+        click.echo(json.dumps(s, indent=2))
+        return
+    click.echo("rag metadata stats:")
+    click.echo(f"  total sources    : {s['total_sources']}")
+    click.echo(f"  total citations  : {s['total_citations']}")
+    click.echo(f"  total eval runs  : {s['total_eval_runs']}")
+    if s["top_cited_source"]:
+        click.echo(
+            f"  most-cited source: {s['top_cited_source']}  ({s['top_cited_count']}×)"
+        )
+    else:
+        click.echo("  most-cited source: (none yet)")
+
+
+@cli.command("eval-runs")
+@click.option("--limit", default=10, type=int, help="Max rows to show (default 10).")
+@click.option("--json", "as_json", is_flag=True, help="Print as JSON.")
+@click.pass_context
+def eval_runs(ctx, limit, as_json):
+    """Show recent eval runs (recall@5, MRR over time)."""
+    cfg = ctx.obj["config"]
+    md = _open_metadata(cfg)
+    try:
+        rows = md.get_eval_runs(limit=limit)
+    finally:
+        md.close()
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        click.echo("(no eval runs logged — run `rag eval` first)")
+        return
+    click.echo(f"{len(rows)} recent eval run(s):")
+    for r in rows:
+        rd = r.get("recall_at_dense")
+        rd_str = f"  recall@dense={rd:.2f}" if rd is not None else ""
+        fp = r.get("faithfulness_proxy")
+        fp_str = f"  faith={fp:.2f}" if fp is not None else ""
+        click.echo(
+            f"  {r['ran_at']}  n={r['n_questions']:<3}  "
+            f"recall@5={r['recall_at_5']:.2f}  mrr={r['mrr']:.2f}{rd_str}{fp_str}"
+        )
 
 
 # -----------------------------------------------------------------------------

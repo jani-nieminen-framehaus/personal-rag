@@ -29,6 +29,7 @@ from typing import Any, Iterable
 
 from core.pipeline import ask as ask_pipeline
 from core.interfaces import Embedder, Reranker, Generator
+from core.metadata import MetadataStore
 from store.qdrant_store import QdrantStore
 
 
@@ -106,6 +107,7 @@ def run(
     generator: Generator | None,
     top_k_dense: int = 20,
     top_k_final: int = 5,
+    metadata: MetadataStore | None = None,
 ) -> dict[str, Any]:
     """Compute aggregate metrics over the golden set."""
     gold = load_golden(golden_path)
@@ -177,6 +179,19 @@ def run(
     }
     if faithfulness_count:
         summary["faithfulness_proxy"] = round(faithfulness_sum / faithfulness_count, 4)
+
+    # P1 metadata: one row per eval run so you can track quality over time.
+    if metadata is not None:
+        try:
+            metadata.record_eval_run(
+                n_questions=summary["n_questions"],
+                recall_at_5=summary["recall_at_5"],
+                mrr=summary["mrr"],
+                recall_at_dense=summary.get("recall_at_dense"),
+                faithfulness_proxy=summary.get("faithfulness_proxy"),
+            )
+        except Exception as e:  # pragma: no cover — defensive
+            log.warning("metadata: record_eval_run failed: %s", e)
     return summary
 
 

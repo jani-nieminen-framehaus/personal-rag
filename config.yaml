@@ -107,6 +107,14 @@ pipeline:
   top_k_final: 5                  # how many after rerank → generator
   citation_style: bracket         # bracket | superscript — bracket is the default
 
+# ---- Metadata ----------------------------------------------------------------
+# SQLite store for the side-channel: which files are indexed, what you've
+# cited recently, eval-run history. Defaults to ./metadata.sqlite3 (one file,
+# trivial to back up). Set enabled: false to disable.
+metadata:
+  enabled: true
+  path: ./metadata.sqlite3
+
 # ---- Logging -----------------------------------------------------------------
 logging:
   level: INFO                     # DEBUG | INFO | WARNING | ERROR

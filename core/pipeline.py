@@ -21,6 +21,7 @@ from typing import Any, Callable
 import yaml
 
 from core.interfaces import Chunk, Embedder, Reranker, Generator, Ingester
+from core.metadata import MetadataStore, hash_text
 from store.qdrant_store import QdrantStore
 
 
@@ -107,6 +108,21 @@ def make_store(cfg: dict[str, Any]) -> QdrantStore:
     return cls(**kwargs)
 
 
+def make_metadata(cfg: dict[str, Any]) -> MetadataStore | None:
+    """Build a MetadataStore from the `metadata:` config block, or None if disabled.
+
+    Config shape:
+        metadata:
+          enabled: true            # default true
+          path: ./metadata.sqlite3 # default ./metadata.sqlite3
+    """
+    section = cfg.get("metadata", {}) or {}
+    if not section.get("enabled", True):
+        return None
+    path = section.get("path", "./metadata.sqlite3")
+    return MetadataStore(path)
+
+
 # -----------------------------------------------------------------------------
 # Reranker default
 # -----------------------------------------------------------------------------
@@ -130,6 +146,7 @@ def ingest(
     recreate: bool = False,
     batch_size: int | None = None,
     progress: Callable[[int, int], None] | None = None,
+    metadata: MetadataStore | None = None,
 ) -> int:
     """Walk the ingester, embed, upsert. Returns number of chunks written.
 
@@ -141,6 +158,10 @@ def ingest(
         batch_size: override embedder batch size (None = use embedder's default).
         progress: optional callback(done, total). `total` is unknown up front
                   for streaming ingesters, so we pass done and -1.
+        metadata: optional MetadataStore. If set, we record one row per
+            unique source_path in the `sources` table after the embed
+            loop finishes. The content_hash is computed from the joined
+            chunk text (deterministic given a deterministic chunker).
     """
     # Pass the embedder's dim so ensure_collection can validate the
     # existing collection (or use the dim when creating a new one).
@@ -153,6 +174,9 @@ def ingest(
     bs = batch_size or getattr(embedder, "batch_size", 32) or 32
     buffer: list[Chunk] = []
     total = 0
+    # Per-source accumulator for the metadata store. Keyed by
+    # source_path; value is (doc_type, topic, joined_text).
+    sources: dict[str, tuple[str, str, list[str]]] = {}
 
     def _flush() -> None:
         nonlocal total
@@ -161,6 +185,12 @@ def ingest(
         texts = [c.text for c in buffer]
         vecs = embedder.embed(texts)
         store.upsert_chunks(buffer, vecs)
+        for c in buffer:
+            entry = sources.get(c.source_path)
+            if entry is None:
+                sources[c.source_path] = (c.doc_type, c.topic, [c.text])
+            else:
+                entry[2].append(c.text)
         total += len(buffer)
         if progress:
             progress(total, -1)
@@ -172,6 +202,21 @@ def ingest(
             _flush()
     _flush()
     log.info("ingest: wrote %d chunks into %s", total, store.collection)
+
+    # P1 metadata: one row per unique source file. Cheap (one
+    # row per file, not per chunk) and idempotent — re-ingest
+    # just refreshes chunk_count + content_hash.
+    if metadata is not None and sources:
+        for source_path, (doc_type, topic, texts) in sources.items():
+            metadata.record_source(
+                source_path=source_path,
+                doc_type=doc_type,
+                topic=topic,
+                chunk_count=len(texts),
+                content_hash=hash_text("\n\n".join(texts)),
+            )
+        log.info("metadata: recorded %d source rows", len(sources))
+
     return total
 
 
@@ -199,6 +244,7 @@ def ask(
     top_k_dense: int = 20,
     top_k_final: int = 5,
     topic: str | None = None,
+    metadata: MetadataStore | None = None,
 ) -> AskResult:
     """Full retrieve → rerank → build → generate pipeline."""
     # 1. Embed the query. Audit #9: use embed_query (with the model's
@@ -253,6 +299,15 @@ def ask(
         }
         for c, s in hits
     ]
+    # P1 metadata: log this ask's citations. One row per [n] in the
+    # answer, with the query, chunk_id, and source_path. Failures are
+    # logged but never break the answer (a slow / locked DB should
+    # not surface as a user-visible RAG error).
+    if metadata is not None and citations:
+        try:
+            metadata.record_citations(query, citations)
+        except Exception as e:  # pragma: no cover — defensive
+            log.warning("metadata: record_citations failed: %s", e)
     return AskResult(answer=answer, citations=citations, dense_hits=dense_hits)
 
 
