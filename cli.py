@@ -26,6 +26,7 @@ from core.pipeline import (
     format_citation_footer,
     ask as ask_pipeline,
     ingest as ingest_pipeline,
+    DEFAULT_CONFIG_PATH,
 )
 from ingest.markdown_dir import MarkdownDirIngester
 from ingest.zeal_docsets import ZealIngester
@@ -159,8 +160,39 @@ def ingest(ctx, markdown_path, zeal_path, recreate, batch_size):
 # rag eval
 # -----------------------------------------------------------------------------
 
+def _resolve_repo_path(path_str: str) -> Path:
+    """Resolve a path against multiple candidate roots.
+
+    The user can be sitting in any directory when they invoke
+    `rag eval` (especially when launched via rag.bat / rag.ps1 from
+    somewhere else). The golden set lives at `eval/golden_set.jsonl`
+    inside the repo, so we try in order:
+      1. The literal path (absolute or relative-to-CWD)
+      2. CWD + path_str
+      3. The repo root (the directory containing config.yaml) + path_str
+
+    Returns the resolved absolute path of the first match. Falls back
+    to the literal if nothing is found, so the user sees the real
+    "file not found" from the eval runner.
+
+    This was the bug the audit called "rag eval golden path is CWD-
+    relative while config is repo-anchored".
+    """
+    p = Path(path_str)
+    if p.is_file():
+        return p.resolve()
+    for root in (Path.cwd(), DEFAULT_CONFIG_PATH.parent):
+        candidate = (root / path_str).resolve()
+        if candidate.is_file():
+            return candidate
+    # Not found anywhere — return the literal so the user sees the real
+    # "file not found" from the eval runner.
+    return p
+
+
 @cli.command()
-@click.option("--golden", default="eval/golden_set.jsonl", help="Path to golden_set.jsonl.")
+@click.option("--golden", default="eval/golden_set.jsonl",
+              help="Path to golden_set.jsonl. Resolved against CWD, then the repo root.")
 @click.option("--json", "as_json", is_flag=True, help="Print metrics as JSON.")
 @click.option("--with-faithfulness", is_flag=True,
               help="Also run the (slow) LLM generation step to compute the faithfulness proxy. "
@@ -171,6 +203,7 @@ def eval(ctx, golden, as_json, with_faithfulness):
     # Lazy import so the eval dependencies don't load on every command.
     from eval import run_ragas
 
+    golden_path = _resolve_repo_path(golden)
     cfg = ctx.obj["config"]
     embedder = make_embedder(cfg)
     store = make_store(cfg)
@@ -181,7 +214,7 @@ def eval(ctx, golden, as_json, with_faithfulness):
     generator = make_generator(cfg) if with_faithfulness else None
 
     metrics = run_ragas.run(
-        golden_path=Path(golden),
+        golden_path=golden_path,
         embedder=embedder,
         store=store,
         reranker=reranker,

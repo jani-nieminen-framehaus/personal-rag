@@ -103,11 +103,24 @@ class Embedder(ABC):
     - Return one vector per input string, in the same order.
     - Return lists of plain Python floats (so they're JSON-serializable for debugging).
     - Be deterministic for the same input + same model state.
+
+    Audit #9: instruction-tuned models (Qwen3-Embedding in particular)
+    benefit from a different prefix for queries vs documents. The two
+    methods let implementations apply the right one. By default they
+    both call the underlying `embed`; override to specialize.
     """
 
     @abstractmethod
     def dim(self) -> int:
         """Dimensionality of the output vectors. Used to size the Qdrant collection."""
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a single query string. Default: same as embed_documents."""
+        return self.embed([text])[0]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Batch-embed documents. Default: same as embed (legacy single-method impls)."""
+        return self.embed(texts)
 
     @abstractmethod
     def embed(self, texts: list[str]) -> list[list[float]]:

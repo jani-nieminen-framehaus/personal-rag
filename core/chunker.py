@@ -93,6 +93,68 @@ def _split_by_tokens(text: str, target: int, overlap_pct: int, min_size: int) ->
 # ---------- Markdown ----------------------------------------------------------
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+# A fenced code block line, per CommonMark: 0-3 leading spaces, then 3+
+# backticks or tildes, then optionally an info string (e.g. "python" or "bash").
+# Closing fences have nothing after the marker (whitespace only).
+_FENCE_LINE_RE = re.compile(r"^(\s{0,3})(```+|~~~+)([^\n]*)$")
+
+
+def _find_real_headings(md: str) -> list[re.Match]:
+    """Find heading lines, but skip any that are inside a fenced code block.
+
+    Bug #11 fix: the previous regex matched `# comment` lines inside
+    ```bash ... ``` blocks, causing false splits. We walk the markdown
+    line by line, toggling a "in-code" flag when we see a fence opener/
+    closer, and only consider headings outside fences.
+    """
+    matches: list[re.Match] = []
+    in_code = False
+    fence_char: str | None = None
+    fence_len: int = 0
+    pos = 0
+    for line in md.splitlines(keepends=True):
+        line_start = pos
+        pos += len(line)
+        fence_match = _FENCE_LINE_RE.match(line)
+        if fence_match:
+            indent = fence_match.group(1)
+            marker = fence_match.group(2)
+            # Per CommonMark, fenced code blocks can have up to 3 spaces
+            # of leading indent and the fence must be at least 3 chars
+            # long. (Longer is fine; matches the same family.)
+            if len(indent) > 3:
+                continue
+            char = marker[0]
+            n = len(marker)
+            if not in_code:
+                if n >= 3:
+                    in_code = True
+                    fence_char = char
+                    fence_len = n
+                continue
+            # In code — does this line close the block?
+            if char == fence_char and n >= fence_len:
+                in_code = False
+                fence_char = None
+                fence_len = 0
+            continue
+        if in_code:
+            continue
+        h = _HEADING_RE.match(line)
+        if h:
+            matches.append(_FakeMatch(line_start + h.start(), h.group(1), h.group(2)))
+    return matches
+
+
+class _FakeMatch:
+    """Mimics re.Match enough for our consumer (start, group(1), group(2))."""
+    def __init__(self, start: int, hashes: str, heading: str):
+        self._start = start
+        self._hashes = hashes
+        self._heading = heading
+    def start(self) -> int: return self._start
+    def group(self, n: int) -> str:
+        return {1: self._hashes, 2: self._heading}[n]
 
 
 @dataclass
@@ -104,8 +166,9 @@ class MdSection:
 
 def _split_markdown_sections(md: str) -> list[MdSection]:
     """Walk the markdown by heading lines. Preserve heading lines in the body
-    so the LLM still has structural context."""
-    matches = list(_HEADING_RE.finditer(md))
+    so the LLM still has structural context. Headings inside fenced code
+    blocks are ignored (audit #11)."""
+    matches = _find_real_headings(md)
     if not matches:
         return [MdSection(heading="(top)", level=0, body=md)]
 
@@ -173,6 +236,28 @@ def chunk_markdown(
                 )
             )
             chunk_index += 1
+
+    # Bug #12 fix: tiny chunks (under min_size tokens) get merged into
+    # the next chunk so nothing ships as a sub-min fragment. We walk
+    # left-to-right, absorbing small chunks into their successor.
+    if len(chunks) >= 2 and min_size > 0:
+        i = 0
+        while i < len(chunks) - 1:
+            if count_tokens(chunks[i].text) < min_size:
+                # Absorb this small chunk into the next one.
+                chunks[i + 1].text = chunks[i].text + "\n\n" + chunks[i + 1].text
+                del chunks[i]
+                # Don't advance i — the new chunks[i] is the merged
+                # chunk, and may itself still be too small (e.g. a
+                # chain of three tiny sections).
+            else:
+                i += 1
+        # The last chunk, if still too small, has no successor to absorb
+        # into. Prepend it to its predecessor instead.
+        if len(chunks) >= 2 and count_tokens(chunks[-1].text) < min_size:
+            chunks[-2].text = chunks[-2].text + "\n\n" + chunks[-1].text
+            chunks.pop()
+
     return chunks
 
 

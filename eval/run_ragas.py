@@ -134,17 +134,26 @@ def run(
             topic=topic,
         )
         retrieved_ids = [c["chunk_id"] for c in result.citations]
+        # Audit #10: also compute dense-stage recall@k (pre-rerank). When
+        # a real reranker lands in P1, this distinguishes "dense stage
+        # missed the chunk entirely" from "reranker demoted a good hit".
+        dense_ids = [c["chunk_id"] for c in result.dense_hits]
+        r_dense = recall_at_k(dense_ids, rel, top_k_dense)
         r5 = recall_at_k(retrieved_ids, rel, 5)
         m = mrr(retrieved_ids, rel)
         recall_sum += r5
         mrr_sum += m
-        log.info("[%d/%d] %r  recall@5=%.2f  mrr=%.2f", i, len(gold), q, r5, m)
+        log.info(
+            "[%d/%d] %r  recall@%d(dense)=%.2f  recall@5(post-rerank)=%.2f  mrr=%.2f",
+            i, len(gold), q, top_k_dense, r_dense, r5, m,
+        )
 
         row: dict[str, Any] = {
             "question": q,
             "retrieved": retrieved_ids[:5],
             "relevant": rel,
             "recall_at_5": r5,
+            "recall_at_dense": r_dense,
             "mrr": m,
         }
         if generator is not None:
@@ -158,9 +167,11 @@ def run(
         per_question.append(row)
 
     n = max(1, len(gold))
+    recall_dense_sum = sum(r.get("recall_at_dense", 0.0) for r in per_question)
     summary = {
         "n_questions": len(gold),
         "recall_at_5": round(recall_sum / n, 4),
+        "recall_at_dense": round(recall_dense_sum / n, 4),
         "mrr": round(mrr_sum / n, 4),
         "per_question": per_question,
     }
@@ -177,15 +188,20 @@ def print_report(metrics: dict[str, Any]) -> None:
     print("=" * 60)
     print(f"  RAG eval — {metrics['n_questions']} questions")
     print("=" * 60)
-    print(f"  recall@5              : {metrics['recall_at_5']:.3f}")
-    print(f"  MRR                   : {metrics['mrr']:.3f}")
+    print(f"  recall@dense (pre-rerank) : {metrics.get('recall_at_dense', 0.0):.3f}")
+    print(f"  recall@5 (post-rerank)    : {metrics['recall_at_5']:.3f}")
+    print(f"  MRR                       : {metrics['mrr']:.3f}")
     if "faithfulness_proxy" in metrics:
-        print(f"  faithfulness (proxy)  : {metrics['faithfulness_proxy']:.3f}")
+        print(f"  faithfulness (proxy)      : {metrics['faithfulness_proxy']:.3f}")
     print("=" * 60)
     print("  per-question:")
     for row in metrics["per_question"]:
         ok = "✓" if row["recall_at_5"] >= 1.0 else ("·" if row["recall_at_5"] > 0 else "✗")
-        print(f"    {ok} recall@5={row['recall_at_5']:.2f}  mrr={row['mrr']:.2f}  q={row['question']!r}")
+        rd = row.get("recall_at_dense", 0.0)
+        print(
+            f"    {ok} recall@dense={rd:.2f}  recall@5={row['recall_at_5']:.2f}  "
+            f"mrr={row['mrr']:.2f}  q={row['question']!r}"
+        )
 
 
 # -----------------------------------------------------------------------------

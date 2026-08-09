@@ -1,6 +1,7 @@
 # RAG Walking Skeleton — P0 Plan
 
-> Status: planning — not yet implemented.
+> Status: P0 implemented and pushed. Three waves of bug fixes landed; see
+> git log on `main` (commits `5880de9`, `f2259e9`, `d5b34fc`).
 > Owner: Jani. Target: runnable P0 with end-to-end `rag ask` over personal notes + Zeal docsets.
 
 ## 1. Goal & non-goals
@@ -84,7 +85,7 @@
 | `store/qdrant_store.py` | ~150 | `QdrantStore` — create collection (`dense` + reserved `sparse`), upsert, query. Cosine distance, payload includes chunk text. |
 | `eval/golden_set.jsonl` | starter | 8–12 hand-written Q→chunk_id pairs against sample notes (so the harness runs end-to-end on day 1). |
 | `eval/run_ragas.py` | ~120 | Custom recall@5 + MRR + a naive faithfulness heuristic (token overlap between answer and retrieved chunks). No Ragas framework. |
-| `cli.py` | ~150 | `rag ask`, `rag ingest`, `rag eval` subcommands. `--verbose`, `--top-k`, `--no-citations` flags. |
+| `cli.py` | ~150 | `rag ask`, `rag ingest`, `rag eval` subcommands. `--verbose`, `--top-k-dense`, `--top-k-final`, `--topic`, `--no-citations`, `--json` flags. |
 | `requirements.txt` | ~15 | Pinned: `qdrant-client`, `sentence-transformers`, `transformers`, `bitsandbytes`, `accelerate`, `torch`, `tiktoken`, `openai`, `pyyaml`, `python-frontmatter`, `beautifulsoup4`, `click`, `pytest` (dev). |
 | `README.md` | big | Windows-native setup (Ollama + Qdrant binary), install, first ingest, first query, eval, troubleshooting. |
 
@@ -110,15 +111,20 @@ Total target: ~1.5k lines, mostly comments/docstrings.
 ## 5. Qdrant collection schema (P0 → P1 migration story)
 
 ```python
-# store/qdrant_store.py
+# store/qdrant_store.py — actual API used in the code
+from qdrant_client.http.models import (
+    VectorParams, SparseVectorParams, Distance, Modifier,
+)
+
 client.create_collection(
     collection_name="kb_p0",
     vectors_config={
-        "dense":   VectorParams(size=4096, distance=Distance.COSINE),  # Qwen3-8B
-        "sparse":  VectorParams(size=1, distance=Distance.DOT, sparse=True),  # placeholder
+        # Qwen3-Embedding-8B output dim; cosine distance
+        "dense": VectorParams(size=4096, distance=Distance.COSINE),
     },
+    # Placeholder slot; P1 populates with BM25 vectors via update_vectors
     sparse_vectors_config={
-        "sparse": SparseVectorParams(modifier=Modifier.IDF)  # P1
+        "sparse": SparseVectorParams(modifier=Modifier.IDF),
     },
 )
 ```
@@ -129,7 +135,7 @@ In P0 we only populate `dense`. P1 adds BM25 `sparse` per point + a hybrid query
 
 ```
 rag ask "what was said about exposure in photography"          # main path
-rag ask "..." --top-k 20 --rerank-k 5 --no-citations          # knobs
+rag ask "..." --top-k-dense 20 --top-k-final 5 --no-citations  # knobs
 rag ingest --markdown ./notes --topic notes
 rag ingest --zeal ~/.local/share/Zeal/Zeal/docsets/Python.docset
 rag eval                                                    # recall@5 + MRR

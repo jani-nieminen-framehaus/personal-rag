@@ -192,16 +192,22 @@ def test_chunk_python_produces_multiple_chunks():
 # -- Markdown chunking --------------------------------------------------------
 
 def test_chunk_markdown_heading_sections():
+    # Sections are large enough that the merge-on-tiny rule doesn't fire.
     src = '''\
 # Title
 
-intro
+This is a substantial intro body with enough tokens to qualify as a
+proper chunk on its own, well above min_size.
 
 ## Section A
-body a
+
+Body of section A which also has enough content to stand alone without
+being absorbed by the merge logic.
 
 ## Section B
-body b
+
+Body of section B which is similarly substantial and won't be merged
+either.
 '''
     p = Path("test.md")
     chunks = chunk_markdown(

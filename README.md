@@ -1,6 +1,6 @@
 # rag — personal, multi-topic RAG (P0 walking skeleton)
 
-> A terminal-first RAG CLI for your own knowledge base. Plain Python 3.12,
+> A terminal-first RAG CLI for your own knowledge base. Plain Python 3.11+,
 > no LangChain / LlamaIndex. Every model is swappable from `config.yaml`.
 > Built for Windows 11 + Ollama on a 48 GB VRAM rig. No WSL2, no Docker
 > Desktop, no GUI.
@@ -61,7 +61,7 @@ python cli.py eval
 
 Three services to install, all native Windows. No WSL2, no Docker Desktop.
 
-### 1. Python 3.12
+### 1. Python 3.11+
 
 If you don't have it already:
 
@@ -69,7 +69,7 @@ If you don't have it already:
 # from the Microsoft Store, or winget:
 winget install Python.Python.3.12
 # restart terminal so `python` resolves
-python --version    # → Python 3.12.x
+python --version    # → Python 3.11.x or 3.12.x
 ```
 
 ### 2. Ollama
@@ -124,7 +124,7 @@ docker run -d --name qdrant -p 6333:6333 `
 From either option, `http://localhost:6333/collections` should return
 `{"result":{"collections":[]}}`.
 
-### 5. The Python venv (Windows side)
+### 4. The Python venv (Windows side)
 
 ```powershell
 cd D:\Tinkering sideprojects\rag
@@ -142,7 +142,7 @@ Qwen3-Embedding-8B (~5 GB on first `rag ask`). Subsequent runs are instant
 > - swap `embedder.quant: q4` → `none` in `config.yaml` (uses full precision),
 > - or pin `bitsandbytes` to the latest Windows-compatible release.
 
-### 5b. The shiv launcher (recommended)
+### 5. The shiv launcher (recommended)
 
 Skip the `python -m venv` + `activate` + `cd` dance. There's a Windows shiv
 at the repo root that does all of it:
@@ -387,7 +387,7 @@ Run from `D:\Tinkering sideprojects\rag` with the venv active.
 
 ```powershell
 # 1. Python version
-python --version                           # → Python 3.12.x
+python --version                           # → Python 3.11.x or 3.12.x
 
 # 2. Heavy deps loaded (no model download yet)
 python -c "import torch, transformers, sentence_transformers, qdrant_client, openai, yaml; print('deps ok')"

@@ -20,6 +20,12 @@ embedder:
   batch_size: 8                   # 8B is heavy; tune to your VRAM
   normalize: true                 # Qwen3 embeddings expect cosine-normalized
   max_seq_length: 8192            # Qwen3-Embedding supports 32k; cap for memory
+  # Audit #9: Qwen3-Embedding is instruction-tuned. Queries get this prefix
+  # at retrieval time; documents are embedded without it. The default
+  # ("web search query → relevant passages") is the model's recommended
+  # instruction for general retrieval. Override for domain-specific
+  # retrieval (e.g. "Find code that does X").
+  query_instruction: "Given a web search query, retrieve relevant passages that answer the query"
   # P1 alternative (uncomment + change class to switch):
   # class: providers.embed_bgem3.BgeM3Embedder
   # model: BAAI/bge-m3

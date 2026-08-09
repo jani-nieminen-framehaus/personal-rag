@@ -57,7 +57,18 @@ class Qwen3Embedder(Embedder):
 
     Reads its own config from the EmbedderConfig — see `core/pipeline.py` for
     the factory that builds instances from config.yaml.
+
+    Audit #9: the model is instruction-tuned. The Qwen3-Embedding model
+    card recommends a query instruction prefix for asymmetric retrieval
+    (query and document spaces differ). We default to the standard
+    "web search" instruction, which is what Qwen3-Embedding was trained
+    for; override via `query_instruction` in config.yaml.
     """
+
+    # Standard Qwen3-Embedding retrieval-query instruction. Override via config.
+    DEFAULT_QUERY_INSTRUCTION = (
+        "Given a web search query, retrieve relevant passages that answer the query"
+    )
 
     def __init__(
         self,
@@ -68,12 +79,14 @@ class Qwen3Embedder(Embedder):
         batch_size: int = 8,
         normalize: bool = True,
         max_seq_length: int = 8192,
+        query_instruction: str | None = None,
     ):
         from sentence_transformers import SentenceTransformer
 
         self.model_name = model
         self.batch_size = batch_size
         self.normalize = normalize
+        self.query_instruction = query_instruction if query_instruction is not None else self.DEFAULT_QUERY_INSTRUCTION
 
         log.info("loading %s on %s (quant=%s, compute=%s)", model, device, quant, compute_dtype)
         model_kwargs = _build_quant_config(quant, compute_dtype) or {}
@@ -95,11 +108,11 @@ class Qwen3Embedder(Embedder):
         return self._dim
 
     def embed(self, texts: list[str]) -> list[list[float]]:
+        return self.embed_documents(texts)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        # sentence-transformers handles tokenization, batching, and pooling.
-        # `convert_to_numpy=False` returns plain lists (already Python floats
-        # after tolist()).
         vecs = self._model.encode(
             texts,
             batch_size=self.batch_size,
@@ -108,3 +121,15 @@ class Qwen3Embedder(Embedder):
             show_progress_bar=False,
         )
         return vecs.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a single query with the retrieval instruction prefix.
+
+        Documents (chunks at ingest time) are embedded WITHOUT the
+        prefix; queries (one at retrieval time) are embedded WITH it.
+        This asymmetry measurably improves recall on Qwen3-Embedding.
+        """
+        if not text:
+            return [0.0] * self._dim
+        prompted = f"{self.query_instruction}\n{text}"
+        return self.embed_documents([prompted])[0]

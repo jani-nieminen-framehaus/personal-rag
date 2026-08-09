@@ -14,7 +14,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -182,7 +182,11 @@ def ingest(
 @dataclass
 class AskResult:
     answer: str
-    citations: list[dict[str, Any]]   # [{n, source_path, section, chunk_id, topic, doc_type}]
+    citations: list[dict[str, Any]]   # post-rerank: [{n, source_path, section, chunk_id, topic, doc_type, score, text}]
+    dense_hits: list[dict[str, Any]] = field(default_factory=list)
+    # pre-rerank top-k from the store, so the eval can log dense-stage
+    # recall@20 even when a reranker (P1) changes the post-rerank order.
+    # Audit #10.
 
 
 def ask(
@@ -197,8 +201,11 @@ def ask(
     topic: str | None = None,
 ) -> AskResult:
     """Full retrieve → rerank → build → generate pipeline."""
-    # 1. Embed the query.
-    qvec = embedder.embed([query])[0]
+    # 1. Embed the query. Audit #9: use embed_query (with the model's
+    #    retrieval instruction prefix) instead of plain embed. Documents
+    #    were embedded without the prefix at ingest time, so the
+    #    asymmetric space is what the model was trained for.
+    qvec = embedder.embed_query(query)
 
     # 2. Retrieve top_k_dense from the store.
     hits = store.search_with_filter(qvec, top_k=top_k_dense, topic=topic) if topic \
@@ -234,7 +241,19 @@ def ask(
         }
         for i, c in enumerate(chunks)
     ]
-    return AskResult(answer=answer, citations=citations)
+    # Audit #10: surface pre-rerank dense hits so the eval can compare
+    # dense-stage recall against post-rerank recall when a real reranker
+    # lands in P1.
+    dense_hits = [
+        {
+            "chunk_id": c.chunk_id,
+            "source_path": c.source_path,
+            "section": c.section,
+            "score": round(float(s), 4),
+        }
+        for c, s in hits
+    ]
+    return AskResult(answer=answer, citations=citations, dense_hits=dense_hits)
 
 
 # -----------------------------------------------------------------------------
