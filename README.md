@@ -205,6 +205,75 @@ the chunker, the embedding model, or the query.
 
 ---
 
+## Evaluation — what it's actually for
+
+Skip this section until you have a real corpus in the index. None of it
+is required to use the tool: ingest, ask, read answers. That works.
+
+**The problem it solves.** When retrieval misses, you don't find out. The
+model still writes a fluent, confident answer from whatever chunks it did
+get — it does not say "I couldn't find the relevant passage." You only
+notice if you already knew the answer, and if you knew, you wouldn't be
+asking. Everything below exists to catch that one failure, because it is
+the only failure you cannot spot by reading the output.
+
+Quick manual check, no tooling needed: look at the citation footer. If it
+is empty or cites files unrelated to your question, retrieval missed and
+the confident tone was the model bluffing. If it cites the right file but
+the answer is still mush, retrieval worked and the *answer* is the
+problem — that is what the faithfulness score measures, separately.
+
+**The golden set is a ruler, not a quiz.** It is a list of questions where
+the correct source chunk is already known, so software can ask "did the
+right chunk come back?" and give you a number. You never read it.
+
+**You do not write the questions.** `rag golden generate` samples chunks
+from your own index and has the local model draft a question that each
+chunk answers. `rag golden review` then shows you each one with a preview
+of its source chunk, and you press `y` / `n` / `e` (edit) / `q` (quit,
+resume later). The correct answer is known by construction — the question
+was generated *from* that chunk. Twenty minutes gets you fifty.
+
+**"Knobs" are four settings in `config.yaml`:** how many candidates to
+fetch before narrowing to the final few (`top_k_dense`), the balance
+between meaning-matching and exact-keyword-matching (`dense_weight`),
+whether the reranker earns its latency, and chunk size. There is no
+universally right answer — a docset full of exact function names wants
+different weighting than prose notes, and a mixed corpus is an empirical
+question. `rag eval --sweep` tries the combinations, scores each against
+the golden set, and prints a table best-first. The top row is what you
+copy into `config.yaml`.
+
+### When to run what
+
+| Command | When | Cost |
+| --- | --- | --- |
+| `rag golden generate` + `review` | after adding a meaningful batch of new material | ~10 min of your attention |
+| `rag eval` | health check, or after changing anything | seconds |
+| `rag eval --sweep` | only when the corpus changes *character* | slow, unattended |
+
+Most of the time you run none of them.
+
+### Two things that will bite you if nobody says them
+
+**A recall number is only meaningful against a fixed corpus.** Retrieval
+gets harder as the index grows — more near-duplicates competing for the
+same few slots — so the same settings score *lower* on 1000 notes than on
+10. That is a harder exam, not a regression. Compare setting A against
+setting B on the same corpus on the same afternoon; do not read the
+numbers as a trend line across months.
+
+**So do not tune on a toy corpus.** Ingest the bulk of what you actually
+have first, then spend the twenty minutes. Tuning on ten notes optimises
+for a corpus you do not own. The question set is designed to grow with
+you: `rag golden generate` remembers which chunks it has already drafted
+from and skips them, so re-running it after an ingest drafts only from the
+new material.
+
+Full operator sequence: `docs/superpowers/specs/2026-08-10-p3-runbook.md`.
+
+---
+
 ## Ingesting your own notes
 
 ```powershell
