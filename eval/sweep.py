@@ -122,6 +122,21 @@ def run_chunking_sweep(
     The live collection is never touched. Metrics use section-level
     matching because chunk_ids are chunking-dependent (UUID5 over
     path/section/chunk_index). Markdown-only in P3.1."""
+    # The golden set is generated from the LIVE index, which also holds Zeal
+    # docsets, PDFs and EPUBs — but the scratch collections are re-ingested
+    # from markdown alone. Rows referencing any other source type can never
+    # match here, so they hold absolute recall down by a constant amount.
+    # Unwarned, an operator reads recall@5 = 0.3 as a catastrophe instead of
+    # an artifact of this sweep's scope. The constant cancels out when
+    # comparing rows, which is why only the ranking is meaningful.
+    log.warning(
+        "chunking sweep: re-ingests MARKDOWN ONLY (%s). Golden rows that "
+        "reference PDFs, EPUBs or Zeal docsets cannot match in the scratch "
+        "collections and will depress every row equally. Compare the "
+        "RANKING across target_tokens values only — the ABSOLUTE recall/MRR "
+        "numbers below are not comparable to a normal `rag eval` run.",
+        markdown_root,
+    )
     results: list[dict[str, Any]] = []
     for tt in (target_tokens_list or DEFAULT_TARGET_TOKENS):
         combo = {"target_tokens": tt}

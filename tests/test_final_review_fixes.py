@@ -194,6 +194,46 @@ def test_failed_sweep_still_prints_the_table(tmp_path, stub_abcs):
 
 
 # -----------------------------------------------------------------------------
+# The chunking sweep re-ingests markdown only — say so, loudly
+# -----------------------------------------------------------------------------
+
+def test_chunking_sweep_warns_that_only_ranking_is_meaningful(tmp_path, caplog):
+    """golden_real.jsonl is generated from the LIVE index, which on this
+    deployment also holds Zeal docsets, PDFs and EPUBs. Those rows can
+    never match inside a markdown-only scratch collection, so they drag
+    absolute recall down — and the operator reads recall@5 = 0.3 as a
+    catastrophe rather than an artifact of the sweep's scope."""
+    import logging as _logging
+    from eval import sweep as sweep_mod
+
+    cfg = {"store": {"class": "x", "url": "u", "collection": "kb", "dense_dim": 4}}
+    scratch = MagicMock()
+    scratch.collection = "kb_tune_512"
+
+    with patch.object(sweep_mod, "make_store", return_value=scratch), \
+         patch.object(sweep_mod, "ingest_pipeline", return_value=3), \
+         patch.object(sweep_mod.run_ragas, "run",
+                      return_value={"recall_at_5": 0.3, "mrr": 0.2}), \
+         caplog.at_level(_logging.WARNING, logger="eval.sweep"):
+        sweep_mod.run_chunking_sweep(
+            Path("g.jsonl"), cfg, markdown_root=str(tmp_path),
+            embedder=MagicMock(), target_tokens_list=[512])
+
+    warned = " ".join(r.getMessage() for r in caplog.records
+                      if r.levelno >= _logging.WARNING).lower()
+    assert "markdown" in warned, "the markdown-only scope must be named"
+    assert "ranking" in warned, "must say only cross-target_tokens RANKING is meaningful"
+    assert "absolute" in warned, "must say the absolute numbers are not meaningful"
+
+
+def test_runbook_step_5_carries_the_scope_caveat():
+    runbook = (REPO / "docs" / "superpowers" / "specs"
+               / "2026-08-10-p3-runbook.md").read_text(encoding="utf-8").lower()
+    assert "--golden eval/golden_real.jsonl" in runbook
+    assert "markdown" in runbook and "ranking" in runbook
+
+
+# -----------------------------------------------------------------------------
 # build_golden: relevant_refs + the chunking_params drift it exists to prevent
 # -----------------------------------------------------------------------------
 
