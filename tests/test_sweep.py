@@ -61,3 +61,20 @@ def test_format_table_contains_params_and_metrics():
                 "status": "ok", "recall_at_5": 0.91, "mrr": 0.85}]
     table = sweep.format_table(results)
     assert "0.91" in table and "bge" in table
+
+
+def test_cli_eval_sweep_prints_table(monkeypatch):
+    from click.testing import CliRunner
+    import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "make_embedder", lambda cfg: MagicMock())
+    monkeypatch.setattr(cli_mod, "make_store", lambda cfg: MagicMock())
+    monkeypatch.setattr(cli_mod, "make_metadata", lambda cfg: None)
+
+    fake_results = [{"params": {"dense_weight": 0.5, "top_k_dense": 20,
+                                "top_k_final": 5, "reranker": "bge"},
+                     "status": "ok", "recall_at_5": 0.91, "mrr": 0.85}]
+    with patch("eval.sweep.run_sweep", return_value=fake_results):
+        res = CliRunner().invoke(cli_mod.cli, ["eval", "--sweep"])
+    assert res.exit_code == 0
+    assert "recall@5" in res.output and "0.91" in res.output

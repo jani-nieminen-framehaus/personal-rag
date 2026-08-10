@@ -293,11 +293,14 @@ def _resolve_repo_path(path_str: str) -> Path:
 @click.option("--with-faithfulness", is_flag=True,
               help="Also run the (slow) LLM generation step to compute faithfulness. "
                    "Requires Ollama to be running with the configured generator model.")
-@click.option("--nli", is_flag=True,
+@click.option("--nli/--no-nli", default=None,
               help="Use NLI cross-encoder (cross-encoder/nli-deberta-v3-xsmall) "
-                   "for the faithfulness score. Falls back to token-overlap if unavailable.")
+                   "for the faithfulness score. Falls back to token-overlap if unavailable. "
+                   "Default: config eval.nli (true).")
+@click.option("--sweep", is_flag=True,
+              help="Grid over retrieval knobs; prints a results table.")
 @click.pass_context
-def eval(ctx, golden, as_json, with_faithfulness, nli):
+def eval(ctx, golden, as_json, with_faithfulness, nli, sweep):
     """Run the eval harness: recall@5, MRR, NLI faithfulness."""
     # Lazy import so the eval dependencies don't load on every command.
     from eval import run_ragas
@@ -306,16 +309,20 @@ def eval(ctx, golden, as_json, with_faithfulness, nli):
     cfg = ctx.obj["config"]
     embedder = make_embedder(cfg)
     store = make_store(cfg)
-    reranker = make_reranker(cfg)
     metadata = make_metadata(cfg)
     # Generator is only loaded when --with-faithfulness is set. By default
     # the eval is retrieval-only (no LLM call) so it's fast and works even
     # when Ollama isn't running.
     generator = make_generator(cfg) if with_faithfulness else None
 
-    # NLI faithfulness scorer — loaded lazily; None if unavailable.
+    if nli is None:
+        nli = (cfg.get("eval") or {}).get("nli", True)
+
+    # NLI faithfulness scorer — loaded lazily; None if unavailable. Only
+    # worth loading when there's a generator to score (faithfulness isn't
+    # computed on retrieval-only runs), so a plain `rag eval` stays fast.
     nli_scorer = None
-    if nli:
+    if nli and generator is not None:
         try:
             from eval.nli_faithfulness import make_nli_faithfulness
             nli_scorer = make_nli_faithfulness(cfg)
@@ -323,6 +330,18 @@ def eval(ctx, golden, as_json, with_faithfulness, nli):
                 click.echo("nli: model unavailable — falling back to token-overlap proxy")
         except Exception as e:
             click.echo(f"nli: could not load scorer: {e} — skipping")
+
+    if sweep:
+        from eval import sweep as sweep_mod
+        results = sweep_mod.run_sweep(
+            golden_path, cfg, embedder=embedder, store=store,
+            metadata=metadata, generator=generator, nli=nli_scorer)
+        if metadata is not None:
+            metadata.close()
+        click.echo(sweep_mod.format_table(results))
+        return
+
+    reranker = make_reranker(cfg)
 
     metrics = run_ragas.run(
         golden_path=golden_path,

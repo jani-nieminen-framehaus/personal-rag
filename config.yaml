@@ -125,3 +125,12 @@ metadata:
 # ---- Logging -----------------------------------------------------------------
 logging:
   level: INFO                     # DEBUG | INFO | WARNING | ERROR
+
+# ---- Eval ---------------------------------------------------------------------
+eval:
+  nli: true                       # NLI faithfulness by default (--no-nli to skip)
+  sweep:                          # rag eval --sweep grid (query-time knobs only)
+    dense_weight: [0.3, 0.5, 0.7]
+    top_k_dense: [20, 40]
+    top_k_final: [5]
+    reranker: [passthrough, bge]
