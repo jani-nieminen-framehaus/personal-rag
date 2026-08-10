@@ -404,20 +404,37 @@ def golden_review_cmd(ctx):
         return
     accepted: list[dict] = golden_review.load_rows(GOLDEN_REAL)
     done = 0
-    for cand in todo:
-        click.echo(f"\nQ: {cand['question']}")
-        click.echo(f"   [{cand.get('topic', 'default')}] {cand.get('preview', '')}")
-        choice = click.prompt("accept? [y]es / [n]o / [e]dit / [q]uit",
-                              type=click.Choice(["y", "n", "e", "q"]))
-        if choice == "q":
-            break
-        edited = click.prompt("edited question") if choice == "e" else None
-        _, golden_row = golden_review.apply_decision(cand, choice, edited=edited)
-        if golden_row:
-            accepted.append(golden_row)
-        done += 1
-    golden_review.save_rows(GOLDEN_CANDIDATES, rows)          # statuses updated in place
-    golden_review.save_rows(GOLDEN_REAL, accepted)
+    # The atomic write in save_rows() only protects a single write; it does
+    # NOT protect the review SESSION. Without this try/finally, a Ctrl-C
+    # (KeyboardInterrupt — Click converts it to Abort -> "Aborted!" + exit 1)
+    # or any other exception mid-loop would skip straight past both
+    # save_rows() calls below and silently discard every y/n/e decision made
+    # earlier in the pass, not just the in-flight one. Both saves now run on
+    # every exit path (normal completion, "q", or an exception), and the
+    # exception/interrupt is left to propagate afterward — never swallowed.
+    try:
+        for cand in todo:
+            click.echo(f"\nQ: {cand['question']}")
+            click.echo(f"   [{cand.get('topic', 'default')}] {cand.get('preview', '')}")
+            choice = click.prompt("accept? [y]es / [n]o / [e]dit / [q]uit",
+                                  type=click.Choice(["y", "n", "e", "q"]))
+            if choice == "q":
+                break
+            edited = None
+            if choice == "e":
+                # Re-prompt until non-blank so apply_decision's ValueError
+                # ("edit decision requires a non-empty question") can never
+                # actually be raised from here. Ctrl-C is the "back out" —
+                # it's still persisted by the try/finally above.
+                while not edited or not edited.strip():
+                    edited = click.prompt("edited question")
+            _, golden_row = golden_review.apply_decision(cand, choice, edited=edited)
+            if golden_row:
+                accepted.append(golden_row)
+            done += 1
+    finally:
+        golden_review.save_rows(GOLDEN_CANDIDATES, rows)          # statuses updated in place
+        golden_review.save_rows(GOLDEN_REAL, accepted)
     click.echo(f"reviewed {done}; accepted total now {len(accepted)}")
 
 
