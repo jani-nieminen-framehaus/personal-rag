@@ -344,6 +344,94 @@ def eval(ctx, golden, as_json, with_faithfulness, nli):
 
 
 # -----------------------------------------------------------------------------
+# rag golden generate / review / stats
+# -----------------------------------------------------------------------------
+#
+# Curation flow for the golden eval set. `generate` drafts candidate rows
+# over the live index (needs Ollama); `review` is an interactive y/n/e/q
+# pass that promotes accepted candidates into golden_real.jsonl; `stats`
+# reports counts. Both files are gitignored (personal corpus).
+#
+# NOTE: these two constants are deliberately NOT run through
+# `_resolve_repo_path` — that helper falls back to a bare CWD-relative
+# path when the target file doesn't exist yet, which is correct for an
+# INPUT like --golden (read-only, must already exist) but wrong for an
+# OUTPUT path like these: `rag golden generate` run from outside the repo
+# root would then write to (or fail creating) the wrong `eval/` directory.
+# Anchoring to DEFAULT_CONFIG_PATH.parent (the repo root) makes the
+# output location independent of CWD.
+GOLDEN_CANDIDATES = DEFAULT_CONFIG_PATH.parent / "eval" / "golden_candidates.jsonl"
+GOLDEN_REAL = DEFAULT_CONFIG_PATH.parent / "eval" / "golden_real.jsonl"
+
+
+@cli.group()
+def golden():
+    """Build and curate the golden question set over the LIVE index."""
+
+
+@golden.command("generate")
+@click.option("--n", default=100, type=int, help="Candidates to draft.")
+@click.option("--topic", "topics", multiple=True, help="Restrict to topic(s). Repeatable.")
+@click.option("--seed", default=1337, type=int, help="Sampling seed (determinism).")
+@click.pass_context
+def golden_generate(ctx, n, topics, seed):
+    """Sample chunks from the live index and draft candidate questions (needs Ollama)."""
+    from eval import golden_gen
+
+    cfg = ctx.obj["config"]
+    store = make_store(cfg)
+    try:
+        generator = make_generator(cfg)
+    except Exception as e:
+        click.echo(f"error: generator unavailable ({e}) — is Ollama running?", err=True)
+        sys.exit(1)
+    GOLDEN_CANDIDATES.parent.mkdir(parents=True, exist_ok=True)
+    written = golden_gen.generate_candidates(
+        store, generator, GOLDEN_CANDIDATES, n=n, topics=list(topics) or None, seed=seed)
+    click.echo(f"wrote {written} candidates to {GOLDEN_CANDIDATES}. Next: rag golden review")
+
+
+@golden.command("review")
+@click.pass_context
+def golden_review_cmd(ctx):
+    """Interactive y/n/e/q pass over pending candidates."""
+    from eval import golden_review
+
+    rows = golden_review.load_rows(GOLDEN_CANDIDATES)
+    todo = golden_review.pending(rows)
+    if not todo:
+        click.echo("no pending candidates. Run: rag golden generate")
+        return
+    accepted: list[dict] = golden_review.load_rows(GOLDEN_REAL)
+    done = 0
+    for cand in todo:
+        click.echo(f"\nQ: {cand['question']}")
+        click.echo(f"   [{cand.get('topic', 'default')}] {cand.get('preview', '')}")
+        choice = click.prompt("accept? [y]es / [n]o / [e]dit / [q]uit",
+                              type=click.Choice(["y", "n", "e", "q"]))
+        if choice == "q":
+            break
+        edited = click.prompt("edited question") if choice == "e" else None
+        _, golden_row = golden_review.apply_decision(cand, choice, edited=edited)
+        if golden_row:
+            accepted.append(golden_row)
+        done += 1
+    golden_review.save_rows(GOLDEN_CANDIDATES, rows)          # statuses updated in place
+    golden_review.save_rows(GOLDEN_REAL, accepted)
+    click.echo(f"reviewed {done}; accepted total now {len(accepted)}")
+
+
+@golden.command("stats")
+@click.pass_context
+def golden_stats(ctx):
+    """Counts: pending / rejected / accepted (per topic)."""
+    from eval import golden_review
+
+    s = golden_review.stats(GOLDEN_CANDIDATES, GOLDEN_REAL)
+    click.echo(json.dumps(s, indent=2))
+
+
+# -----------------------------------------------------------------------------
 # rag serve / rag status / rag url
 # -----------------------------------------------------------------------------
 #
