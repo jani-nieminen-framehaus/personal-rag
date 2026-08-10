@@ -94,26 +94,32 @@ def generate_candidates(
         for payload in sample_chunks(store, n=n + len(seen), topics=topics, seed=seed):
             if written >= n:
                 break
-            cid = payload["chunk_id"]
-            if cid in seen:
+            cid = payload.get("chunk_id")
+            if cid is None or cid in seen:
                 continue
+            # The try covers the ROW CONSTRUCTION as well as the draft:
+            # store/qdrant_store.py explicitly acknowledges that points with
+            # missing payload keys exist ("data corruption / older schema")
+            # and skips them during search. With only draft_question()
+            # guarded, one such point raised KeyError out of the loop and
+            # aborted a 100-candidate run part-way through.
             try:
                 question = draft_question(generator, payload["text"])
+                if question is None:
+                    log.warning("golden: empty draft for %s — skipping", cid)
+                    continue
+                row = {
+                    "question": question,
+                    "relevant_chunk_ids": [cid],
+                    "relevant_refs": [{"source_path": payload["source_path"],
+                                       "section": payload["section"]}],
+                    "topic": payload.get("topic", "default"),
+                    "preview": payload["text"][:PREVIEW_CHARS],
+                    "status": "candidate",
+                }
             except Exception as e:
-                log.warning("golden: draft failed for %s: %s — skipping", cid, e)
+                log.warning("golden: skipping chunk %s: %s", cid, e)
                 continue
-            if question is None:
-                log.warning("golden: empty draft for %s — skipping", cid)
-                continue
-            row = {
-                "question": question,
-                "relevant_chunk_ids": [cid],
-                "relevant_refs": [{"source_path": payload["source_path"],
-                                   "section": payload["section"]}],
-                "topic": payload.get("topic", "default"),
-                "preview": payload["text"][:PREVIEW_CHARS],
-                "status": "candidate",
-            }
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             seen.add(cid)
             written += 1

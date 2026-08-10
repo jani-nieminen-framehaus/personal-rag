@@ -62,6 +62,27 @@ def test_generate_candidates_appends_and_resumes(tmp_path):
     assert "Sec c1" in sections and "Sec c2" in sections
 
 
+def test_generate_candidates_survives_a_malformed_payload(tmp_path):
+    """store/qdrant_store.py explicitly acknowledges that points with
+    missing payload keys exist ("data corruption / older schema") and skips
+    them during search — so this is live, not hypothetical. The row
+    construction sat OUTSIDE the per-chunk try, so one such point aborted a
+    100-candidate run (and every question drafted after it was lost, since
+    the file is appended row by row)."""
+    out = tmp_path / "cands.jsonl"
+    gen = MagicMock()
+    gen.generate.return_value = "A question?"
+    bad = _payload("bad")
+    del bad["section"]          # older schema / corrupted point
+    store = _store([bad, _payload("good")])
+
+    n = golden_gen.generate_candidates(store, gen, out, n=2)
+
+    assert n == 1, "the good chunk must still be written"
+    rows = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
+    assert [r["relevant_chunk_ids"] for r in rows] == [["good"]]
+
+
 def test_generate_candidates_skips_failed_drafts(tmp_path):
     out = tmp_path / "cands.jsonl"
     gen = MagicMock()

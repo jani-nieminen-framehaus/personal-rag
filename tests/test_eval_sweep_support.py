@@ -81,6 +81,64 @@ def test_section_match_mode(monkeypatch, tmp_path):
     assert m_sect["recall_at_5"] == 1.0    # section survives re-chunking
 
 
+def test_unknown_match_mode_fails_loudly(monkeypatch, tmp_path):
+    """Anything other than the literal "section" silently fell through to
+    chunk_id matching. chunk_ids are chunking-dependent, so a typo made a
+    chunking sweep report a uniformly terrible table with status: ok — the
+    exact silent-zero section mode was built to prevent."""
+    golden = _golden(tmp_path, {"question": "q", "relevant_chunk_ids": ["c1"]})
+    calls = []
+
+    def fake_ask(*a, **kw):
+        calls.append(kw)
+        return _result([{"chunk_id": "c1", "text": "t",
+                         "source_path": "/a.md", "section": "S"}])
+
+    monkeypatch.setattr(run_ragas, "ask_pipeline", fake_ask)
+
+    with pytest.raises(ValueError, match="secton"):
+        run_ragas.run(golden, embedder=MagicMock(), store=MagicMock(),
+                      reranker=MagicMock(), generator=None, match_mode="secton")
+    assert calls == [], "a bad match_mode must be rejected before any retrieval"
+
+
+def test_valid_match_modes_are_accepted(monkeypatch, tmp_path):
+    golden = _golden(tmp_path, {
+        "question": "q", "relevant_chunk_ids": ["c1"],
+        "relevant_refs": [{"source_path": "/a.md", "section": "S"}]})
+    cite = {"chunk_id": "c1", "text": "t", "source_path": "/a.md", "section": "S"}
+    monkeypatch.setattr(run_ragas, "ask_pipeline", lambda *a, **kw: _result([cite]))
+    for mode in ("chunk_id", "section"):
+        m = run_ragas.run(golden, embedder=MagicMock(), store=MagicMock(),
+                          reranker=MagicMock(), generator=None, match_mode=mode)
+        assert m["recall_at_5"] == 1.0
+
+
+def test_section_mode_precondition_is_hoisted_above_the_retrieval_loop(monkeypatch, tmp_path):
+    """The check ran AFTER ask_pipeline, so a golden set whose 50th row
+    lacks relevant_refs burned 50 embed+search round trips before failing.
+    Validate every row up front instead."""
+    golden = tmp_path / "g.jsonl"
+    golden.write_text(
+        json.dumps({"question": "fine", "relevant_chunk_ids": ["c1"],
+                    "relevant_refs": [{"source_path": "/a.md", "section": "S"}]}) + "\n"
+        + json.dumps({"question": "row 2 has no refs", "relevant_chunk_ids": ["c2"]}) + "\n",
+        encoding="utf-8")
+    calls = []
+
+    def fake_ask(*a, **kw):
+        calls.append(kw)
+        return _result([{"chunk_id": "c1", "text": "t",
+                         "source_path": "/a.md", "section": "S"}])
+
+    monkeypatch.setattr(run_ragas, "ask_pipeline", fake_ask)
+
+    with pytest.raises(ValueError, match="row 2 has no refs"):
+        run_ragas.run(golden, embedder=MagicMock(), store=MagicMock(),
+                      reranker=MagicMock(), generator=None, match_mode="section")
+    assert calls == [], "no retrieval may happen before the precondition is checked"
+
+
 def test_section_match_mode_requires_relevant_refs(monkeypatch, tmp_path):
     """Controller-directed requirement: a golden row with no relevant_refs
     under match_mode="section" must fail loudly (ValueError naming the

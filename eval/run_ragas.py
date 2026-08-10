@@ -39,6 +39,10 @@ log = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
+# The only two ways a retrieved hit may be matched against a golden row.
+# Anything else is a typo, and must not quietly become chunk_id matching.
+_MATCH_MODES = frozenset({"chunk_id", "section"})
+
 
 def _tokens(text: str) -> set[str]:
     return {t.lower() for t in _TOKEN_RE.findall(text)}
@@ -143,8 +147,30 @@ def run(
             `params` dict (e.g. `{"reranker": "bge"}`). Does not affect
             retrieval — only the run() args above do that.
     """
+    if match_mode not in _MATCH_MODES:
+        # Silently falling through to chunk_id matching made a typo look
+        # like a catastrophic result: chunk_ids are chunking-dependent, so
+        # a chunking sweep would report a uniformly terrible table with
+        # status: ok — the exact silent-zero section mode exists to prevent.
+        raise ValueError(
+            f"unknown match_mode {match_mode!r}; expected one of "
+            f"{sorted(_MATCH_MODES)}"
+        )
+
     gold = load_golden(golden_path)
     log.info("eval: %d questions from %s", len(gold), golden_path)
+
+    # Preconditions first, before spending an embed+search per question.
+    # This used to be checked inside the loop, after ask_pipeline, so a
+    # golden set whose 50th row lacked relevant_refs burned 50 round trips
+    # against the live index before failing.
+    if match_mode == "section":
+        for item in gold:
+            if not item.get("relevant_refs"):
+                raise ValueError(
+                    "match_mode='section' requires relevant_refs for question: "
+                    f"{item['question']!r}"
+                )
 
     recall_sum = 0.0
     mrr_sum = 0.0
@@ -170,11 +196,8 @@ def run(
             dense_weight=dense_weight,
         )
         if match_mode == "section":
-            refs = item.get("relevant_refs") or []
-            if not refs:
-                raise ValueError(
-                    f"match_mode='section' requires relevant_refs for question: {q!r}"
-                )
+            # Presence was validated up front, before the retrieval loop.
+            refs = item["relevant_refs"]
             rel = [f'{r["source_path"]}::{r["section"]}' for r in refs]
             retrieved_ids = [f'{c["source_path"]}::{c["section"]}' for c in result.citations]
             # Controller correction: dense_hits DO carry source_path and
