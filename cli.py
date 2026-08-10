@@ -299,8 +299,12 @@ def _resolve_repo_path(path_str: str) -> Path:
                    "Default: config eval.nli (true).")
 @click.option("--sweep", is_flag=True,
               help="Grid over retrieval knobs; prints a results table.")
+@click.option("--sweep-chunking", is_flag=True,
+              help="Heavy: re-ingest --markdown root into scratch collections per chunk size.")
+@click.option("--markdown", "markdown_root", default=None,
+              help="Source root for --sweep-chunking.")
 @click.pass_context
-def eval(ctx, golden, as_json, with_faithfulness, nli, sweep):
+def eval(ctx, golden, as_json, with_faithfulness, nli, sweep, sweep_chunking, markdown_root):
     """Run the eval harness: recall@5, MRR, NLI faithfulness."""
     # Lazy import so the eval dependencies don't load on every command.
     from eval import run_ragas
@@ -330,6 +334,18 @@ def eval(ctx, golden, as_json, with_faithfulness, nli, sweep):
                 click.echo("nli: model unavailable — falling back to token-overlap proxy")
         except Exception as e:
             click.echo(f"nli: could not load scorer: {e} — skipping")
+
+    if sweep_chunking:
+        if not markdown_root:
+            raise click.UsageError("--sweep-chunking requires --markdown <root>")
+        from eval import sweep as sweep_mod
+        results = sweep_mod.run_chunking_sweep(
+            golden_path, cfg, markdown_root=markdown_root,
+            embedder=embedder, metadata=metadata)
+        if metadata is not None:
+            metadata.close()
+        click.echo(sweep_mod.format_chunking_table(results))
+        return
 
     if sweep:
         from eval import sweep as sweep_mod

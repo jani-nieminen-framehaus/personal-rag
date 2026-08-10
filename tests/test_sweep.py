@@ -78,3 +78,44 @@ def test_cli_eval_sweep_prints_table(monkeypatch):
         res = CliRunner().invoke(cli_mod.cli, ["eval", "--sweep"])
     assert res.exit_code == 0
     assert "recall@5" in res.output and "0.91" in res.output
+
+
+def test_chunking_sweep_uses_scratch_collections_and_drops_them(tmp_path):
+    cfg = {"store": {"class": "store.qdrant_store.QdrantStore",
+                     "url": "http://localhost:6333", "collection": "kb",
+                     "dense_dim": 4}}
+    made = []
+
+    def fake_make_store(c):
+        s = MagicMock()
+        s.collection = c["store"]["collection"]
+        made.append(s)
+        return s
+
+    with patch.object(sweep, "make_store", side_effect=fake_make_store), \
+         patch.object(sweep, "ingest_pipeline", return_value=3), \
+         patch.object(sweep.run_ragas, "run",
+                      return_value={"recall_at_5": 0.8, "mrr": 0.7}) as run_mock:
+        results = sweep.run_chunking_sweep(
+            Path("g.jsonl"), cfg, markdown_root=str(tmp_path),
+            embedder=MagicMock(), target_tokens_list=[512, 1024])
+
+    assert [s.collection for s in made] == ["kb_tune_512", "kb_tune_1024"]
+    for s in made:
+        s.drop.assert_called_once()          # cleaned up even on success
+    assert all(c.kwargs["match_mode"] == "section"
+               for c in run_mock.call_args_list)
+    assert {r["params"]["target_tokens"] for r in results} == {512, 1024}
+
+
+def test_chunking_sweep_drops_scratch_on_failure(tmp_path):
+    cfg = {"store": {"class": "x", "url": "u", "collection": "kb", "dense_dim": 4}}
+    scratch = MagicMock()
+    scratch.collection = "kb_tune_512"
+    with patch.object(sweep, "make_store", return_value=scratch), \
+         patch.object(sweep, "ingest_pipeline", side_effect=RuntimeError("embed died")):
+        results = sweep.run_chunking_sweep(
+            Path("g.jsonl"), cfg, markdown_root=str(tmp_path),
+            embedder=MagicMock(), target_tokens_list=[512])
+    scratch.drop.assert_called_once()
+    assert results[0]["status"].startswith("failed")

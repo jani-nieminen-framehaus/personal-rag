@@ -233,3 +233,8 @@ class VectorStore(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} does not support hybrid (sparse) retrieval"
         )
+
+    def drop(self) -> None:
+        """Delete this store's collection entirely. Scratch-collection
+        lifecycle (eval chunking sweeps) depends on this."""
+        raise NotImplementedError(f"{type(self).__name__} does not implement drop()")

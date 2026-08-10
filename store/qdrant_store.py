@@ -113,6 +113,10 @@ class QdrantStore(VectorStore):
                     f"to drop and re-create the collection."
                 )
 
+    def drop(self) -> None:
+        """Delete the collection. Used by eval scratch collections."""
+        self.client.delete_collection(self.collection)
+
     def count(self) -> int:
         """Number of points currently in the collection."""
         info = self.client.get_collection(self.collection)
