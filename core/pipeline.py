@@ -322,6 +322,7 @@ def _retrieve_hybrid(
     store: VectorStore,
     top_k: int,
     topic: str | None,
+    dense_weight: float = 0.5,
 ) -> list[tuple]:
     """Dense + sparse hybrid search with RRF fusion.
 
@@ -379,7 +380,7 @@ def _retrieve_hybrid(
             query_vector=qvec,
             query_sparse=query_sparse,
             top_k=top_k,
-            dense_weight=0.5,
+            dense_weight=dense_weight,
         )
     except Exception as e:
         log.warning("hybrid search failed (%s) — falling back to dense", e)
@@ -419,6 +420,7 @@ def ask(
     topic: str | None = None,
     metadata: MetadataStore | None = None,
     hybrid: bool = False,
+    dense_weight: float = 0.5,
 ) -> AskResult:
     """Full retrieve → rerank → build → generate pipeline.
 
@@ -426,6 +428,8 @@ def ask(
         hybrid: if True, use hybrid (dense + sparse BM25) search with RRF fusion.
             Requires sparse vectors to be populated first via `store.enable_hybrid()`
             or `rag ingest --populate-sparse`.
+        dense_weight: dense-vs-sparse balance for hybrid search, passed through
+            to `store.search_hybrid()`. Ignored unless `hybrid=True`.
     """
     # 1. Embed the query. Audit #9: use embed_query (with the model's
     #    retrieval instruction prefix) instead of plain embed. Documents
@@ -435,7 +439,7 @@ def ask(
 
     # 2. Retrieve top_k_dense from the store (or hybrid search).
     if hybrid:
-        hits = _retrieve_hybrid(query, qvec, store, top_k=top_k_dense, topic=topic)
+        hits = _retrieve_hybrid(query, qvec, store, top_k=top_k_dense, topic=topic, dense_weight=dense_weight)
     else:
         hits = store.search_with_filter(qvec, top_k=top_k_dense, topic=topic) if topic \
             else store.search_dense(qvec, top_k=top_k_dense)

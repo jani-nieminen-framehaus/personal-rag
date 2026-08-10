@@ -348,3 +348,30 @@ def test_build_golden_passes_when_refs_resolve(monkeypatch, tmp_path):
     assert build_golden.main() == 0
     entry = json.loads(golden_out.read_text(encoding="utf-8").strip())
     assert entry["relevant_chunk_ids"] == ["cid1"]
+
+
+# -- dense_weight threading through ask() --------------------------------------
+
+def test_ask_threads_dense_weight_to_store(monkeypatch):
+    """The sweep varies dense_weight; ask() must pass it to search_hybrid."""
+    from unittest.mock import MagicMock
+    from core import pipeline
+
+    try:
+        pipeline._hybrid_cache.update({"vocab": {"kw": 0}, "idf": {"kw": 1.0}, "built": True})
+        store = MagicMock()
+        store.collection = "kb"
+        store.search_hybrid.return_value = []
+        store.search_dense.return_value = []
+        embedder = MagicMock()
+        embedder.embed_query.return_value = [0.1]
+
+        pipeline.ask(
+            "kw question", embedder=embedder, store=store,
+            reranker=MagicMock(), generator=MagicMock(),
+            hybrid=True, dense_weight=0.7,
+        )
+        assert store.search_hybrid.call_args.kwargs["dense_weight"] == 0.7
+    finally:
+        pipeline._hybrid_cache.clear()
+        pipeline._hybrid_cache.update({"vocab": None, "idf": None, "built": False})
