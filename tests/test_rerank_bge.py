@@ -161,3 +161,18 @@ def test_rerank_falls_back_to_predict_when_rank_missing():
     pairs = fake_model.predict.call_args.args[0]
     assert pairs[0] == ("q", "a")
     assert pairs[2] == ("q", "c")
+
+
+# ---- inference errors propagate (no swallow-and-retry) ---------------------
+
+def test_inference_errors_propagate():
+    """A CUDA OOM in rank() must surface once, with its own traceback, and
+    must NOT trigger a second forward pass via predict()."""
+    chunks = [_chunk("a", 0)]
+    rr, fake_model = _build_reranker_with_rank_mock([(0, 0.9)])
+    fake_model.rank.side_effect = RuntimeError("CUDA out of memory")
+
+    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+        rr.rerank("q", chunks, top_k=1)
+
+    fake_model.predict.assert_not_called()
