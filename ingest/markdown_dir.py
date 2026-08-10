@@ -40,6 +40,7 @@ class MarkdownDirIngester(Ingester):
         frontmatter_topic_key: str = "topic",
         max_chunks_per_doc: int = 2000,
         skip_hidden: bool = True,
+        only_paths: set[Path] | None = None,
     ):
         self.root = Path(root).resolve()
         if not self.root.exists():
@@ -53,7 +54,7 @@ class MarkdownDirIngester(Ingester):
         self.frontmatter_topic_key = frontmatter_topic_key
         self.max_chunks_per_doc = max_chunks_per_doc
         self.skip_hidden = skip_hidden
-        self.only_paths = None
+        self.only_paths = only_paths
 
     @property
     def name(self) -> str:

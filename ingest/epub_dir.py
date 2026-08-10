@@ -59,6 +59,7 @@ class EpubDirIngester(Ingester):
         default_topic: str,
         max_chunks_per_doc: int = 2000,
         skip_hidden: bool = True,
+        only_paths: set[Path] | None = None,
     ):
         self.path = Path(path).resolve()
         if not self.path.exists():
@@ -75,7 +76,7 @@ class EpubDirIngester(Ingester):
         self.default_topic = default_topic
         self.max_chunks_per_doc = max_chunks_per_doc
         self.skip_hidden = skip_hidden
-        self.only_paths = None
+        self.only_paths = only_paths
 
     @property
     def name(self) -> str:
