@@ -33,3 +33,7 @@ samples/test_books/
 
 # One-off scratch/debug scripts (never commit)
 /_*.py
+
+# Golden sets over the real corpus — personal data, never committed
+eval/golden_candidates.jsonl
+eval/golden_real.jsonl
