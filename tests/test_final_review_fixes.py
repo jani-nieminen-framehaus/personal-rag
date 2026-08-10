@@ -194,6 +194,50 @@ def test_failed_sweep_still_prints_the_table(tmp_path, stub_abcs):
 
 
 # -----------------------------------------------------------------------------
+# A whitespace-only query is a 400, not a 500
+# -----------------------------------------------------------------------------
+
+def test_api_ask_rejects_whitespace_only_query(serve_state, monkeypatch):
+    """embed_query correctly raises ValueError on whitespace-only input,
+    but nobody translated it: AskRequest's min_length=1 does not strip, so
+    " " passed validation and surfaced as an unhandled 500 traceback in the
+    GUI."""
+    from fastapi.testclient import TestClient
+    import serve
+
+    called = []
+    monkeypatch.setattr(serve, "ask_pipeline",
+                        lambda *a, **kw: called.append(1) or _fake_result())
+    serve_state.ready = True
+    monkeypatch.setattr(serve.S, "config", {"pipeline": {}})
+
+    r = TestClient(serve.app).post("/api/ask", json={"query": "   "})
+    assert r.status_code == 400, r.text
+    assert not called, "must not reach the pipeline at all"
+
+
+def test_api_ask_still_rejects_an_empty_query(serve_state):
+    """The pydantic min_length=1 path stays intact (422)."""
+    from fastapi.testclient import TestClient
+    import serve
+
+    serve_state.ready = True
+    r = TestClient(serve.app).post("/api/ask", json={"query": ""})
+    assert r.status_code == 422
+
+
+def test_cli_ask_rejects_whitespace_only_query_without_a_traceback():
+    """`rag ask "   "` used to reach embed_query and dump a ValueError
+    traceback. Deliberately runs with the REAL factories: a clean rejection
+    must happen before anything heavyweight is constructed."""
+    res = CliRunner().invoke(cli_mod.cli, ["ask", "   "])
+    assert res.exit_code != 0
+    assert "whitespace" in res.output.lower()
+    assert not isinstance(res.exception, ValueError), (
+        f"expected a clean click error, got a raw traceback: {res.exception!r}")
+
+
+# -----------------------------------------------------------------------------
 # The chunking sweep re-ingests markdown only — say so, loudly
 # -----------------------------------------------------------------------------
 

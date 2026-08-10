@@ -200,6 +200,12 @@ class AskResponse(BaseModel):
 def api_ask(req: AskRequest):
     if not S.ready:
         raise HTTPException(503, "server not ready")
+    if not req.query.strip():
+        # AskRequest's min_length=1 does not strip, so "   " passes
+        # validation and then hits embed_query, which correctly raises
+        # ValueError — surfacing in the GUI as an unhandled 500 traceback.
+        # A blank question is a bad request, so say so.
+        raise HTTPException(400, "query is empty or whitespace-only")
     pipeline_cfg = (S.config or {}).get("pipeline") or {}
     top_k_dense = req.top_k_dense or pipeline_cfg.get("top_k_dense", 20)
     top_k_final = req.top_k_final or pipeline_cfg.get("top_k_final", 5)
