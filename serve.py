@@ -185,6 +185,11 @@ class AskRequest(BaseModel):
     topic: str | None = None
     top_k_dense: int | None = Field(None, ge=1, le=100)
     top_k_final: int | None = Field(None, ge=1, le=20)
+    hybrid: bool = Field(False, description="Use hybrid dense+sparse search.")
+    session_id: str | None = Field(
+        None, max_length=64,
+        description="Session ID for conversation memory. If provided, this turn is stored.",
+    )
 
 
 class AskResponse(BaseModel):
@@ -210,12 +215,27 @@ def api_ask(req: AskRequest):
         top_k_final=top_k_final,
         topic=req.topic,
         metadata=S.metadata,
+        hybrid=req.hybrid,
     )
-    return AskResponse(
+    response = AskResponse(
         answer=result.answer,
         citations=result.citations,
         dense_hits=result.dense_hits,
     )
+
+    # P2 conversation memory: store the turn in the DB when session_id is given.
+    if req.session_id and S.metadata is not None:
+        try:
+            S.metadata.record_turn(
+                session_id=req.session_id,
+                query=req.query,
+                answer=result.answer,
+                citations=result.citations,
+            )
+        except Exception as e:
+            log.warning("session: record_turn failed: %s", e)
+
+    return response
 
 
 # -- /api/eval ---------------------------------------------------------------
@@ -283,7 +303,7 @@ async def api_ingest(files: list[UploadFile] = File(...)):
                 skipped.append("<empty>")
                 continue
             ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
-            if ext not in {"pdf", "md", "markdown", "py"}:
+            if ext not in {"pdf", "md", "markdown", "py", "epub"}:
                 skipped.append(name)
                 continue
             # Bucket by extension so each ingester sees a clean dir.
@@ -308,6 +328,7 @@ async def api_ingest(files: list[UploadFile] = File(...)):
             ("md", "MarkdownDirIngester", "markdown"),
             ("markdown", "MarkdownDirIngester", "markdown"),
             ("py", "MarkdownDirIngester", "markdown"),
+            ("epub", "EpubDirIngester", "epub"),
         ):
             bucket = work / ext
             if not bucket.is_dir():
@@ -319,6 +340,16 @@ async def api_ingest(files: list[UploadFile] = File(...)):
             if ing_cls == "PdfDirIngester":
                 from ingest.pdf_dir import PdfDirIngester
                 inst = PdfDirIngester(
+                    path=str(bucket),
+                    target_tokens=chunking.get("target_tokens", 768),
+                    overlap_pct=chunking.get("overlap_pct", 12),
+                    min_chunk_tokens=chunking.get("min_chunk_tokens", 32),
+                    default_topic=ing.get("default_topic", "default"),
+                    max_chunks_per_doc=chunking.get("max_chunks_per_doc", 2000),
+                )
+            elif ing_cls == "EpubDirIngester":
+                from ingest.epub_dir import EpubDirIngester
+                inst = EpubDirIngester(
                     path=str(bucket),
                     target_tokens=chunking.get("target_tokens", 768),
                     overlap_pct=chunking.get("overlap_pct", 12),
@@ -429,6 +460,35 @@ def api_eval_runs(limit: int = 20):
 def api_stats():
     md = _ensure_metadata()
     return md.get_stats()
+
+
+# -- /api/sessions -----------------------------------------------------------
+
+class SessionCreateRequest(BaseModel):
+    title: str | None = None
+
+
+@app.post("/api/sessions/{session_id}")
+def api_create_session(session_id: str, body: SessionCreateRequest | None = None):
+    """Create or update a session. Idempotent."""
+    md = _ensure_metadata()
+    title = body.title if body else None
+    md.create_session(session_id, title=title)
+    return {"id": session_id, "title": title or ""}
+
+
+@app.get("/api/sessions")
+def api_list_sessions(limit: int = 20):
+    """List recent sessions, most recent first."""
+    md = _ensure_metadata()
+    return md.get_sessions(limit=limit)
+
+
+@app.get("/api/sessions/{session_id}/turns")
+def api_get_turns(session_id: str, limit: int = 50):
+    """Get all turns for a session, oldest first (chronological)."""
+    md = _ensure_metadata()
+    return md.get_turns(session_id, limit=limit)
 
 
 # -----------------------------------------------------------------------------

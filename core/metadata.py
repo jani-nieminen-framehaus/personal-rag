@@ -25,6 +25,7 @@ Wired into:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import sqlite3
 import threading
@@ -72,6 +73,26 @@ CREATE TABLE IF NOT EXISTS eval_runs (
     faithfulness_proxy  REAL
 );
 CREATE INDEX IF NOT EXISTS idx_eval_runs_ran_at ON eval_runs(ran_at);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id          TEXT PRIMARY KEY,
+    created_at  TIMESTAMP NOT NULL,
+    updated_at  TIMESTAMP NOT NULL,
+    title       TEXT,
+    turn_count  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at);
+
+CREATE TABLE IF NOT EXISTS turns (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    asked_at    TIMESTAMP NOT NULL,
+    query       TEXT NOT NULL,
+    answer      TEXT NOT NULL,
+    citations   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_turns_session  ON turns(session_id);
+CREATE INDEX IF NOT EXISTS idx_turns_asked_at ON turns(asked_at);
 """
 
 
@@ -255,6 +276,86 @@ class MetadataStore:
         out["top_cited_source"] = row[0] if row else None
         out["top_cited_count"] = int(row[1]) if row else 0
         return out
+
+    # -- conversation sessions ------------------------------------------------
+
+    def create_session(self, session_id: str, title: str | None = None) -> None:
+        """Create a new session, or no-op if it already exists (idempotent)."""
+        now = _now_iso()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO sessions (id, created_at, updated_at, title, turn_count)
+                VALUES (?, ?, ?, ?, 0)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (session_id, now, now, title or ""),
+            )
+
+    def record_turn(
+        self,
+        session_id: str,
+        query: str,
+        answer: str,
+        citations: Iterable[dict[str, Any]] | None = None,
+    ) -> None:
+        """Append one turn to a session. Creates the session if it doesn't exist.
+
+        `citations` is stored as JSON so it can be replayed in the UI.
+        """
+        now = _now_iso()
+        citations_json = json.dumps(list(citations)) if citations else "[]"
+        with self._lock:
+            # Ensure the session exists.
+            self._conn.execute(
+                "INSERT OR IGNORE INTO sessions (id, created_at, updated_at, title, turn_count) "
+                "VALUES (?, ?, ?, '', 0)",
+                (session_id, now, now),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO turns (session_id, asked_at, query, answer, citations)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (session_id, now, query, answer, citations_json),
+            )
+            self._conn.execute(
+                """
+                UPDATE sessions SET updated_at = ?, turn_count = turn_count + 1
+                WHERE id = ?
+                """,
+                (now, session_id),
+            )
+
+    def get_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Recent sessions, most recent first."""
+        cur = self._conn.execute(
+            "SELECT id, created_at, updated_at, title, turn_count "
+            "FROM sessions ORDER BY updated_at DESC LIMIT ?",
+            (int(limit),),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_turns(self, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """All turns for one session, oldest first (chronological order)."""
+        cur = self._conn.execute(
+            "SELECT id, session_id, asked_at, query, answer, citations "
+            "FROM turns WHERE session_id = ? ORDER BY asked_at ASC LIMIT ?",
+            (session_id, int(limit)),
+        )
+        cols = [d[0] for d in cur.description]
+        rows = []
+        for row in cur.fetchall():
+            d = dict(zip(cols, row))
+            # Decode citations JSON.
+            if d.get("citations"):
+                try:
+                    d["citations"] = json.loads(d["citations"])
+                except Exception:
+                    d["citations"] = []
+            rows.append(d)
+        return rows
 
 
 # -----------------------------------------------------------------------------

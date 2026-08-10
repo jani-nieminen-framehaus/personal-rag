@@ -11,6 +11,7 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   files: [],            // queued File objects for ingest
+  currentSessionId: null,  // active session ID, or null for stateless
 };
 
 // ---- markdown renderer (minimal, no deps) --------------------------------
@@ -99,9 +100,10 @@ function addMessage(role, bodyHtml, citations = []) {
   return div;
 }
 
-async function ask(query, topic) {
+async function ask(query, topic, sessionId) {
   const body = { query };
   if (topic) body.topic = topic;
+  if (sessionId) body.session_id = sessionId;
   const res = await fetch("/api/ask", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -119,7 +121,7 @@ $("form").addEventListener("submit", async (e) => {
   $("query").value = "";
   const thinking = addMessage("assistant", '<span class="thinking">thinking...</span>');
   try {
-    const result = await ask(q, $("topic").value);
+    const result = await ask(q, $("topic").value, state.currentSessionId);
     thinking.querySelector(".body").innerHTML = renderMarkdown(result.answer);
     const list = document.createElement("div");
     list.className = "cite-list";
@@ -145,8 +147,125 @@ $("form").addEventListener("submit", async (e) => {
   }
 });
 
+// ---- sessions (P2: conversation memory) -------------------------------------
+
+// Render a list of historical turns into the chat pane.
+function renderTurns(turns) {
+  $("chat").innerHTML = "";
+  if (!turns || turns.length === 0) {
+    $("chat").innerHTML =
+      '<div class="empty"><p>Ask a question. Citations will appear below the answer.</p>' +
+      '<p class="hint">This session is empty — go ahead and chat.</p></div>';
+    return;
+  }
+  for (const t of turns) {
+    // citations may be stored as a JSON string or already-parsed array.
+    let cites = [];
+    if (t.citations) {
+      if (typeof t.citations === "string") {
+        try { cites = JSON.parse(t.citations); } catch (_) { cites = []; }
+      } else {
+        cites = t.citations;
+      }
+    }
+    // Normalise citation shape for addMessage.
+    const normCites = (cites || []).map((c) => ({
+      n: c.n ?? c.rank ?? 0,
+      source_path: c.source_path ?? "",
+      section: c.section ?? "",
+      text: c.text ?? "",
+      score: c.score ?? 0,
+    }));
+    addMessage("user", escapeHtml(t.query || ""));
+    addMessage("assistant", renderMarkdown(t.answer || ""), normCites);
+  }
+  $("chat").scrollTop = $("chat").scrollHeight;
+}
+
+// Load all turns for a session and display them.
+async function loadTurns(sessionId) {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/turns`);
+    if (!res.ok) throw new Error(`${res.status}`);
+    const turns = await res.json();
+    renderTurns(turns);
+  } catch (err) {
+    // Non-fatal: just show an empty chat.
+    renderTurns([]);
+    console.warn("loadTurns:", err.message);
+  }
+}
+
+// Populate the session dropdown from /api/sessions.
+async function loadSessions() {
+  try {
+    const res = await fetch("/api/sessions?limit=30");
+    if (!res.ok) return;
+    const sessions = await res.json();
+    const sel = $("sessionSelect");
+    // Remember the current selection.
+    const prev = sel.value;
+    // Wipe all options except the placeholder.
+    while (sel.options.length > 1) sel.remove(1);
+    for (const s of sessions) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      const ts = (s.updated_at || "").replace("T", " ").slice(0, 16);
+      const title = s.title || "(untitled)";
+      opt.textContent = `${ts}  ${title}  (${s.turn_count} turn${s.turn_count !== 1 ? "s" : ""})`;
+      sel.appendChild(opt);
+    }
+    // Restore selection if still valid.
+    if (prev && [...sel.options].some((o) => o.value === prev)) {
+      sel.value = prev;
+    }
+  } catch (_) { /* best-effort */ }
+}
+
+// Start a brand-new session: generate a UUID, create it via the API, and
+// activate it (clearing the chat for a fresh conversation).
+async function newSession() {
+  const id = (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36));
+  try {
+    await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+  } catch (_) { /* best-effort — the server will auto-create on record_turn anyway */ }
+  state.currentSessionId = id;
+  $("sessionSelect").value = id;   // won't match any option, but signals "active"
+  renderTurns([]);
+  await loadSessions();   // repopulate so the new session appears in the list
+  // Select the new session in the dropdown (it should now be first after reload).
+  $("sessionSelect").value = id;
+}
+
+// Switch to an existing session: set it as current and restore its turns.
+async function switchToSession(sessionId) {
+  if (!sessionId) {
+    state.currentSessionId = null;
+    renderTurns([]);
+    return;
+  }
+  state.currentSessionId = sessionId;
+  await loadTurns(sessionId);
+}
+
+$("newSessionBtn").addEventListener("click", () => newSession());
+
+$("sessionSelect").addEventListener("change", () => {
+  switchToSession($("sessionSelect").value);
+});
+
 $("clearBtn").addEventListener("click", () => {
-  $("chat").innerHTML = '<div class="empty"><p>Ask a question. Citations will appear below the answer.</p></div>';
+  if (state.currentSessionId) {
+    // Clear just the chat pane, stay in the current session.
+    renderTurns([]);
+  } else {
+    $("chat").innerHTML =
+      '<div class="empty"><p>Ask a question. Citations will appear below the answer.</p></div>';
+  }
 });
 
 // ---- eval panel -----------------------------------------------------------
@@ -203,7 +322,7 @@ function humanSize(n) {
 
 function addFiles(files) {
   // Filter to supported extensions.
-  const allowed = new Set([".pdf", ".md", ".markdown", ".py"]);
+  const allowed = new Set([".pdf", ".md", ".markdown", ".py", ".epub"]);
   for (const f of files) {
     const name = (f.name || "").toLowerCase();
     const dot = name.lastIndexOf(".");
@@ -447,4 +566,5 @@ async function loadTopics() {
 
 checkHealth();
 loadTopics();
+loadSessions();
 setInterval(checkHealth, 30000);

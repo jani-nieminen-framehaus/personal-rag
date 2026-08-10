@@ -25,6 +25,9 @@ Pillow>=10.0.0,<11
 # --- PDF ingester (P1) ---
 pymupdf>=1.24.0,<2
 
+# --- EPUB ingester (P2) ---
+ebooklib>=0.5,<1
+
 # --- Vector store ---
 qdrant-client>=1.10.0,<2
 

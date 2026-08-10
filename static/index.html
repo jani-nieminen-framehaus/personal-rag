@@ -15,7 +15,6 @@
         <span class="status-text" id="statusText">checking...</span>
         <span class="spacer"></span>
         <button id="evalBtn" class="ghost">run eval</button>
-        <button id="clearBtn" class="ghost">clear</button>
       </div>
       <nav class="tabs" role="tablist">
         <button class="tab active" data-tab="ask" role="tab">Ask</button>
@@ -27,6 +26,13 @@
     <main>
       <!-- Ask tab -->
       <section id="tab-ask" class="tab-panel active">
+        <div class="session-row">
+          <select id="sessionSelect" title="Conversation session">
+            <option value="">— no session —</option>
+          </select>
+          <button id="newSessionBtn" class="ghost" title="Start a new session">+ new</button>
+          <button id="clearBtn" class="ghost" title="Clear this chat">clear</button>
+        </div>
         <div class="chat" id="chat">
           <div class="empty">
             <p>Ask a question. Citations will appear below the answer.</p>
@@ -48,11 +54,11 @@
           <div id="dropzone" class="dropzone" tabindex="0" role="button"
                aria-label="Drop files here or click to pick">
             <div class="dropzone-icon">+</div>
-            <div class="dropzone-text">Drop PDFs or Markdown files here</div>
+            <div class="dropzone-text">Drop PDFs, EPUBs, or Markdown files here</div>
             <div class="dropzone-hint">or click to pick from your computer</div>
           </div>
           <input type="file" id="filePicker" multiple
-                 accept=".pdf,.md,.markdown,.py" style="display:none">
+                 accept=".pdf,.md,.markdown,.py,.epub" style="display:none">
           <div id="ingestList" class="ingest-list"></div>
           <div class="ingest-actions">
             <button id="ingestBtn" class="primary" disabled>Ingest</button>

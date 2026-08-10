@@ -1,4 +1,4 @@
-"""Eval harness — recall@5, MRR, optional naive faithfulness.
+"""Eval harness — recall@5, MRR, optional NLI faithfulness.
 
 Filename kept as `run_ragas.py` per the project taxonomy. There is no Ragas
 framework dependency — metrics are computed directly from retrieval results.
@@ -13,11 +13,8 @@ Golden set format (`eval/golden_set.jsonl`, one JSON object per line):
 Metrics:
     recall@k   : fraction of relevant chunks that appear in the top-k.
     MRR        : mean reciprocal rank of the FIRST relevant chunk (1/rank).
-    faithfulness (optional): token-overlap heuristic between the generated
-                answer and the union of retrieved chunk texts. NOT a real
-                faithfulness measure — it catches the trivial "model ignored
-                the sources" case, nothing more. The P1 plan is to swap in
-                an NLI-based metric.
+    faithfulness: NLI entailment score via cross-encoder/nli-deberta-v3-xsmall.
+                  Falls back to the token-overlap proxy if the model is unavailable.
 """
 from __future__ import annotations
 
@@ -26,7 +23,10 @@ import logging
 import re
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
+
+if TYPE_CHECKING:
+    from eval.nli_faithfulness import NliFaithfulness
 
 from core.pipeline import ask as ask_pipeline
 from core.interfaces import Embedder, Reranker, Generator
@@ -109,6 +109,7 @@ def run(
     top_k_dense: int = 20,
     top_k_final: int = 5,
     metadata: MetadataStore | None = None,
+    nli_faithfulness: "NliFaithfulness | None" = None,
 ) -> dict[str, Any]:
     """Compute aggregate metrics over the golden set."""
     gold = load_golden(golden_path)
@@ -160,13 +161,17 @@ def run(
             "mrr": m,
         }
         if generator is not None:
-            # Bug #5 fix: pass chunk TEXT (not source_path) so the proxy
-            # measures actual answer↔content overlap. The previous code
-            # measured answer↔file_path overlap, which was meaningless.
-            f = faithfulness_proxy(result.answer, [c["text"] for c in result.citations])
-            faithfulness_sum += f
+            chunk_texts = [c["text"] for c in result.citations]
+            if nli_faithfulness is not None and chunk_texts:
+                # Real NLI entailment — uses cross-encoder/nli-deberta-v3-xsmall.
+                f = nli_faithfulness.score(result.answer, chunk_texts)
+                row["faithfulness_proxy"] = round(f, 4)
+            else:
+                # Token-overlap fallback (original heuristic).
+                f = faithfulness_proxy(result.answer, chunk_texts)
+                row["faithfulness_proxy"] = f
+            faithfulness_sum += row["faithfulness_proxy"]
             faithfulness_count += 1
-            row["faithfulness_proxy"] = f
         per_question.append(row)
 
     n = max(1, len(gold))

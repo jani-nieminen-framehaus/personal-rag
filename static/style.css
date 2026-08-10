@@ -227,6 +227,27 @@ form {
   border-top: 1px solid var(--border-soft);
 }
 
+/* Session row — sits above the chat pane inside the Ask tab. */
+.session-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+#sessionSelect {
+  flex: 1;
+  background: var(--bg-elev);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.4rem 0.5rem;
+  font-family: var(--sans);
+  font-size: 0.85rem;
+  max-width: 400px;
+}
+
 #topic {
   background: var(--bg-elev);
   color: var(--fg);

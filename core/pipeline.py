@@ -221,6 +221,136 @@ def ingest(
 
 
 # -----------------------------------------------------------------------------
+# Hybrid (BM25) retrieval helpers
+# -----------------------------------------------------------------------------
+
+
+def _tokenize_for_sparse(text: str) -> list[str]:
+    """Simple tokenizer matching the one used in store.enable_hybrid()."""
+    import re
+    return re.findall(r"\w{2,}", text.lower())
+
+
+def _build_query_sparse_vector(query: str, vocab: dict[str, int] | None, idf: dict[str, float] | None) -> "SparseVector | None":
+    """Build a sparse vector for the query.
+
+    Must use the same IDF weights as enable_hybrid() so scores are comparable.
+    If vocab/idf are not provided, returns None (sparse not populated yet).
+    """
+    from collections import Counter
+    from qdrant_client.http.models import SparseVector
+
+    if vocab is None or idf is None:
+        return None
+    tokens = _tokenize_for_sparse(query)
+    tf = Counter(tokens)
+    if not tf:
+        return None
+    max_tf = max(tf.values()) or 1
+    indices: list[int] = []
+    values: list[float] = []
+    for term, count in tf.items():
+        if term in vocab:
+            score = (count / max_tf) * idf.get(term, 0.0)
+            if score > 0:
+                indices.append(vocab[term])
+                values.append(score)
+    if not indices:
+        return None
+    return SparseVector(indices=indices, values=values)
+
+
+# Cached corpus stats for hybrid search — built lazily on first hybrid query.
+_hybrid_cache: dict = {"vocab": None, "idf": None, "built": False}
+
+
+def _retrieve_hybrid(
+    query: str,
+    qvec: list[float],
+    store: QdrantStore,
+    top_k: int,
+    topic: str | None,
+) -> list[tuple]:
+    """Dense + sparse hybrid search with RRF fusion.
+
+    On first call, lazily builds the corpus IDF map by scrolling all chunks.
+    Subsequent calls reuse the cached IDF (refreshes only if needed).
+    """
+    import math
+    import re
+    from collections import Counter
+
+    from qdrant_client.http.models import SparseVector
+
+    global _hybrid_cache
+
+    # Lazy IDF build.
+    if not _hybrid_cache["built"]:
+        log.info("hybrid: building corpus IDF map...")
+        _TOKEN_RE = re.compile(r"\w{2,}")
+
+        def tokenize(t: str) -> list[str]:
+            return _TOKEN_RE.findall(t.lower())
+
+        all_texts: list[tuple[str, str]] = []
+        offset = None
+        while True:
+            pts, offset = store.client.scroll(
+                collection_name=store.collection,
+                limit=256, offset=offset,
+                with_payload=True, with_vectors=False,
+            )
+            for p in pts:
+                text = (p.payload or {}).get("text", "")
+                if text:
+                    all_texts.append((p.id, text))
+            if offset is None:
+                break
+
+        N = len(all_texts)
+        doc_freq: Counter = Counter()
+        for _, text in all_texts:
+            for tok in set(tokenize(text)):
+                doc_freq[tok] += 1
+
+        _hybrid_cache["idf"] = {
+            t: math.log((N - df + 0.5) / (df + 0.5) + 1.0)
+            for t, df in doc_freq.items()
+        }
+        _hybrid_cache["vocab"] = {t: i for i, t in enumerate(sorted(_hybrid_cache["idf"]))}
+        _hybrid_cache["built"] = True
+        log.info("hybrid: IDF map ready — vocab=%d terms", len(_hybrid_cache["vocab"]))
+
+    # Build query sparse vector.
+    vocab = _hybrid_cache["vocab"]
+    idf = _hybrid_cache["idf"]
+    query_sparse = _build_query_sparse_vector(query, vocab, idf)
+
+    if query_sparse is None:
+        log.warning("hybrid: no query terms found in vocabulary — falling back to dense")
+        return store.search_dense(qvec, top_k=top_k)
+
+    # Call the store's hybrid search.
+    try:
+        hits = store.search_hybrid(
+            query_vector=qvec,
+            query_sparse=query_sparse,
+            top_k=top_k,
+            dense_weight=0.5,
+        )
+    except Exception as e:
+        log.warning("hybrid search failed (%s) — falling back to dense", e)
+        return store.search_dense(qvec, top_k=top_k)
+
+    # Filter by topic if requested (simple post-filter).
+    if topic:
+        hits = [(c, ds, hs) for c, ds, hs in hits if c.topic == topic]
+
+    # Return as (chunk, score) tuples for compatibility with the rest of ask().
+    return [(c, hs) for c, ds, hs in hits]
+
+
+# -----------------------------------------------------------------------------
 # Ask driver
 # -----------------------------------------------------------------------------
 
@@ -245,17 +375,27 @@ def ask(
     top_k_final: int = 5,
     topic: str | None = None,
     metadata: MetadataStore | None = None,
+    hybrid: bool = False,
 ) -> AskResult:
-    """Full retrieve → rerank → build → generate pipeline."""
+    """Full retrieve → rerank → build → generate pipeline.
+
+    Args:
+        hybrid: if True, use hybrid (dense + sparse BM25) search with RRF fusion.
+            Requires sparse vectors to be populated first via `store.enable_hybrid()`
+            or `rag ingest --populate-sparse`.
+    """
     # 1. Embed the query. Audit #9: use embed_query (with the model's
     #    retrieval instruction prefix) instead of plain embed. Documents
     #    were embedded without the prefix at ingest time, so the
     #    asymmetric space is what the model was trained for.
     qvec = embedder.embed_query(query)
 
-    # 2. Retrieve top_k_dense from the store.
-    hits = store.search_with_filter(qvec, top_k=top_k_dense, topic=topic) if topic \
-        else store.search_dense(qvec, top_k=top_k_dense)
+    # 2. Retrieve top_k_dense from the store (or hybrid search).
+    if hybrid:
+        hits = _retrieve_hybrid(query, qvec, store, top_k=top_k_dense, topic=topic)
+    else:
+        hits = store.search_with_filter(qvec, top_k=top_k_dense, topic=topic) if topic \
+            else store.search_dense(qvec, top_k=top_k_dense)
     if not hits:
         return AskResult(answer="(no results found in the index)", citations=[])
 

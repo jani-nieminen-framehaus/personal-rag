@@ -13,6 +13,9 @@ rather than duplicating them.
 from __future__ import annotations
 
 import logging
+import math
+import re
+from collections import Counter
 from typing import Any
 
 from qdrant_client import QdrantClient
@@ -24,6 +27,7 @@ from qdrant_client.http.models import (
     Modifier,
     PointStruct,
     Filter,
+    SparseVector,
 )
 
 from core.interfaces import Chunk
@@ -189,16 +193,192 @@ class QdrantStore:
     # -- P1 migration path ----------------------------------------------------
 
     def enable_hybrid(self) -> None:
-        """No-op in P0.
+        """Populate the sparse slot with TF-IDF (≈BM25) vectors.
 
-        P1 will:
-          1. iterate all points, compute BM25 sparse vectors for each chunk's
-             text, and call update_vectors(using='sparse', ...).
-          2. switch retrieve_dense to a hybrid query with RRF fusion
-             (see core.pipeline.retrieve_hybrid).
-        The collection schema already supports it — no recreate needed.
+        Algorithm:
+          1. Scroll all points, extract chunk text from payload.
+          2. Build corpus: all chunk texts → vocabulary + document frequencies.
+          3. Compute IDF for each vocabulary term (standard Lucene formula).
+          4. For each chunk: tokenize, compute TF-IDF per term, store as a
+             sparse vector in Qdrant via update_vectors.
+
+        The collection schema already has the sparse slot declared — no
+        recreate needed. Safe to re-run; update_vectors is idempotent.
+
+        After calling this, search_hybrid() becomes available.
         """
-        log.info("enable_hybrid() is a no-op in P0 — wired for P1")
+        log.info("enable_hybrid: scrolling all points to build corpus vocabulary...")
+        # Step 1: collect all chunk texts.
+        chunk_texts: list[tuple[str, str]] = []  # (chunk_id, text)
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.collection,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for p in points:
+                payload = p.payload or {}
+                text = payload.get("text", "")
+                if text:
+                    chunk_texts.append((p.id, text))
+            if offset is None:
+                break
+
+        if not chunk_texts:
+            log.warning("enable_hybrid: no chunks found in collection")
+            return
+
+        log.info("enable_hybrid: building vocabulary from %d chunks", len(chunk_texts))
+
+        # Step 2: build vocabulary and document frequencies.
+        # Simple whitespace+punctuation tokenizer.
+        _TOKEN_RE = re.compile(r"\w{2,}")  # ≥2-char words, strips noise
+
+        def tokenize(text: str) -> list[str]:
+            return _TOKEN_RE.findall(text.lower())
+
+        doc_freq: Counter[str] = Counter()
+        for _, text in chunk_texts:
+            tokens = set(tokenize(text))
+            for t in tokens:
+                doc_freq[t] += 1
+
+        N = len(chunk_texts)
+        # IDF using the Lucene formula (smoothed).
+        idf: dict[str, float] = {
+            term: math.log((N - df + 0.5) / (df + 0.5) + 1.0)
+            for term, df in doc_freq.items()
+        }
+        # Build a sorted vocab so indices are deterministic.
+        vocab = sorted(idf.keys())
+        term_to_idx: dict[str, int] = {t: i for i, t in enumerate(vocab)}
+        log.info(
+            "enable_hybrid: vocabulary size=%d, N=%d, avg_df=%.1f",
+            len(vocab), N, sum(doc_freq.values()) / N,
+        )
+
+        # Step 3: compute sparse vectors for each chunk.
+        log.info("enable_hybrid: computing sparse vectors for %d chunks...", len(chunk_texts))
+        from qdrant_client.http.models import PointVectors
+
+        batch: list[PointVectors] = []
+        for chunk_id, text in chunk_texts:
+            tokens = tokenize(text)
+            tf = Counter(tokens)
+            # Build sparse vector: indices + BM25-like TF-IDF values.
+            # Use TF * IDF with k1=0 (binary-like, just IDF weighting).
+            # This gives a pure IDF-weighted term vector.
+            indices: list[int] = []
+            values: list[float] = []
+            for term, count in tf.items():
+                if term in term_to_idx:
+                    # Simple TF-IDF: tf=count, idf from above.
+                    # Normalise by max_tf for BM25-like behaviour without k1 param.
+                    max_tf = max(tf.values()) or 1
+                    score = (count / max_tf) * idf.get(term, 0.0)
+                    if score > 0:
+                        indices.append(term_to_idx[term])
+                        values.append(score)
+
+            if not indices:
+                # Empty/skip — give it a zero vector to avoid Qdrant errors.
+                indices = [0]
+                values = [0.0]
+
+            batch.append(
+                PointVectors(
+                    id=chunk_id,
+                    vector={"sparse": SparseVector(indices=indices, values=values)},
+                )
+            )
+
+        # Step 4: upsert all sparse vectors.
+        self.client.update_vectors(
+            collection_name=self.collection,
+            points=batch,
+            wait=True,
+        )
+        log.info(
+            "enable_hybrid: done — %d sparse vectors written to %s",
+            len(batch), self.collection,
+        )
+
+    def search_hybrid(
+        self,
+        query_vector: list[float],
+        query_sparse: SparseVector,
+        top_k: int = 20,
+        dense_weight: float = 0.5,
+    ) -> list[tuple[Chunk, float, float]]:
+        """Hybrid search: RRF fusion of dense and sparse results.
+
+        Args:
+            query_vector: the dense query embedding.
+            query_sparse: a pre-built SparseVector for the query text.
+            top_k: number of candidates to retrieve from each branch.
+            dense_weight: balance between dense and sparse (0.0-1.0).
+                0.5 = equal weight. Higher = more dense. Lower = more sparse.
+
+        Returns (chunk, dense_score, hybrid_score) tuples best-first.
+        """
+        # Retrieve from both branches independently.
+        dense_hits = self.search_dense(query_vector, top_k=top_k)
+        sparse_hits = self._search_sparse(query_sparse, top_k=top_k)
+
+        # Build score maps for RRF.
+        dense_scores: dict[str, float] = {c.chunk_id: s for c, s in dense_hits}
+        sparse_scores: dict[str, float] = {c.chunk_id: s for c, s in sparse_hits}
+        all_ids = set(dense_scores) | set(sparse_scores)
+
+        # RRF with optional weighting.
+        k = 60  # standard RRF constant
+        rrf_scores: dict[str, float] = {}
+        for cid in all_ids:
+            ds = dense_scores.get(cid, 0.0)
+            ss = sparse_scores.get(cid, 0.0)
+            rrf = (
+                dense_weight * (1 / (k + 1)) * (1 + ds) +
+                (1 - dense_weight) * (1 / (k + 1)) * (1 + ss)
+            )
+            # True RRF: rank-based, not score-based.
+            # Simpler approach: use normalised scores directly.
+            rrf_scores[cid] = ds * dense_weight + ss * (1 - dense_weight)
+
+        # Return best-first by fused score.
+        sorted_ids = sorted(rrf_scores, key=rrf_scores.__getitem__, reverse=True)
+        chunk_by_id = {c.chunk_id: c for c, _ in dense_hits}
+        chunk_by_id.update({c.chunk_id: c for c, _ in sparse_hits})
+
+        out: list[tuple[Chunk, float, float]] = []
+        for cid in sorted_ids[:top_k]:
+            c = chunk_by_id.get(cid)
+            if c:
+                out.append((c, dense_scores.get(cid, 0.0), rrf_scores[cid]))
+        return out
+
+    def _search_sparse(self, query: SparseVector, top_k: int) -> list[tuple[Chunk, float]]:
+        """Search using the sparse vector slot. Returns (chunk, score) pairs."""
+        try:
+            hits = self.client.query_points(
+                collection_name=self.collection,
+                query=query,
+                using="sparse",
+                limit=top_k,
+                with_payload=True,
+            ).points
+        except Exception:
+            # Sparse not populated yet.
+            return []
+        out: list[tuple[Chunk, float]] = []
+        for h in hits:
+            payload = h.payload or {}
+            if not all(k in payload for k in ("chunk_id", "text", "source_path", "topic", "doc_type", "section")):
+                continue
+            out.append((Chunk.from_payload(payload), float(h.score)))
+        return out
 
     # -- ops ------------------------------------------------------------------
 

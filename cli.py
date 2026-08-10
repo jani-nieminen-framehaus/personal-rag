@@ -36,6 +36,7 @@ from core.metadata import MetadataStore
 from ingest.markdown_dir import MarkdownDirIngester
 from ingest.zeal_docsets import ZealIngester
 from ingest.pdf_dir import PdfDirIngester
+from ingest.epub_dir import EpubDirIngester
 
 
 # Persistent service state for the GUI. Lives in the user's home so
@@ -82,8 +83,9 @@ def cli(ctx, config, verbose):
 @click.option("--topic", default=None, help="Restrict retrieval to a single topic.")
 @click.option("--no-citations", is_flag=True, help="Print the answer only.")
 @click.option("--json", "as_json", is_flag=True, help="Print a machine-readable AskResult.")
+@click.option("--hybrid", is_flag=True, help="Use hybrid (dense + sparse BM25) search.")
 @click.pass_context
-def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json):
+def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json, hybrid):
     """Ask a question over the knowledge base."""
     cfg = ctx.obj["config"]
     pip = cfg.get("pipeline", {})
@@ -106,6 +108,7 @@ def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json):
         top_k_final=top_k_final,
         topic=topic,
         metadata=metadata,
+        hybrid=hybrid,
     )
     if metadata is not None:
         metadata.close()
@@ -128,13 +131,16 @@ def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json):
 @click.option("--markdown", "markdown_path", default=None, help="Directory of .md files to ingest.")
 @click.option("--zeal", "zeal_path", default=None, help="Path to a .docset directory.")
 @click.option("--pdf", "pdf_path", default=None, help="Path to a single .pdf file OR a directory of PDFs.")
+@click.option("--epub", "epub_path", default=None, help="Path to a single .epub file OR a directory of EPUBs.")
 @click.option("--recreate", is_flag=True, help="Drop and recreate the collection before ingest.")
 @click.option("--batch-size", default=None, type=int, help="Override embedder batch size.")
+@click.option("--populate-sparse", is_flag=True,
+              help="After ingest, compute BM25 sparse vectors for hybrid search.")
 @click.pass_context
-def ingest(ctx, markdown_path, zeal_path, pdf_path, recreate, batch_size):
-    """Ingest Markdown notes, Zeal docsets, and/or PDFs into the index."""
-    if not (markdown_path or zeal_path or pdf_path):
-        raise click.UsageError("pass at least one of --markdown, --zeal, or --pdf")
+def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_size, populate_sparse):
+    """Ingest Markdown notes, Zeal docsets, PDFs, and/or EPUBs into the index."""
+    if not (markdown_path or zeal_path or pdf_path or epub_path):
+        raise click.UsageError("pass at least one of --markdown, --zeal, --pdf, or --epub")
 
     cfg = ctx.obj["config"]
     ch = cfg.get("chunking", {})
@@ -198,8 +204,34 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, recreate, batch_size):
             recreate=rec, batch_size=batch_size, metadata=metadata,
         )
 
+    if epub_path:
+        ei = EpubDirIngester(
+            path=epub_path,
+            target_tokens=ch.get("target_tokens", 768),
+            overlap_pct=ch.get("overlap_pct", 12),
+            min_chunk_tokens=ch.get("min_chunk_tokens", 32),
+            default_topic=ing.get("default_topic", "default"),
+            max_chunks_per_doc=ch.get("max_chunks_per_doc", 2000),
+        )
+        click.echo(f"ingesting EPUB from {epub_path} …")
+        # If this is the only source, --recreate is honored.
+        rec = recreate if not (markdown_path or zeal_path or pdf_path) else False
+        total += ingest_pipeline(
+            ei, embedder, store,
+            recreate=rec, batch_size=batch_size, metadata=metadata,
+        )
+
     if metadata is not None:
         metadata.close()
+
+    if populate_sparse:
+        click.echo("populating sparse (BM25) vectors …")
+        try:
+            store.enable_hybrid()
+            click.echo("sparse vectors populated.")
+        except Exception as e:
+            click.echo(f"warning: sparse population failed: {e}", err=True)
+
     click.echo(f"done. wrote {total} chunks into {store.collection}.")
 
 
@@ -242,11 +274,14 @@ def _resolve_repo_path(path_str: str) -> Path:
               help="Path to golden_set.jsonl. Resolved against CWD, then the repo root.")
 @click.option("--json", "as_json", is_flag=True, help="Print metrics as JSON.")
 @click.option("--with-faithfulness", is_flag=True,
-              help="Also run the (slow) LLM generation step to compute the faithfulness proxy. "
+              help="Also run the (slow) LLM generation step to compute faithfulness. "
                    "Requires Ollama to be running with the configured generator model.")
+@click.option("--nli", is_flag=True,
+              help="Use NLI cross-encoder (cross-encoder/nli-deberta-v3-xsmall) "
+                   "for the faithfulness score. Falls back to token-overlap if unavailable.")
 @click.pass_context
-def eval(ctx, golden, as_json, with_faithfulness):
-    """Run the eval harness: recall@5, MRR, naive faithfulness."""
+def eval(ctx, golden, as_json, with_faithfulness, nli):
+    """Run the eval harness: recall@5, MRR, NLI faithfulness."""
     # Lazy import so the eval dependencies don't load on every command.
     from eval import run_ragas
 
@@ -261,6 +296,17 @@ def eval(ctx, golden, as_json, with_faithfulness):
     # when Ollama isn't running.
     generator = make_generator(cfg) if with_faithfulness else None
 
+    # NLI faithfulness scorer — loaded lazily; None if unavailable.
+    nli_scorer = None
+    if nli:
+        try:
+            from eval.nli_faithfulness import make_nli_faithfulness
+            nli_scorer = make_nli_faithfulness(cfg)
+            if nli_scorer is None:
+                click.echo("nli: model unavailable — falling back to token-overlap proxy")
+        except Exception as e:
+            click.echo(f"nli: could not load scorer: {e} — skipping")
+
     metrics = run_ragas.run(
         golden_path=golden_path,
         embedder=embedder,
@@ -270,6 +316,7 @@ def eval(ctx, golden, as_json, with_faithfulness):
         top_k_dense=cfg.get("pipeline", {}).get("top_k_dense", 20),
         top_k_final=cfg.get("pipeline", {}).get("top_k_final", 5),
         metadata=metadata,
+        nli_faithfulness=nli_scorer,
     )
     if metadata is not None:
         metadata.close()
@@ -589,6 +636,62 @@ def eval_runs(ctx, limit, as_json):
             f"  {r['ran_at']}  n={r['n_questions']:<3}  "
             f"recall@5={r['recall_at_5']:.2f}  mrr={r['mrr']:.2f}{rd_str}{fp_str}"
         )
+
+
+@cli.command("sessions")
+@click.option("--limit", default=20, type=int, help="Max sessions to show (default 20).")
+@click.option("--session", "session_id", default=None,
+              help="Show turns for a specific session ID instead of listing sessions.")
+@click.option("--json", "as_json", is_flag=True, help="Print as JSON.")
+@click.pass_context
+def sessions(ctx, limit, session_id, as_json):
+    """List recent chat sessions, or show turns for a specific session.
+
+    Use --session <id> to see the full conversation for one session.
+    Session IDs are printed alongside each session in the list output.
+    """
+    cfg = ctx.obj["config"]
+    md = _open_metadata(cfg)
+    try:
+        if session_id:
+            rows = md.get_turns(session_id, limit=limit)
+        else:
+            rows = md.get_sessions(limit=limit)
+    finally:
+        md.close()
+
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+        return
+
+    if not rows:
+        if session_id:
+            click.echo(f"(no turns found for session {session_id})")
+        else:
+            click.echo("(no sessions yet — start chatting in the GUI first)")
+        return
+
+    if session_id:
+        click.echo(f"session {session_id}  ({len(rows)} turn(s)):")
+        for t in rows:
+            q = t["query"]
+            a = t["answer"]
+            ts = (t["asked_at"] or "").replace("T", " ")[:19]
+            click.echo(f"  [{ts}]")
+            click.echo(f"    Q: {q}")
+            # One-line preview of the answer
+            preview = a.split("\n")[0]
+            if len(preview) > 80:
+                preview = preview[:77] + "…"
+            click.echo(f"    A: {preview}")
+            click.echo("")
+    else:
+        click.echo(f"{len(rows)} recent session(s):")
+        for s in rows:
+            ts = (s["updated_at"] or "").replace("T", " ")[:19]
+            title = s["title"] or "(untitled)"
+            n = s["turn_count"]
+            click.echo(f"  {ts}  [{s['id']}]  {n} turn(s)  {title}")
 
 
 # -----------------------------------------------------------------------------
