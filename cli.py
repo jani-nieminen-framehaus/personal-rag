@@ -301,6 +301,24 @@ def _resolve_repo_path(path_str: str) -> Path:
     return p
 
 
+def _exit_if_no_combo_succeeded(results: list[dict], label: str) -> None:
+    """Exit 1 when not a single sweep row came back ok.
+
+    Wave A's theme: honest exit codes (`ingest --populate-sparse` already
+    does this). A table of nothing but failures is not a successful run —
+    returning 0 lets a scripted sweep, or a tired operator, read it as one.
+    The table is printed first, because it carries the diagnosis.
+    """
+    if any(r.get("status") == "ok" for r in results):
+        return
+    click.echo(
+        f"error: every combination failed — {len(results)} {label} combination(s) "
+        "attempted, none produced metrics. See the status column above.",
+        err=True,
+    )
+    sys.exit(1)
+
+
 @cli.command()
 @click.option("--golden", default="eval/golden_set.jsonl",
               help="Path to golden_set.jsonl. Resolved against CWD, then the repo root.")
@@ -375,6 +393,7 @@ def eval(ctx, golden, as_json, with_faithfulness, nli, sweep, sweep_chunking, ma
         if metadata is not None:
             metadata.close()
         click.echo(sweep_mod.format_chunking_table(results))
+        _exit_if_no_combo_succeeded(results, "chunking sweep")
         return
 
     if sweep:
@@ -385,6 +404,7 @@ def eval(ctx, golden, as_json, with_faithfulness, nli, sweep, sweep_chunking, ma
         if metadata is not None:
             metadata.close()
         click.echo(sweep_mod.format_table(results))
+        _exit_if_no_combo_succeeded(results, "sweep")
         return
 
     reranker = make_reranker(cfg)

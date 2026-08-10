@@ -130,6 +130,70 @@ def test_eval_flags_override_config(tmp_path, stub_abcs):
 
 
 # -----------------------------------------------------------------------------
+# `rag eval --sweep` must not exit 0 when every combination failed
+# -----------------------------------------------------------------------------
+
+def _combo(status: str, recall=None, mrr=None) -> dict:
+    return {"params": {"dense_weight": 0.5, "top_k_dense": 20,
+                       "top_k_final": 5, "reranker": "bge"},
+            "status": status, "recall_at_5": recall, "mrr": mrr}
+
+
+def _chunk_combo(status: str, recall=None, mrr=None) -> dict:
+    return {"params": {"target_tokens": 768},
+            "status": status, "recall_at_5": recall, "mrr": mrr}
+
+
+def test_sweep_exits_1_when_every_combination_failed(tmp_path, stub_abcs):
+    """Wave A's theme was honest exit codes (--populate-sparse already does
+    this). A sweep that printed a table of nothing but failures still
+    returned 0, so a scripted run — or a tired operator — reads success."""
+    cfg = _write_cfg(tmp_path, {})
+    results = [_combo("failed: qdrant refused the connection"),
+               _combo("failed: qdrant refused the connection")]
+    with patch("eval.sweep.run_sweep", return_value=results):
+        res = CliRunner().invoke(cli_mod.cli, ["-c", cfg, "eval", "--sweep"])
+    assert res.exit_code == 1, res.output
+    assert "every combination failed" in res.output.lower()
+
+
+def test_sweep_exits_0_when_any_combination_succeeded(tmp_path, stub_abcs):
+    cfg = _write_cfg(tmp_path, {})
+    results = [_combo("ok", 0.91, 0.85), _combo("failed: boom")]
+    with patch("eval.sweep.run_sweep", return_value=results):
+        res = CliRunner().invoke(cli_mod.cli, ["-c", cfg, "eval", "--sweep"])
+    assert res.exit_code == 0, res.output
+    assert "0.91" in res.output
+
+
+def test_chunking_sweep_exits_1_when_every_combination_failed(tmp_path, stub_abcs):
+    cfg = _write_cfg(tmp_path, {})
+    results = [_chunk_combo("failed: section mode needs relevant_refs")]
+    with patch("eval.sweep.run_chunking_sweep", return_value=results):
+        res = CliRunner().invoke(cli_mod.cli, [
+            "-c", cfg, "eval", "--sweep-chunking", "--markdown", str(tmp_path)])
+    assert res.exit_code == 1, res.output
+    assert "every combination failed" in res.output.lower()
+
+
+def test_chunking_sweep_exits_0_when_any_combination_succeeded(tmp_path, stub_abcs):
+    cfg = _write_cfg(tmp_path, {})
+    results = [_chunk_combo("ok", 0.42, 0.31)]
+    with patch("eval.sweep.run_chunking_sweep", return_value=results):
+        res = CliRunner().invoke(cli_mod.cli, [
+            "-c", cfg, "eval", "--sweep-chunking", "--markdown", str(tmp_path)])
+    assert res.exit_code == 0, res.output
+
+
+def test_failed_sweep_still_prints_the_table(tmp_path, stub_abcs):
+    """The table is the diagnosis — exiting 1 must not hide it."""
+    cfg = _write_cfg(tmp_path, {})
+    with patch("eval.sweep.run_sweep", return_value=[_combo("failed: boom")]):
+        res = CliRunner().invoke(cli_mod.cli, ["-c", cfg, "eval", "--sweep"])
+    assert "failed: boom" in res.output
+
+
+# -----------------------------------------------------------------------------
 # build_golden: relevant_refs + the chunking_params drift it exists to prevent
 # -----------------------------------------------------------------------------
 
