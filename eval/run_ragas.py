@@ -56,6 +56,11 @@ def load_golden(path: Path) -> list[dict[str, Any]]:
             obj = json.loads(line)
             if "question" not in obj or "relevant_chunk_ids" not in obj:
                 raise ValueError(f"line {ln}: missing question or relevant_chunk_ids")
+            ids = obj["relevant_chunk_ids"]
+            if not isinstance(ids, list) or not all(isinstance(c, str) for c in ids):
+                # A bare string would iterate as characters downstream and
+                # silently zero out recall — fail loudly instead.
+                raise ValueError(f"line {ln}: relevant_chunk_ids must be a list of strings")
             out.append(obj)
     return out
 
@@ -166,10 +171,12 @@ def run(
                 # Real NLI entailment — uses cross-encoder/nli-deberta-v3-xsmall.
                 f = nli_faithfulness.score(result.answer, chunk_texts)
                 row["faithfulness_proxy"] = round(f, 4)
+                row["faithfulness_method"] = "nli"
             else:
                 # Token-overlap fallback (original heuristic).
                 f = faithfulness_proxy(result.answer, chunk_texts)
                 row["faithfulness_proxy"] = f
+                row["faithfulness_method"] = "lexical"
             faithfulness_sum += row["faithfulness_proxy"]
             faithfulness_count += 1
         per_question.append(row)
@@ -185,6 +192,10 @@ def run(
     }
     if faithfulness_count:
         summary["faithfulness_proxy"] = round(faithfulness_sum / faithfulness_count, 4)
+        # NLI scores and lexical-overlap scores are not comparable numbers —
+        # tag which scorer produced them so runs can be compared honestly.
+        methods = {r["faithfulness_method"] for r in per_question if "faithfulness_method" in r}
+        summary["faithfulness_method"] = methods.pop() if len(methods) == 1 else "mixed"
 
     # P1 metadata: one row per eval run so you can track quality over time.
     if metadata is not None:

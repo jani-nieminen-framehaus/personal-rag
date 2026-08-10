@@ -96,7 +96,12 @@ def _state_write(host: str, port: int) -> None:
             "lan_url": f"http://{_hostname()}.local:{port}" if host == "0.0.0.0" else None,
             "host": host,
         }
-        STATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Atomic write (temp + rename): a crash mid-write must not leave a
+        # truncated file — shutdown would silently skip cleanup and
+        # `rag status` would misreport until the file is deleted by hand.
+        tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(STATE_FILE)
     except OSError as e:
         log.warning("could not write state file %s: %s", STATE_FILE, e)
 

@@ -150,6 +150,12 @@ def main() -> int:
 
     GOLDEN.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
     log.info("wrote %s  (%d questions)", GOLDEN, len(out_lines))
+    if missing:
+        # The file is still written (useful for inspecting the drift), but a
+        # golden set with dangling references must fail the build — otherwise
+        # CI quietly runs evals against a shrunken question set.
+        log.error("golden set has %d drifted references — exiting 1", len(missing))
+        return 1
     return 0
 
 

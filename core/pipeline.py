@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -196,17 +197,12 @@ def ingest(
             progress(total, -1)
         buffer.clear()
 
-    for chunk in ingester.iter_chunks():
-        buffer.append(chunk)
-        if len(buffer) >= bs:
-            _flush()
-    _flush()
-    log.info("ingest: wrote %d chunks into %s", total, store.collection)
-
-    # P1 metadata: one row per unique source file. Cheap (one
-    # row per file, not per chunk) and idempotent — re-ingest
-    # just refreshes chunk_count + content_hash.
-    if metadata is not None and sources:
+    def _record_sources() -> None:
+        # P1 metadata: one row per unique source file. Cheap (one
+        # row per file, not per chunk) and idempotent — re-ingest
+        # just refreshes chunk_count + content_hash.
+        if metadata is None or not sources:
+            return
         for source_path, (doc_type, topic, texts) in sources.items():
             metadata.record_source(
                 source_path=source_path,
@@ -216,6 +212,30 @@ def ingest(
                 content_hash=hash_text("\n\n".join(texts)),
             )
         log.info("metadata: recorded %d source rows", len(sources))
+
+    try:
+        for chunk in ingester.iter_chunks():
+            buffer.append(chunk)
+            if len(buffer) >= bs:
+                _flush()
+        _flush()
+    except Exception:
+        # A source failing mid-stream leaves the collection partially
+        # updated. Record the sources that DID land so metadata matches
+        # what is actually in the collection, then propagate.
+        log.error(
+            "ingest: aborted after %d chunks — collection %s is partially updated",
+            total, store.collection,
+        )
+        _record_sources()
+        raise
+    finally:
+        # The corpus changed (or may have) — a stale IDF map would silently
+        # skew hybrid scores on the next query.
+        invalidate_hybrid_cache()
+
+    log.info("ingest: wrote %d chunks into %s", total, store.collection)
+    _record_sources()
 
     return total
 
@@ -260,8 +280,22 @@ def _build_query_sparse_vector(query: str, vocab: dict[str, int] | None, idf: di
     return SparseVector(indices=indices, values=values)
 
 
-# Cached corpus stats for hybrid search — built lazily on first hybrid query.
+# Cached corpus stats for hybrid search — built lazily on first hybrid query,
+# guarded by _hybrid_lock so two FastAPI threadpool workers can't both scroll
+# the corpus on a cold start. Invalidated after every ingest.
 _hybrid_cache: dict = {"vocab": None, "idf": None, "built": False}
+_hybrid_lock = threading.Lock()
+
+
+def invalidate_hybrid_cache() -> None:
+    """Drop the cached corpus IDF map so the next hybrid query rebuilds it.
+
+    Must be called after anything that changes the corpus (ingest, delete):
+    a stale IDF map silently shifts hybrid scores against the new corpus."""
+    with _hybrid_lock:
+        _hybrid_cache["vocab"] = None
+        _hybrid_cache["idf"] = None
+        _hybrid_cache["built"] = False
 
 
 def _retrieve_hybrid(
@@ -284,46 +318,50 @@ def _retrieve_hybrid(
 
     global _hybrid_cache
 
-    # Lazy IDF build.
-    if not _hybrid_cache["built"]:
-        log.info("hybrid: building corpus IDF map...")
-        _TOKEN_RE = re.compile(r"\w{2,}")
+    # Lazy IDF build. The lock makes the check-then-build atomic: a second
+    # worker arriving mid-build blocks here instead of scrolling the corpus
+    # a second time.
+    with _hybrid_lock:
+        if not _hybrid_cache["built"]:
+            log.info("hybrid: building corpus IDF map...")
+            _TOKEN_RE = re.compile(r"\w{2,}")
 
-        def tokenize(t: str) -> list[str]:
-            return _TOKEN_RE.findall(t.lower())
+            def tokenize(t: str) -> list[str]:
+                return _TOKEN_RE.findall(t.lower())
 
-        all_texts: list[tuple[str, str]] = []
-        offset = None
-        while True:
-            pts, offset = store.client.scroll(
-                collection_name=store.collection,
-                limit=256, offset=offset,
-                with_payload=True, with_vectors=False,
-            )
-            for p in pts:
-                text = (p.payload or {}).get("text", "")
-                if text:
-                    all_texts.append((p.id, text))
-            if offset is None:
-                break
+            all_texts: list[tuple[str, str]] = []
+            offset = None
+            while True:
+                pts, offset = store.client.scroll(
+                    collection_name=store.collection,
+                    limit=256, offset=offset,
+                    with_payload=True, with_vectors=False,
+                )
+                for p in pts:
+                    text = (p.payload or {}).get("text", "")
+                    if text:
+                        all_texts.append((p.id, text))
+                if offset is None:
+                    break
 
-        N = len(all_texts)
-        doc_freq: Counter = Counter()
-        for _, text in all_texts:
-            for tok in set(tokenize(text)):
-                doc_freq[tok] += 1
+            N = len(all_texts)
+            doc_freq: Counter = Counter()
+            for _, text in all_texts:
+                for tok in set(tokenize(text)):
+                    doc_freq[tok] += 1
 
-        _hybrid_cache["idf"] = {
-            t: math.log((N - df + 0.5) / (df + 0.5) + 1.0)
-            for t, df in doc_freq.items()
-        }
-        _hybrid_cache["vocab"] = {t: i for i, t in enumerate(sorted(_hybrid_cache["idf"]))}
-        _hybrid_cache["built"] = True
-        log.info("hybrid: IDF map ready — vocab=%d terms", len(_hybrid_cache["vocab"]))
+            _hybrid_cache["idf"] = {
+                t: math.log((N - df + 0.5) / (df + 0.5) + 1.0)
+                for t, df in doc_freq.items()
+            }
+            _hybrid_cache["vocab"] = {t: i for i, t in enumerate(sorted(_hybrid_cache["idf"]))}
+            _hybrid_cache["built"] = True
+            log.info("hybrid: IDF map ready — vocab=%d terms", len(_hybrid_cache["vocab"]))
 
-    # Build query sparse vector.
-    vocab = _hybrid_cache["vocab"]
-    idf = _hybrid_cache["idf"]
+        # Snapshot under the lock. Invalidation replaces these dicts rather
+        # than mutating them, so using the snapshots outside the lock is safe.
+        vocab = _hybrid_cache["vocab"]
+        idf = _hybrid_cache["idf"]
     query_sparse = _build_query_sparse_vector(query, vocab, idf)
 
     if query_sparse is None:

@@ -5,14 +5,38 @@
 
 $ErrorActionPreference = 'Stop'
 $TaskName = 'rag-gui'
+$stateFile = Join-Path $env:USERPROFILE '.rag\state.json'
 
-# Stop the service if it's running.
-$proc = Get-Process -Name python -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -match 'cli serve' } |
-    Select-Object -First 1
-if ($proc) {
-    Write-Host "stopping running rag service (pid $($proc.Id))..."
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+# Stop the service if it's running. The PID from the state file is
+# authoritative and works on every PowerShell version; the command-line
+# match is a fallback that needs PS 7+ ($_.CommandLine is $null on 5.1).
+$stopped = $false
+$statePid = $null
+if (Test-Path $stateFile) {
+    try {
+        $statePid = (Get-Content $stateFile -Raw | ConvertFrom-Json).pid
+    } catch {
+        # Truncated/invalid state file — fall through to the heuristic.
+    }
+}
+if ($statePid) {
+    $proc = Get-Process -Id $statePid -ErrorAction SilentlyContinue
+    if ($proc -and $proc.ProcessName -match 'python') {
+        Write-Host "stopping running rag service (pid $statePid)..."
+        Stop-Process -Id $statePid -Force -ErrorAction SilentlyContinue
+        $stopped = $true
+    }
+}
+if (-not $stopped) {
+    # Matches both launch forms: "python -m cli serve" and "python cli.py serve".
+    $proc = Get-Process -Name python -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'cli(\.py)?\s+serve' } |
+        Select-Object -First 1
+    if ($proc) {
+        Write-Host "stopping running rag service (pid $($proc.Id))..."
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        $stopped = $true
+    }
 }
 
 # Remove the scheduled task.
@@ -24,11 +48,20 @@ if ($existing) {
     Write-Host "  no scheduled task named '$TaskName' found — nothing to remove"
 }
 
-# Clean up the state file.
-$stateFile = Join-Path $env:USERPROFILE '.rag\state.json'
+# Clean up the state file — but never yank it out from under a server that
+# is still alive (that makes `rag status` report "not running" while the
+# server keeps serving).
 if (Test-Path $stateFile) {
-    Remove-Item $stateFile -Force -ErrorAction SilentlyContinue
-    Write-Host "  state file $stateFile removed"
+    $stillAlive = $false
+    if ($statePid -and -not $stopped) {
+        $stillAlive = [bool](Get-Process -Id $statePid -ErrorAction SilentlyContinue)
+    }
+    if ($stillAlive) {
+        Write-Host "  state file kept — server (pid $statePid) is still running; stop it first" -ForegroundColor Yellow
+    } else {
+        Remove-Item $stateFile -Force -ErrorAction SilentlyContinue
+        Write-Host "  state file $stateFile removed"
+    }
 }
 
 Write-Host ""

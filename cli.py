@@ -136,8 +136,10 @@ def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json, hybr
 @click.option("--batch-size", default=None, type=int, help="Override embedder batch size.")
 @click.option("--populate-sparse", is_flag=True,
               help="After ingest, compute BM25 sparse vectors for hybrid search.")
+@click.option("--yes", "-y", is_flag=True,
+              help="Skip the confirmation prompt when using --recreate.")
 @click.pass_context
-def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_size, populate_sparse):
+def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_size, populate_sparse, yes):
     """Ingest Markdown notes, Zeal docsets, PDFs, and/or EPUBs into the index."""
     if not (markdown_path or zeal_path or pdf_path or epub_path):
         raise click.UsageError("pass at least one of --markdown, --zeal, --pdf, or --epub")
@@ -150,6 +152,13 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
     store = make_store(cfg)
     metadata = make_metadata(cfg)
     total = 0
+
+    if recreate and not yes:
+        click.confirm(
+            f"--recreate will DROP collection '{store.collection}' before "
+            "re-ingesting; a failed ingest then leaves a partial index. Continue?",
+            abort=True,
+        )
 
     if markdown_path:
         mi = MarkdownDirIngester(
@@ -230,7 +239,14 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
             store.enable_hybrid()
             click.echo("sparse vectors populated.")
         except Exception as e:
-            click.echo(f"warning: sparse population failed: {e}", err=True)
+            click.echo(f"error: sparse population failed: {e}", err=True)
+            click.echo(
+                f"wrote {total} chunks into {store.collection}, but the index is "
+                "dense-only — hybrid queries will fall back to dense search. "
+                "Re-run with --populate-sparse after fixing the error.",
+                err=True,
+            )
+            sys.exit(1)
 
     click.echo(f"done. wrote {total} chunks into {store.collection}.")
 

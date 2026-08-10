@@ -3,8 +3,9 @@
 P0 uses a single named dense vector (`dense`). The collection also declares a
 `SparseVectorParams` slot named `sparse` at creation time so P1 can populate it
 with BM25 sparse vectors without re-creating the collection or re-ingesting
-the existing dense embeddings. P1 hybrid query path is documented in
-`enable_hybrid()` below — it's a no-op in P0.
+the existing dense embeddings. The P1 hybrid path is implemented:
+`enable_hybrid()` populates TF-IDF sparse vectors, `search_hybrid()` fuses
+dense + sparse results with weighted reciprocal-rank fusion.
 
 All upserts use deterministic UUID5 ids (see core.interfaces.make_chunk_id),
 so re-running an ingest over the same source paths updates points in place
@@ -313,7 +314,11 @@ class QdrantStore:
         top_k: int = 20,
         dense_weight: float = 0.5,
     ) -> list[tuple[Chunk, float, float]]:
-        """Hybrid search: RRF fusion of dense and sparse results.
+        """Hybrid search: weighted reciprocal-rank fusion of dense and sparse.
+
+        Rank-based fusion (not score-based), so the dense cosine scores and
+        the sparse TF-IDF scores — which live on completely different scales —
+        can never dominate each other through raw magnitude.
 
         Args:
             query_vector: the dense query embedding.
@@ -322,30 +327,29 @@ class QdrantStore:
             dense_weight: balance between dense and sparse (0.0-1.0).
                 0.5 = equal weight. Higher = more dense. Lower = more sparse.
 
-        Returns (chunk, dense_score, hybrid_score) tuples best-first.
+        Returns (chunk, dense_score, hybrid_score) tuples best-first. The
+        hybrid_score is the fused RRF value (max ~1/(k+1), i.e. ~0.016).
         """
         # Retrieve from both branches independently.
         dense_hits = self.search_dense(query_vector, top_k=top_k)
         sparse_hits = self._search_sparse(query_sparse, top_k=top_k)
 
-        # Build score maps for RRF.
         dense_scores: dict[str, float] = {c.chunk_id: s for c, s in dense_hits}
-        sparse_scores: dict[str, float] = {c.chunk_id: s for c, s in sparse_hits}
-        all_ids = set(dense_scores) | set(sparse_scores)
 
-        # RRF with optional weighting.
+        # Weighted RRF: score(c) = w/(k+rank_dense) + (1-w)/(k+rank_sparse),
+        # with a branch contributing 0 when the chunk is absent from it.
         k = 60  # standard RRF constant
+        dense_rank = {c.chunk_id: r for r, (c, _) in enumerate(dense_hits, start=1)}
+        sparse_rank = {c.chunk_id: r for r, (c, _) in enumerate(sparse_hits, start=1)}
+
         rrf_scores: dict[str, float] = {}
-        for cid in all_ids:
-            ds = dense_scores.get(cid, 0.0)
-            ss = sparse_scores.get(cid, 0.0)
-            rrf = (
-                dense_weight * (1 / (k + 1)) * (1 + ds) +
-                (1 - dense_weight) * (1 / (k + 1)) * (1 + ss)
+        for cid in set(dense_rank) | set(sparse_rank):
+            d = dense_rank.get(cid)
+            s = sparse_rank.get(cid)
+            rrf_scores[cid] = (
+                dense_weight * (1.0 / (k + d) if d else 0.0)
+                + (1 - dense_weight) * (1.0 / (k + s) if s else 0.0)
             )
-            # True RRF: rank-based, not score-based.
-            # Simpler approach: use normalised scores directly.
-            rrf_scores[cid] = ds * dense_weight + ss * (1 - dense_weight)
 
         # Return best-first by fused score.
         sorted_ids = sorted(rrf_scores, key=rrf_scores.__getitem__, reverse=True)
