@@ -38,8 +38,10 @@ log = logging.getLogger(__name__)
 
 
 # -----------------------------------------------------------------------------
-# Schema
+# Schema & Migrations
 # -----------------------------------------------------------------------------
+
+_LATEST_SCHEMA_VERSION = 1
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -126,10 +128,25 @@ class MetadataStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._lock = threading.Lock()
         self._init_schema()
+        self._migrate()
 
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(_SCHEMA)
+
+    def _migrate(self) -> None:
+        """Additive migrations, versioned via PRAGMA user_version.
+
+        v0 -> v1: eval_runs gains params (JSON) + faithfulness_method.
+        _SCHEMA stays at the v0 shape so fresh and existing DBs take the
+        exact same path through here.
+        """
+        with self._lock:
+            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version < _LATEST_SCHEMA_VERSION:
+                self._conn.execute("ALTER TABLE eval_runs ADD COLUMN params TEXT")
+                self._conn.execute("ALTER TABLE eval_runs ADD COLUMN faithfulness_method TEXT")
+                self._conn.execute(f"PRAGMA user_version = {_LATEST_SCHEMA_VERSION}")
 
     def close(self) -> None:
         with self._lock:
@@ -196,14 +213,17 @@ class MetadataStore:
         mrr: float,
         recall_at_dense: float | None = None,
         faithfulness_proxy: float | None = None,
+        params: dict | None = None,
+        faithfulness_method: str | None = None,
     ) -> None:
         """Append one row to `eval_runs`. The eval harness calls this once per run."""
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO eval_runs
-                    (ran_at, n_questions, recall_at_5, mrr, recall_at_dense, faithfulness_proxy)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (ran_at, n_questions, recall_at_5, mrr, recall_at_dense,
+                     faithfulness_proxy, params, faithfulness_method)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _now_iso(),
@@ -212,6 +232,8 @@ class MetadataStore:
                     float(mrr),
                     None if recall_at_dense is None else float(recall_at_dense),
                     None if faithfulness_proxy is None else float(faithfulness_proxy),
+                    None if params is None else json.dumps(params, ensure_ascii=False),
+                    faithfulness_method,
                 ),
             )
 
@@ -249,12 +271,15 @@ class MetadataStore:
     def get_eval_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         """Recent eval runs, most recent first."""
         cur = self._conn.execute(
-            "SELECT id, ran_at, n_questions, recall_at_5, mrr, recall_at_dense, faithfulness_proxy "
+            "SELECT id, ran_at, n_questions, recall_at_5, mrr, recall_at_dense, faithfulness_proxy, params, faithfulness_method "
             "FROM eval_runs ORDER BY ran_at DESC, id DESC LIMIT ?",
             (int(limit),),
         )
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        for r in rows:
+            r["params"] = json.loads(r["params"]) if r.get("params") else None
+        return rows
 
     def get_stats(self) -> dict[str, Any]:
         """Aggregate counts and the top-cited source. One row, fast."""
