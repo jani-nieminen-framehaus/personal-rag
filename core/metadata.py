@@ -140,13 +140,40 @@ class MetadataStore:
         v0 -> v1: eval_runs gains params (JSON) + faithfulness_method.
         _SCHEMA stays at the v0 shape so fresh and existing DBs take the
         exact same path through here.
+
+        The migration is deliberately TOLERANT rather than transactional.
+        The connection autocommits (`isolation_level=None`) and `self._lock`
+        is a threading.Lock, which does nothing across processes — and this
+        deployment runs the FastAPI server as a scheduled task alongside CLI
+        commands against the same metadata.sqlite3. So two concurrent opens
+        of a v0 DB, or a crash between the ALTERs and the PRAGMA, can leave
+        a column present with user_version still 0. Checking table_info
+        before each ADD COLUMN makes that state self-repairing on the next
+        open instead of a permanent `duplicate column name: params` out of
+        __init__ that needs manual sqlite surgery. (A BEGIN IMMEDIATE
+        transaction would close the race but could NOT repair a database
+        that is already half-migrated.)
         """
         with self._lock:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-            if version < _LATEST_SCHEMA_VERSION:
-                self._conn.execute("ALTER TABLE eval_runs ADD COLUMN params TEXT")
-                self._conn.execute("ALTER TABLE eval_runs ADD COLUMN faithfulness_method TEXT")
-                self._conn.execute(f"PRAGMA user_version = {_LATEST_SCHEMA_VERSION}")
+            if version >= _LATEST_SCHEMA_VERSION:
+                return
+            existing = {row[1] for row in self._conn.execute("PRAGMA table_info(eval_runs)")}
+            for column, decl in (("params", "TEXT"), ("faithfulness_method", "TEXT")):
+                if column in existing:
+                    continue
+                try:
+                    self._conn.execute(f"ALTER TABLE eval_runs ADD COLUMN {column} {decl}")
+                except sqlite3.OperationalError as e:
+                    # Another process won the race between our table_info
+                    # read and this ALTER. The column exists either way,
+                    # which is all we need — anything else re-raises.
+                    if "duplicate column" not in str(e).lower():
+                        raise
+                    log.debug("metadata: %s already added concurrently", column)
+            # Set the version regardless of which ALTERs we actually ran, so
+            # a half-migrated database converges to v1 on this open.
+            self._conn.execute(f"PRAGMA user_version = {_LATEST_SCHEMA_VERSION}")
 
     def close(self) -> None:
         with self._lock:
