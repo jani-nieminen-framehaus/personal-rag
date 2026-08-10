@@ -22,18 +22,24 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Inject a `sentence_transformers` stub into sys.modules so the
-# `with patch("sentence_transformers.CrossEncoder", ...)` lines in
-# the tests below can find the attribute. The CrossEncoder class
-# itself is replaced by the per-test MagicMock, so this stub is
-# only a placeholder.
-if "sentence_transformers" not in sys.modules:
-    _stub = types.ModuleType("sentence_transformers")
-    _stub.CrossEncoder = MagicMock()  # placeholder; tests override it
-    sys.modules["sentence_transformers"] = _stub
-
 from core.interfaces import Chunk
 from providers.rerank_bge import BgeReranker
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stub_sentence_transformers():
+    """Inject a `sentence_transformers` stub so the
+    `with patch("sentence_transformers.CrossEncoder", ...)` lines below can
+    find the attribute — and REMOVE it afterwards, so the stub can't leak
+    a MagicMock CrossEncoder into unrelated test modules in the session."""
+    injected = "sentence_transformers" not in sys.modules
+    if injected:
+        stub = types.ModuleType("sentence_transformers")
+        stub.CrossEncoder = MagicMock()  # placeholder; tests override it
+        sys.modules["sentence_transformers"] = stub
+    yield
+    if injected:
+        sys.modules.pop("sentence_transformers", None)
 
 
 def _chunk(text: str, idx: int = 0) -> Chunk:

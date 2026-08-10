@@ -12,10 +12,8 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import sqlite3
 import tempfile
-import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -169,7 +167,7 @@ def _make_fake_docset(root: Path) -> None:
         conn.commit()
 
 
-def test_zeal_dedupes_same_file():
+def test_zeal_dedupes_same_file(rmtree_retry):
     """Bug #8: searchIndex has many rows per file (one per anchor). The
     ingester must chunk each file once, not 3x for page_a and 2x for
     page_b. Without dedupe, the same chunks are upserted multiple times
@@ -200,21 +198,10 @@ def test_zeal_dedupes_same_file():
             f"synth_path must preserve relative dir, got: {paths}"
         )
     finally:
-        # Windows can hold a file handle on the SQLite DB briefly after
-        # the ingester's with-block closes, causing rmtree to fail. A
-        # small retry loop is more reliable than ignore_errors.
-        for _ in range(5):
-            try:
-                shutil.rmtree(td)
-                break
-            except OSError:
-                time.sleep(0.1)
-        else:
-            # Final fallback — best-effort cleanup
-            shutil.rmtree(td, ignore_errors=True)
+        rmtree_retry(td)
 
 
-def test_zeal_source_path_preserves_relative_dir():
+def test_zeal_source_path_preserves_relative_dir(rmtree_retry):
     """Bug #8 sub-issue: synth_path = docset_root / page_path.name dropped
     the relative subdirectory, so two pages named index.html in different
     subdirs collided on chunk_id. After the fix, the source_path includes
@@ -239,11 +226,4 @@ def test_zeal_source_path_preserves_relative_dir():
             f"subdir/page_b.html lost its relative path: {[c.source_path for c in chunks]}"
         )
     finally:
-        for _ in range(5):
-            try:
-                shutil.rmtree(td)
-                break
-            except OSError:
-                time.sleep(0.1)
-        else:
-            shutil.rmtree(td, ignore_errors=True)
+        rmtree_retry(td)

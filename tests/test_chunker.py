@@ -33,40 +33,23 @@ def _enc(text: str) -> list[int]:
     return _ENC.encode(text)
 
 
-def test_split_by_tokens_no_data_loss_1444():
+@pytest.mark.parametrize("n", [769, 1000, 1444, 2000])
+def test_split_by_tokens_no_data_loss(n):
     """Bug #2 reproducer: text > target tokens must not lose content.
 
     The original code returned 1 piece (the LAST `target` tokens) for any
     input where the tail was smaller than `min_size`, losing everything
     before the start of the last window. The fix must cover the original
-    text with the union of pieces — no word may vanish.
+    text with the union of pieces — no word may vanish. Parametrized so
+    one failing size doesn't mask the rest.
     """
-    # Build a long text. The exact token count depends on tiktoken's BPE
-    # behavior on "tok0001" etc., so we don't assert a specific count.
-    # We DO assert that every distinct "word" survives.
-    text = " ".join(f"tok{i:04d}" for i in range(2000))
-    n = count_tokens(text)
-    assert n > 768, f"setup: text must be > target tokens; got {n}"
-
+    text = " ".join(f"tok{i:04d}" for i in range(n))
     pieces = _split_by_tokens(text, target=768, overlap_pct=12, min_size=32)
-
-    # Every distinct word must appear in at least one piece.
+    # Every sampled word must appear in some piece.
     all_piece_text = " ".join(pieces)
-    missing = [i for i in (0, 100, 500, 700, 1000, 1300, 1500, 1800, 1999)
+    missing = [i for i in range(0, n, max(1, n // 20))
                if f"tok{i:04d}" not in all_piece_text]
-    assert not missing, f"words missing from pieces: {missing}"
-
-
-def test_split_by_tokens_no_data_loss_table():
-    """Bug #2 reproducer: parametrize over the input sizes from the audit table."""
-    for n in (769, 1000, 1444, 2000):
-        text = " ".join(f"tok{i:04d}" for i in range(n))
-        pieces = _split_by_tokens(text, target=768, overlap_pct=12, min_size=32)
-        # Every distinct word must appear in some piece.
-        all_piece_text = " ".join(pieces)
-        missing = [i for i in range(0, n, max(1, n // 20))
-                   if f"tok{i:04d}" not in all_piece_text]
-        assert not missing, f"n={n}: words missing from pieces: {missing}"
+    assert not missing, f"n={n}: words missing from pieces: {missing}"
 
 
 def test_split_by_tokens_short_text_passthrough():
@@ -174,7 +157,9 @@ def test_chunk_python_produces_multiple_chunks():
     """End-to-end: the audit verified framehaus_pipeline.py produced 1 chunk
     (the AST was dead). After the fix, it should produce one chunk per
     top-level def + module prelude."""
-    src_path = Path("samples/notes/code/framehaus_pipeline.py")
+    # Anchored to the repo root, not the CWD — pytest may be launched from
+    # anywhere (IDE runners, CI working dirs).
+    src_path = Path(__file__).resolve().parent.parent / "samples" / "notes" / "code" / "framehaus_pipeline.py"
     text = src_path.read_text(encoding="utf-8")
     chunks = chunk_python(
         src_path, text,

@@ -30,3 +30,6 @@ metadata.sqlite3*
 test_out.pdf
 samples/test_books/
 
+
+# One-off scratch/debug scripts (never commit)
+/_*.py
