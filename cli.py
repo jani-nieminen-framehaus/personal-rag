@@ -84,14 +84,28 @@ def cli(ctx, config, verbose):
 @click.option("--topic", default=None, help="Restrict retrieval to a single topic.")
 @click.option("--no-citations", is_flag=True, help="Print the answer only.")
 @click.option("--json", "as_json", is_flag=True, help="Print a machine-readable AskResult.")
-@click.option("--hybrid", is_flag=True, help="Use hybrid (dense + sparse BM25) search.")
+@click.option("--hybrid/--no-hybrid", default=None,
+              help="Use hybrid (dense + sparse BM25) search. Default: config pipeline.hybrid.")
+@click.option("--dense-weight", default=None, type=float,
+              help="Hybrid dense-vs-sparse balance (0.0–1.0). Default: config pipeline.dense_weight.")
 @click.pass_context
-def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json, hybrid):
+def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json, hybrid, dense_weight):
     """Ask a question over the knowledge base."""
+    if not query.strip():
+        # providers.embed_qwen3.embed_query raises ValueError on blank input;
+        # without this the user gets a traceback for a typo.
+        raise click.UsageError("query is empty or whitespace-only")
+
     cfg = ctx.obj["config"]
-    pip = cfg.get("pipeline", {})
+    pip = cfg.get("pipeline") or {}
     top_k_dense = top_k_dense or pip.get("top_k_dense", 20)
     top_k_final = top_k_final or pip.get("top_k_final", 5)
+    # Both knobs are swept by `rag eval --sweep`; the config keys are what
+    # make a sweep winner applicable to live queries. Flags still win.
+    if hybrid is None:
+        hybrid = pip.get("hybrid", False)
+    if dense_weight is None:
+        dense_weight = pip.get("dense_weight", 0.5)
 
     embedder = make_embedder(cfg)
     store = make_store(cfg)
@@ -110,6 +124,7 @@ def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json, hybr
         topic=topic,
         metadata=metadata,
         hybrid=hybrid,
+        dense_weight=dense_weight,
     )
     if metadata is not None:
         metadata.close()
@@ -303,8 +318,13 @@ def _resolve_repo_path(path_str: str) -> Path:
               help="Heavy: re-ingest --markdown root into scratch collections per chunk size.")
 @click.option("--markdown", "markdown_root", default=None,
               help="Source root for --sweep-chunking.")
+@click.option("--hybrid/--no-hybrid", default=None,
+              help="Use hybrid (dense + sparse BM25) search. Default: config pipeline.hybrid.")
+@click.option("--dense-weight", default=None, type=float,
+              help="Hybrid dense-vs-sparse balance (0.0–1.0). Default: config pipeline.dense_weight.")
 @click.pass_context
-def eval(ctx, golden, as_json, with_faithfulness, nli, sweep, sweep_chunking, markdown_root):
+def eval(ctx, golden, as_json, with_faithfulness, nli, sweep, sweep_chunking, markdown_root,
+         hybrid, dense_weight):
     """Run the eval harness: recall@5, MRR, NLI faithfulness."""
     # Lazy import so the eval dependencies don't load on every command.
     from eval import run_ragas
@@ -321,6 +341,16 @@ def eval(ctx, golden, as_json, with_faithfulness, nli, sweep, sweep_chunking, ma
 
     if nli is None:
         nli = (cfg.get("eval") or {}).get("nli", True)
+
+    # The baseline run (runbook step 3) has to measure the SAME retrieval
+    # stack the sweep (step 4) varies, or the "measured delta" between them
+    # compares incomparable numbers. The sweep pins hybrid=True; these keys
+    # are how the baseline gets there too.
+    pip = cfg.get("pipeline") or {}
+    if hybrid is None:
+        hybrid = pip.get("hybrid", False)
+    if dense_weight is None:
+        dense_weight = pip.get("dense_weight", 0.5)
 
     # NLI faithfulness scorer — loaded lazily; None if unavailable. Only
     # worth loading when there's a generator to score (faithfulness isn't
@@ -365,10 +395,12 @@ def eval(ctx, golden, as_json, with_faithfulness, nli, sweep, sweep_chunking, ma
         store=store,
         reranker=reranker,
         generator=generator,
-        top_k_dense=cfg.get("pipeline", {}).get("top_k_dense", 20),
-        top_k_final=cfg.get("pipeline", {}).get("top_k_final", 5),
+        top_k_dense=pip.get("top_k_dense", 20),
+        top_k_final=pip.get("top_k_final", 5),
         metadata=metadata,
         nli_faithfulness=nli_scorer,
+        hybrid=hybrid,
+        dense_weight=dense_weight,
     )
     if metadata is not None:
         metadata.close()

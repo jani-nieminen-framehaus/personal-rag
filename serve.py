@@ -176,7 +176,14 @@ class AskRequest(BaseModel):
     topic: str | None = None
     top_k_dense: int | None = Field(None, ge=1, le=100)
     top_k_final: int | None = Field(None, ge=1, le=20)
-    hybrid: bool = Field(False, description="Use hybrid dense+sparse search.")
+    # None = inherit config pipeline.hybrid / pipeline.dense_weight. These are
+    # swept by `rag eval --sweep`; hardcoding the defaults here would pin the
+    # GUI to dense-only 0.5 no matter what the sweep found.
+    hybrid: bool | None = Field(
+        None, description="Use hybrid dense+sparse search. Default: config pipeline.hybrid.")
+    dense_weight: float | None = Field(
+        None, ge=0.0, le=1.0,
+        description="Hybrid dense-vs-sparse balance. Default: config pipeline.dense_weight.")
     session_id: str | None = Field(
         None, max_length=64,
         description="Session ID for conversation memory. If provided, this turn is stored.",
@@ -193,9 +200,12 @@ class AskResponse(BaseModel):
 def api_ask(req: AskRequest):
     if not S.ready:
         raise HTTPException(503, "server not ready")
-    pipeline_cfg = (S.config or {}).get("pipeline", {})
+    pipeline_cfg = (S.config or {}).get("pipeline") or {}
     top_k_dense = req.top_k_dense or pipeline_cfg.get("top_k_dense", 20)
     top_k_final = req.top_k_final or pipeline_cfg.get("top_k_final", 5)
+    hybrid = req.hybrid if req.hybrid is not None else pipeline_cfg.get("hybrid", False)
+    dense_weight = (req.dense_weight if req.dense_weight is not None
+                    else pipeline_cfg.get("dense_weight", 0.5))
     result = ask_pipeline(
         req.query,
         embedder=S.embedder,
@@ -206,7 +216,8 @@ def api_ask(req: AskRequest):
         top_k_final=top_k_final,
         topic=req.topic,
         metadata=S.metadata,
-        hybrid=req.hybrid,
+        hybrid=hybrid,
+        dense_weight=dense_weight,
     )
     response = AskResponse(
         answer=result.answer,
