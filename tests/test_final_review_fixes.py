@@ -129,6 +129,86 @@ def test_eval_flags_override_config(tmp_path, stub_abcs):
     assert kwargs["dense_weight"] == 0.3
 
 
+# -----------------------------------------------------------------------------
+# build_golden: relevant_refs + the chunking_params drift it exists to prevent
+# -----------------------------------------------------------------------------
+
+def test_build_golden_emits_relevant_refs(monkeypatch, tmp_path):
+    """Without relevant_refs, section mode raises on every row of the
+    samples golden set, so a chunking sweep over it cannot run at all."""
+    import json
+    from eval import build_golden
+
+    questions = tmp_path / "questions.jsonl"
+    questions.write_text(
+        json.dumps({"question": "q1", "topic": "ml",
+                    "relevant": [{"path": "ml/a.md", "section": "S"}]}) + "\n",
+        encoding="utf-8")
+    golden_out = tmp_path / "golden.jsonl"
+    monkeypatch.setattr(build_golden, "SAMPLES", tmp_path)
+    monkeypatch.setattr(build_golden, "QUESTIONS", questions)
+    monkeypatch.setattr(build_golden, "GOLDEN", golden_out)
+    monkeypatch.setattr(build_golden, "build_index", lambda: {("ml/a.md", "S"): ["cid1"]})
+
+    assert build_golden.main() == 0
+    entry = json.loads(golden_out.read_text(encoding="utf-8").strip())
+    assert entry["relevant_chunk_ids"] == ["cid1"]
+    assert entry["relevant_refs"] == [
+        {"source_path": str(tmp_path / "ml" / "a.md"), "section": "S"}
+    ]
+
+
+def test_build_golden_ref_source_path_matches_the_live_chunker():
+    """The section key run_ragas matches on is f'{source_path}::{section}',
+    built from live citations — and the live chunker stamps the ABSOLUTE
+    path. build_index() keys its own map by a repo-relative posix path, so
+    emitting that form would silently score every section-mode row 0.0.
+    This test pins the emitted form to what the ingester actually produces.
+    """
+    from eval import build_golden
+    from ingest.markdown_dir import MarkdownDirIngester
+
+    cp = build_golden._load_chunking_config()
+    ingester = MarkdownDirIngester(
+        root=build_golden.SAMPLES,
+        target_tokens=cp["target_tokens"],
+        overlap_pct=cp["overlap_pct"],
+        min_chunk_tokens=cp["min_chunk_tokens"],
+        default_topic=cp["default_topic"],
+        max_chunks_per_doc=cp["max_chunks_per_doc"],
+    )
+    live = {c.source_path for c in ingester.iter_chunks()}
+    assert live, "samples/notes produced no chunks"
+
+    index = build_golden.build_index()
+    emitted = {str(build_golden.SAMPLES / rel_path) for rel_path, _section in index}
+    assert emitted <= live, (
+        "build_golden would emit a source_path the live pipeline never "
+        f"produces; e.g. {sorted(emitted - live)[:2]}"
+    )
+
+
+def test_build_index_passes_max_chunks_per_doc(monkeypatch):
+    """chunking_params() returns max_chunks_per_doc and every other call
+    site passes it. build_golden did not — the exact drift the resolver
+    exists to prevent."""
+    from eval import build_golden
+
+    seen: dict = {}
+
+    class _Spy:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+        def iter_chunks(self):
+            return iter(())
+
+    monkeypatch.setattr(build_golden, "MarkdownDirIngester", _Spy)
+    build_golden.build_index()
+    assert "max_chunks_per_doc" in seen, "build_golden dropped max_chunks_per_doc"
+    assert seen["max_chunks_per_doc"] == build_golden._load_chunking_config()["max_chunks_per_doc"]
+
+
 # -- the API surface ---------------------------------------------------------
 
 def _fake_result():

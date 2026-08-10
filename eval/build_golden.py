@@ -20,9 +20,19 @@ Inputs
 Output
 ------
 - eval/golden_set.jsonl : the same schema as before — one JSON per line
-                          with `question`, `relevant_chunk_ids`, and
-                          optional `topic`. The chunk_ids are the
-                          current ones, computed from the chunker.
+                          with `question`, `relevant_chunk_ids`,
+                          `relevant_refs`, and optional `topic`. The
+                          chunk_ids are the current ones, computed from
+                          the chunker.
+
+PORTABILITY NOTE on `relevant_refs`: chunk_ids are root-relative and so
+survive a clone, but `relevant_refs.source_path` must be the ABSOLUTE path
+because that is what the chunker stamps onto every chunk, and section mode
+matches it verbatim against live citations. A committed golden_set.jsonl
+therefore carries paths from whichever machine last ran this script. That
+only affects `--match-mode section` runs (i.e. `rag eval --sweep-chunking`);
+plain `rag eval` matches on chunk_id and is unaffected. Re-run this script
+after cloning if you intend to sweep chunking over samples/notes.
 
 When to run
 -----------
@@ -87,6 +97,10 @@ def build_index():
         overlap_pct=cp["overlap_pct"],
         min_chunk_tokens=cp["min_chunk_tokens"],
         default_topic=cp["default_topic"],
+        # Every other ingester construction site passes this. Dropping it
+        # here let the golden set chunk a huge file differently from the
+        # live corpus — the exact drift chunking_params() exists to prevent.
+        max_chunks_per_doc=cp["max_chunks_per_doc"],
     )
 
     index: dict[tuple[str, str], list[str]] = {}
@@ -117,6 +131,7 @@ def main() -> int:
             continue
         q = json.loads(line)
         rel_ids: list[str] = []
+        rel_refs: list[dict] = []
         for rel in q.get("relevant", []):
             key = (rel["path"], rel["section"])
             if key not in index:
@@ -126,10 +141,22 @@ def main() -> int:
             # was token-split into multiple pieces, we want any of them to
             # count as a hit — recall@5 is more forgiving, MRR still works.
             rel_ids.extend(index[key])
+            # …and the chunking-independent key alongside it. run_ragas's
+            # section mode matches on f'{source_path}::{section}' built from
+            # live citations, and the chunker stamps citations with the
+            # ABSOLUTE path (core/chunker.py: source_path=str(path)) — while
+            # the index above is keyed by a repo-relative posix path. Emitting
+            # the relative form would look right and silently score every
+            # section-mode row 0.0, so re-join it onto SAMPLES here.
+            rel_refs.append({
+                "source_path": str(SAMPLES / rel["path"]),
+                "section": rel["section"],
+            })
 
         entry: dict = {
             "question": q["question"],
             "relevant_chunk_ids": rel_ids,
+            "relevant_refs": rel_refs,
         }
         if "topic" in q:
             entry["topic"] = q["topic"]
