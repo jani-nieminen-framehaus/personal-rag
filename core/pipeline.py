@@ -305,6 +305,27 @@ _hybrid_cache: dict = {"vocab": None, "idf": None, "built": False}
 _hybrid_lock = threading.Lock()
 
 
+# How much wider than top_k the hybrid branch retrieves when a topic filter
+# is in play.
+#
+# WHY THIS EXISTS: the hybrid path can only filter by topic AFTER fusing,
+# because RRF fuses two ranked lists the store returns independently — there
+# is no per-branch filtered query to push the predicate into (the dense-only
+# path does push it down, via store.search_with_filter). Post-filtering a
+# bare top_k slice threw away most of the candidate budget, and — far worse
+# — made the amount thrown away depend on top_k_dense, which is a SWEPT AXIS
+# in `rag eval --sweep`. top_k_dense=40 then scored better than 20 partly
+# because more in-topic hits survived the filter, which says nothing about
+# retrieval quality; committing that winner to config would be committing a
+# measurement artifact. Over-fetching before the filter decouples the two:
+# the filter no longer interacts with the axis being measured.
+#
+# 4 is a budget, not a guarantee: a topic holding less than 1/4 of the corpus
+# can still come up short, which is honest (the corpus cannot supply more)
+# rather than confounded (the budget was spent on other topics).
+OVERFETCH = 4
+
+
 def invalidate_hybrid_cache() -> None:
     """Drop the cached corpus IDF map so the next hybrid query rebuilds it.
 
@@ -370,28 +391,40 @@ def _retrieve_hybrid(
         idf = _hybrid_cache["idf"]
     query_sparse = _build_query_sparse_vector(query, vocab, idf)
 
+    # A topic post-filter discards hits after retrieval, so retrieve wider
+    # and truncate back — see OVERFETCH. Without a topic nothing is
+    # discarded, so the budget stays exactly top_k and the reranker sees
+    # the same candidate list it always did.
+    fetch_k = top_k * OVERFETCH if topic else top_k
+
+    def _post_filter(pairs: list[tuple]) -> list[tuple]:
+        """Apply the topic post-filter, then truncate to the caller's top_k.
+
+        Every return path in this function goes through here — including the
+        dense fallbacks, which previously returned an unfiltered slice and
+        silently leaked other topics into a topic-scoped query."""
+        if topic:
+            pairs = [(c, s) for c, s in pairs if c.topic == topic]
+        return pairs[:top_k]
+
     if query_sparse is None:
         log.warning("hybrid: no query terms found in vocabulary — falling back to dense")
-        return store.search_dense(qvec, top_k=top_k)
+        return _post_filter(store.search_dense(qvec, top_k=fetch_k))
 
     # Call the store's hybrid search.
     try:
         hits = store.search_hybrid(
             query_vector=qvec,
             query_sparse=query_sparse,
-            top_k=top_k,
+            top_k=fetch_k,
             dense_weight=dense_weight,
         )
     except Exception as e:
         log.warning("hybrid search failed (%s) — falling back to dense", e)
-        return store.search_dense(qvec, top_k=top_k)
-
-    # Filter by topic if requested (simple post-filter).
-    if topic:
-        hits = [(c, ds, hs) for c, ds, hs in hits if c.topic == topic]
+        return _post_filter(store.search_dense(qvec, top_k=fetch_k))
 
     # Return as (chunk, score) tuples for compatibility with the rest of ask().
-    return [(c, hs) for c, ds, hs in hits]
+    return _post_filter([(c, hs) for c, ds, hs in hits])
 
 
 # -----------------------------------------------------------------------------
