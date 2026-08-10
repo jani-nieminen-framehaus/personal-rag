@@ -18,9 +18,9 @@ config.yaml). Idempotent schema creation on open. Threadsafe via
 threads don't trip each other.
 
 Wired into:
-- `core.pipeline.ingest()`  — record_source for each unique file.
-- `core.pipeline.ask()`     — record_citation per returned citation.
-- `eval/run_ragas.run()`    — record_eval_run after the harness finishes.
+- `core.pipeline.ingest()`  - record_source for each unique file.
+- `core.pipeline.ask()`     - record_citation per returned citation.
+- `eval/run_ragas.run()`    - record_eval_run after the harness finishes.
 """
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ class MetadataStore:
 
     The connection uses `check_same_thread=False` so the FastAPI
     handlers (which run in a threadpool) can share it. We serialize
-    writes through a single lock — sqlite3 doesn't allow concurrent
+    writes through a single lock - sqlite3 doesn't allow concurrent
     writes from the same connection anyway. Reads are lock-free.
     """
 
@@ -124,7 +124,7 @@ class MetadataStore:
         chunk_count: int,
         content_hash: str = "",
     ) -> None:
-        """Upsert a source row. Idempotent — re-ingesting the same file just
+        """Upsert a source row. Idempotent - re-ingesting the same file just
         refreshes chunk_count, content_hash, and ingested_at."""
         with self._lock:
             self._conn.execute(
