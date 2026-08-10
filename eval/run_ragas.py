@@ -39,6 +39,10 @@ log = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
+# The only two ways a retrieved hit may be matched against a golden row.
+# Anything else is a typo, and must not quietly become chunk_id matching.
+_MATCH_MODES = frozenset({"chunk_id", "section"})
+
 
 def _tokens(text: str) -> set[str]:
     return {t.lower() for t in _TOKEN_RE.findall(text)}
@@ -56,6 +60,18 @@ def load_golden(path: Path) -> list[dict[str, Any]]:
             obj = json.loads(line)
             if "question" not in obj or "relevant_chunk_ids" not in obj:
                 raise ValueError(f"line {ln}: missing question or relevant_chunk_ids")
+            ids = obj["relevant_chunk_ids"]
+            if not isinstance(ids, list) or not all(isinstance(c, str) for c in ids):
+                # A bare string would iterate as characters downstream and
+                # silently zero out recall — fail loudly instead.
+                raise ValueError(f"line {ln}: relevant_chunk_ids must be a list of strings")
+            refs = obj.get("relevant_refs")
+            if refs is not None and (
+                not isinstance(refs, list)
+                or not all(isinstance(r, dict) and "source_path" in r and "section" in r for r in refs)
+            ):
+                raise ValueError(f"line {ln}: relevant_refs must be a list of "
+                                 "{source_path, section} objects")
             out.append(obj)
     return out
 
@@ -110,10 +126,51 @@ def run(
     top_k_final: int = 5,
     metadata: MetadataStore | None = None,
     nli_faithfulness: "NliFaithfulness | None" = None,
+    hybrid: bool = False,
+    dense_weight: float = 0.5,
+    match_mode: str = "chunk_id",
+    extra_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compute aggregate metrics over the golden set."""
+    """Compute aggregate metrics over the golden set.
+
+    Args:
+        hybrid: forwarded to `ask_pipeline` — use hybrid (dense + sparse)
+            search instead of dense-only.
+        dense_weight: forwarded to `ask_pipeline` — dense-vs-sparse balance
+            when `hybrid=True`.
+        match_mode: "chunk_id" (default) matches retrieved/relevant IDs by
+            `chunk_id`, which drifts across re-chunking configs. "section"
+            matches on `(source_path, section)` pairs instead, built from
+            each golden row's `relevant_refs`, so recall survives a sweep
+            that varies chunking.
+        extra_params: additional sweep knobs to merge into the recorded
+            `params` dict (e.g. `{"reranker": "bge"}`). Does not affect
+            retrieval — only the run() args above do that.
+    """
+    if match_mode not in _MATCH_MODES:
+        # Silently falling through to chunk_id matching made a typo look
+        # like a catastrophic result: chunk_ids are chunking-dependent, so
+        # a chunking sweep would report a uniformly terrible table with
+        # status: ok — the exact silent-zero section mode exists to prevent.
+        raise ValueError(
+            f"unknown match_mode {match_mode!r}; expected one of "
+            f"{sorted(_MATCH_MODES)}"
+        )
+
     gold = load_golden(golden_path)
     log.info("eval: %d questions from %s", len(gold), golden_path)
+
+    # Preconditions first, before spending an embed+search per question.
+    # This used to be checked inside the loop, after ask_pipeline, so a
+    # golden set whose 50th row lacked relevant_refs burned 50 round trips
+    # against the live index before failing.
+    if match_mode == "section":
+        for item in gold:
+            if not item.get("relevant_refs"):
+                raise ValueError(
+                    "match_mode='section' requires relevant_refs for question: "
+                    f"{item['question']!r}"
+                )
 
     recall_sum = 0.0
     mrr_sum = 0.0
@@ -123,7 +180,6 @@ def run(
 
     for i, item in enumerate(gold, 1):
         q = item["question"]
-        rel = item["relevant_chunk_ids"]
         topic = item.get("topic")
 
         # Retrieve the top-k via the actual pipeline.
@@ -136,12 +192,26 @@ def run(
             top_k_dense=top_k_dense,
             top_k_final=top_k_final,
             topic=topic,
+            hybrid=hybrid,
+            dense_weight=dense_weight,
         )
-        retrieved_ids = [c["chunk_id"] for c in result.citations]
-        # Audit #10: also compute dense-stage recall@k (pre-rerank). When
-        # a real reranker lands in P1, this distinguishes "dense stage
-        # missed the chunk entirely" from "reranker demoted a good hit".
-        dense_ids = [c["chunk_id"] for c in result.dense_hits]
+        if match_mode == "section":
+            # Presence was validated up front, before the retrieval loop.
+            refs = item["relevant_refs"]
+            rel = [f'{r["source_path"]}::{r["section"]}' for r in refs]
+            retrieved_ids = [f'{c["source_path"]}::{c["section"]}' for c in result.citations]
+            # Controller correction: dense_hits DO carry source_path and
+            # section (core/pipeline.py:476-484) — build dense_ids from the
+            # real dense hits, not by aliasing retrieved_ids, or
+            # recall_at_dense silently becomes a post-rerank metric.
+            dense_ids = [f'{c["source_path"]}::{c["section"]}' for c in result.dense_hits]
+        else:
+            rel = item["relevant_chunk_ids"]
+            retrieved_ids = [c["chunk_id"] for c in result.citations]
+            # Audit #10: also compute dense-stage recall@k (pre-rerank). When
+            # a real reranker lands in P1, this distinguishes "dense stage
+            # missed the chunk entirely" from "reranker demoted a good hit".
+            dense_ids = [c["chunk_id"] for c in result.dense_hits]
         r_dense = recall_at_k(dense_ids, rel, top_k_dense)
         r5 = recall_at_k(retrieved_ids, rel, 5)
         m = mrr(retrieved_ids, rel)
@@ -166,10 +236,12 @@ def run(
                 # Real NLI entailment — uses cross-encoder/nli-deberta-v3-xsmall.
                 f = nli_faithfulness.score(result.answer, chunk_texts)
                 row["faithfulness_proxy"] = round(f, 4)
+                row["faithfulness_method"] = "nli"
             else:
                 # Token-overlap fallback (original heuristic).
                 f = faithfulness_proxy(result.answer, chunk_texts)
                 row["faithfulness_proxy"] = f
+                row["faithfulness_method"] = "lexical"
             faithfulness_sum += row["faithfulness_proxy"]
             faithfulness_count += 1
         per_question.append(row)
@@ -185,6 +257,23 @@ def run(
     }
     if faithfulness_count:
         summary["faithfulness_proxy"] = round(faithfulness_sum / faithfulness_count, 4)
+        # NLI scores and lexical-overlap scores are not comparable numbers —
+        # tag which scorer produced them so runs can be compared honestly.
+        methods = {r["faithfulness_method"] for r in per_question if "faithfulness_method" in r}
+        summary["faithfulness_method"] = methods.pop() if len(methods) == 1 else "mixed"
+
+    # Record which knobs produced this run, so a parameter sweep (P3.1
+    # tasks 6/8) can tell rows apart after the fact.
+    run_params: dict[str, Any] = {
+        "top_k_dense": top_k_dense,
+        "top_k_final": top_k_final,
+        "hybrid": hybrid,
+        "dense_weight": dense_weight,
+        "match_mode": match_mode,
+    }
+    if extra_params:
+        run_params.update(extra_params)
+    summary["params"] = run_params
 
     # P1 metadata: one row per eval run so you can track quality over time.
     if metadata is not None:
@@ -195,6 +284,8 @@ def run(
                 mrr=summary["mrr"],
                 recall_at_dense=summary.get("recall_at_dense"),
                 faithfulness_proxy=summary.get("faithfulness_proxy"),
+                params=run_params,
+                faithfulness_method=summary.get("faithfulness_method"),
             )
         except Exception as e:  # pragma: no cover — defensive
             log.warning("metadata: record_eval_run failed: %s", e)

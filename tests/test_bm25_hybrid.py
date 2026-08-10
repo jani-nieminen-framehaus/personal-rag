@@ -279,11 +279,12 @@ def test_pipeline_ask_accepts_hybrid_flag():
     """pipeline.ask() should accept hybrid=True and route to _retrieve_hybrid."""
     from core import pipeline
 
-    # Patch the store.
+    # Patch the store. The pipeline reaches the corpus only through the
+    # VectorStore surface (iter_texts), never through a raw client.
     mock_store = MagicMock()
     mock_store.search_dense.return_value = []
     mock_store.search_hybrid.return_value = []
-    mock_store.client.scroll.return_value = ([], None)
+    mock_store.iter_texts.return_value = []
     mock_store.collection = "kb"
 
     mock_embedder = MagicMock()
@@ -302,6 +303,147 @@ def test_pipeline_ask_accepts_hybrid_flag():
     # When sparse is not populated, it falls back to dense search.
     # The key check: ask() accepted hybrid=True without raising.
     assert result.answer == "(no results found in the index)"
+
+
+# ---- hybrid topic post-filter (must not confound the top_k_dense axis) ----
+
+
+@pytest.fixture
+def clean_hybrid_cache():
+    """The corpus IDF map is a module global. Drop it either side of a
+    test so a populated cache can't leak into (or out of) this file."""
+    from core import pipeline
+    pipeline.invalidate_hybrid_cache()
+    yield
+    pipeline.invalidate_hybrid_cache()
+
+
+class _TopicCorpusStore:
+    """Fake store whose in-topic chunks are sparse among out-of-topic ones.
+
+    Retrieval is deterministic (corpus order) so the only thing that can
+    change the size of the returned list is the retrieval budget itself.
+    """
+
+    collection = "kb"
+
+    def __init__(self, n_chunks: int, in_topic_every: int = 3, topic: str = "target"):
+        from core.interfaces import Chunk, make_parent_id
+
+        self.chunks = [
+            Chunk(
+                chunk_id=f"c{i}",
+                parent_id=make_parent_id(f"/src/{i}.md"),
+                text=f"retrieval passage about exposure compensation number {i}",
+                source_path=f"/src/{i}.md",
+                topic=topic if i % in_topic_every == 0 else "other",
+                doc_type="markdown",
+                section=f"Section {i}",
+            )
+            for i in range(n_chunks)
+        ]
+        self.hybrid_budgets: list[int] = []
+        self.dense_budgets: list[int] = []
+        self.hybrid_raises = False
+
+    def iter_texts(self):
+        for c in self.chunks:
+            yield c.chunk_id, c.text
+
+    def search_dense(self, vector, top_k):
+        self.dense_budgets.append(top_k)
+        return [(c, 1.0) for c in self.chunks[:top_k]]
+
+    def search_hybrid(self, query_vector, query_sparse, top_k=20, dense_weight=0.5):
+        self.hybrid_budgets.append(top_k)
+        if self.hybrid_raises:
+            raise RuntimeError("sparse slot not populated")
+        return [(c, 1.0, 0.01) for c in self.chunks[:top_k]]
+
+
+_QUERY = "exposure compensation passage"
+
+
+def test_hybrid_topic_filter_still_returns_a_full_top_k(clean_hybrid_cache):
+    """The post-filter ran AFTER retrieving top_k, so a topic-filtered
+    hybrid query returned only the in-topic survivors of a top_k slice —
+    while the dense path pushes the filter into the store and returns a
+    full top_k. Over-fetching before the filter closes that gap."""
+    from core import pipeline
+
+    store = _TopicCorpusStore(n_chunks=200)
+    hits = pipeline._retrieve_hybrid(
+        _QUERY, [0.1, 0.2, 0.3, 0.4], store, top_k=5, topic="target")
+
+    assert len(hits) == 5, f"expected a full top_k of in-topic hits, got {len(hits)}"
+    assert all(c.topic == "target" for c, _ in hits)
+    assert store.hybrid_budgets[0] > 5, "the filtered branch must over-fetch"
+
+
+def test_hybrid_topic_filter_does_not_confound_the_top_k_dense_axis(clean_hybrid_cache):
+    """THE confound: `top_k_dense` is a SWEPT AXIS. With a post-filter over
+    a top_k slice, 40 beat 20 partly because more in-topic hits happened to
+    survive the filter — nothing to do with retrieval quality. After the
+    fix each budget yields its full budget of in-topic hits, so the axis
+    measures ranking again."""
+    from core import pipeline
+
+    counts = {}
+    for k in (20, 40):
+        pipeline.invalidate_hybrid_cache()
+        store = _TopicCorpusStore(n_chunks=600)
+        hits = pipeline._retrieve_hybrid(
+            _QUERY, [0.1, 0.2, 0.3, 0.4], store, top_k=k, topic="target")
+        assert all(c.topic == "target" for c, _ in hits)
+        counts[k] = len(hits)
+
+    assert counts == {20: 20, 40: 40}
+
+
+def test_hybrid_topic_filter_result_size_is_stable_as_the_pool_grows(clean_hybrid_cache):
+    """top_k held constant, candidate pool grows 10x: the number of
+    returned in-topic chunks must not move."""
+    from core import pipeline
+
+    sizes = []
+    for n_chunks in (60, 600):
+        pipeline.invalidate_hybrid_cache()
+        store = _TopicCorpusStore(n_chunks=n_chunks)
+        hits = pipeline._retrieve_hybrid(
+            _QUERY, [0.1, 0.2, 0.3, 0.4], store, top_k=5, topic="target")
+        sizes.append(len(hits))
+
+    assert sizes == [5, 5], f"result size moved with the pool size: {sizes}"
+
+
+def test_hybrid_topic_filter_applies_to_the_dense_fallback(clean_hybrid_cache):
+    """When search_hybrid raises, _retrieve_hybrid falls back to dense.
+    That fallback must over-fetch AND honour the topic — it used to return
+    an unfiltered top_k slice, i.e. mostly out-of-topic chunks."""
+    from core import pipeline
+
+    store = _TopicCorpusStore(n_chunks=200)
+    store.hybrid_raises = True
+    hits = pipeline._retrieve_hybrid(
+        _QUERY, [0.1, 0.2, 0.3, 0.4], store, top_k=5, topic="target")
+
+    assert len(hits) == 5
+    assert all(c.topic == "target" for c, _ in hits)
+    assert store.dense_budgets[0] > 5, "the dense fallback must over-fetch too"
+
+
+def test_hybrid_without_topic_does_not_over_fetch(clean_hybrid_cache):
+    """No topic filter means nothing is discarded, so the retrieval budget
+    must stay exactly top_k — over-fetching unconditionally would change
+    what the reranker sees on every untopiced query."""
+    from core import pipeline
+
+    store = _TopicCorpusStore(n_chunks=200)
+    hits = pipeline._retrieve_hybrid(
+        _QUERY, [0.1, 0.2, 0.3, 0.4], store, top_k=5, topic=None)
+
+    assert store.hybrid_budgets == [5]
+    assert len(hits) == 5
 
 
 # ---- CLI                                                                  ---

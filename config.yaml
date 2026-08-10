@@ -113,6 +113,13 @@ pipeline:
   top_k_dense: 20                 # how many dense hits before rerank
   top_k_final: 5                  # how many after rerank → generator
   citation_style: bracket         # bracket | superscript — bracket is the default
+  # Retrieval mode + fusion balance. These are the same two knobs the
+  # eval.sweep grid below varies, and they live here so a sweep winner can
+  # actually be APPLIED — `rag ask`, `rag eval` and the GUI all read these
+  # as their defaults (CLI flags / request fields still override).
+  # Hybrid needs sparse vectors: `rag ingest --populate-sparse` first.
+  hybrid: false                   # false = dense only; true = dense + sparse BM25
+  dense_weight: 0.5               # hybrid only: 0.0 all-sparse … 1.0 all-dense
 
 # ---- Metadata ----------------------------------------------------------------
 # SQLite store for the side-channel: which files are indexed, what you've
@@ -125,3 +132,12 @@ metadata:
 # ---- Logging -----------------------------------------------------------------
 logging:
   level: INFO                     # DEBUG | INFO | WARNING | ERROR
+
+# ---- Eval ---------------------------------------------------------------------
+eval:
+  nli: true                       # NLI faithfulness by default (--no-nli to skip)
+  sweep:                          # rag eval --sweep grid (query-time knobs only)
+    dense_weight: [0.3, 0.5, 0.7]
+    top_k_dense: [20, 40]
+    top_k_final: [5]
+    reranker: [passthrough, bge]

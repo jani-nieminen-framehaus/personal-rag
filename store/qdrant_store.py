@@ -3,8 +3,9 @@
 P0 uses a single named dense vector (`dense`). The collection also declares a
 `SparseVectorParams` slot named `sparse` at creation time so P1 can populate it
 with BM25 sparse vectors without re-creating the collection or re-ingesting
-the existing dense embeddings. P1 hybrid query path is documented in
-`enable_hybrid()` below — it's a no-op in P0.
+the existing dense embeddings. The P1 hybrid path is implemented:
+`enable_hybrid()` populates TF-IDF sparse vectors, `search_hybrid()` fuses
+dense + sparse results with weighted reciprocal-rank fusion.
 
 All upserts use deterministic UUID5 ids (see core.interfaces.make_chunk_id),
 so re-running an ingest over the same source paths updates points in place
@@ -30,13 +31,13 @@ from qdrant_client.http.models import (
     SparseVector,
 )
 
-from core.interfaces import Chunk
+from core.interfaces import Chunk, VectorStore
 
 
 log = logging.getLogger(__name__)
 
 
-class QdrantStore:
+class QdrantStore(VectorStore):
     """Thin adapter over the Qdrant HTTP/gRPC client.
 
     The class is intentionally simple — collection management, upsert, and
@@ -112,11 +113,31 @@ class QdrantStore:
                     f"to drop and re-create the collection."
                 )
 
+    def drop(self) -> None:
+        """Delete the collection. Used by eval scratch collections."""
+        self.client.delete_collection(self.collection)
+
     def count(self) -> int:
         """Number of points currently in the collection."""
         info = self.client.get_collection(self.collection)
         # `points_count` lives on the info in 1.10+
         return int(getattr(info, "points_count", 0) or 0)
+
+    def iter_payloads(self):
+        """Yield (point_id, payload) for every point, scrolling in batches."""
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.collection,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for p in points:
+                yield p.id, (p.payload or {})
+            if offset is None:
+                break
 
     # -- writes ---------------------------------------------------------------
 
@@ -209,23 +230,7 @@ class QdrantStore:
         """
         log.info("enable_hybrid: scrolling all points to build corpus vocabulary...")
         # Step 1: collect all chunk texts.
-        chunk_texts: list[tuple[str, str]] = []  # (chunk_id, text)
-        offset = None
-        while True:
-            points, offset = self.client.scroll(
-                collection_name=self.collection,
-                limit=256,
-                offset=offset,
-                with_payload=True,
-                with_vectors=False,
-            )
-            for p in points:
-                payload = p.payload or {}
-                text = payload.get("text", "")
-                if text:
-                    chunk_texts.append((p.id, text))
-            if offset is None:
-                break
+        chunk_texts: list[tuple[str, str]] = list(self.iter_texts())
 
         if not chunk_texts:
             log.warning("enable_hybrid: no chunks found in collection")
@@ -271,13 +276,13 @@ class QdrantStore:
             # Build sparse vector: indices + BM25-like TF-IDF values.
             # Use TF * IDF with k1=0 (binary-like, just IDF weighting).
             # This gives a pure IDF-weighted term vector.
+            # max_tf is loop-invariant per chunk — normalising by it gives
+            # BM25-like behaviour without a k1 param.
+            max_tf = max(tf.values()) if tf else 1
             indices: list[int] = []
             values: list[float] = []
             for term, count in tf.items():
                 if term in term_to_idx:
-                    # Simple TF-IDF: tf=count, idf from above.
-                    # Normalise by max_tf for BM25-like behaviour without k1 param.
-                    max_tf = max(tf.values()) or 1
                     score = (count / max_tf) * idf.get(term, 0.0)
                     if score > 0:
                         indices.append(term_to_idx[term])
@@ -313,7 +318,11 @@ class QdrantStore:
         top_k: int = 20,
         dense_weight: float = 0.5,
     ) -> list[tuple[Chunk, float, float]]:
-        """Hybrid search: RRF fusion of dense and sparse results.
+        """Hybrid search: weighted reciprocal-rank fusion of dense and sparse.
+
+        Rank-based fusion (not score-based), so the dense cosine scores and
+        the sparse TF-IDF scores — which live on completely different scales —
+        can never dominate each other through raw magnitude.
 
         Args:
             query_vector: the dense query embedding.
@@ -322,30 +331,29 @@ class QdrantStore:
             dense_weight: balance between dense and sparse (0.0-1.0).
                 0.5 = equal weight. Higher = more dense. Lower = more sparse.
 
-        Returns (chunk, dense_score, hybrid_score) tuples best-first.
+        Returns (chunk, dense_score, hybrid_score) tuples best-first. The
+        hybrid_score is the fused RRF value (max ~1/(k+1), i.e. ~0.016).
         """
         # Retrieve from both branches independently.
         dense_hits = self.search_dense(query_vector, top_k=top_k)
         sparse_hits = self._search_sparse(query_sparse, top_k=top_k)
 
-        # Build score maps for RRF.
         dense_scores: dict[str, float] = {c.chunk_id: s for c, s in dense_hits}
-        sparse_scores: dict[str, float] = {c.chunk_id: s for c, s in sparse_hits}
-        all_ids = set(dense_scores) | set(sparse_scores)
 
-        # RRF with optional weighting.
+        # Weighted RRF: score(c) = w/(k+rank_dense) + (1-w)/(k+rank_sparse),
+        # with a branch contributing 0 when the chunk is absent from it.
         k = 60  # standard RRF constant
+        dense_rank = {c.chunk_id: r for r, (c, _) in enumerate(dense_hits, start=1)}
+        sparse_rank = {c.chunk_id: r for r, (c, _) in enumerate(sparse_hits, start=1)}
+
         rrf_scores: dict[str, float] = {}
-        for cid in all_ids:
-            ds = dense_scores.get(cid, 0.0)
-            ss = sparse_scores.get(cid, 0.0)
-            rrf = (
-                dense_weight * (1 / (k + 1)) * (1 + ds) +
-                (1 - dense_weight) * (1 / (k + 1)) * (1 + ss)
+        for cid in set(dense_rank) | set(sparse_rank):
+            d = dense_rank.get(cid)
+            s = sparse_rank.get(cid)
+            rrf_scores[cid] = (
+                dense_weight * (1.0 / (k + d) if d else 0.0)
+                + (1 - dense_weight) * (1.0 / (k + s) if s else 0.0)
             )
-            # True RRF: rank-based, not score-based.
-            # Simpler approach: use normalised scores directly.
-            rrf_scores[cid] = ds * dense_weight + ss * (1 - dense_weight)
 
         # Return best-first by fused score.
         sorted_ids = sorted(rrf_scores, key=rrf_scores.__getitem__, reverse=True)

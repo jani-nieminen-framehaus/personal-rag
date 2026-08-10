@@ -29,9 +29,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import service_state
 from core.pipeline import (
     ask as ask_pipeline,
     ingest as ingest_pipeline,
+    chunking_params,
     load_config,
     make_embedder,
     make_generator,
@@ -43,15 +45,13 @@ from core.pipeline import (
 
 log = logging.getLogger("rag.serve")
 
-# Persistent state: hard-coded so the user never has to remember
-# "what port is the server on" — they always go to :8420.
-DEFAULT_PORT = 8420
+# Persistent state: constants live in service_state.py (single source of
+# truth, mirrored for PowerShell in scripts/_config.ps1). Module-level
+# aliases kept so tests can monkeypatch serve.STATE_FILE.
+DEFAULT_PORT = service_state.DEFAULT_PORT
 DEFAULT_HOST = "127.0.0.1"
-
-# State file lives in the user's home dir so the CLI commands
-# (`rag status`, `rag url`) can find it from any CWD.
-STATE_DIR = Path.home() / ".rag"
-STATE_FILE = STATE_DIR / "state.json"
+STATE_DIR = service_state.STATE_DIR
+STATE_FILE = service_state.STATE_FILE
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -86,7 +86,6 @@ def _state_write(host: str, port: int) -> None:
     the running server. Best-effort — if it fails (e.g. perms), we
     just log; the server still runs."""
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
         S.started_at = datetime.now(timezone.utc).isoformat()
         payload = {
             "port": port,
@@ -96,18 +95,16 @@ def _state_write(host: str, port: int) -> None:
             "lan_url": f"http://{_hostname()}.local:{port}" if host == "0.0.0.0" else None,
             "host": host,
         }
-        STATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Atomic write (temp + rename) via service_state; pass the
+        # module-level path so tests can monkeypatch serve.STATE_FILE.
+        service_state.write_state(payload, path=STATE_FILE)
     except OSError as e:
         log.warning("could not write state file %s: %s", STATE_FILE, e)
 
 
 def _state_clear() -> None:
     """Remove the state file on clean shutdown. Idempotent."""
-    try:
-        if STATE_FILE.exists():
-            STATE_FILE.unlink()
-    except OSError:
-        pass
+    service_state.clear_state(path=STATE_FILE)
 
 
 # -----------------------------------------------------------------------------
@@ -144,13 +141,7 @@ async def lifespan(app: FastAPI):
 
     # On shutdown, only clear if our PID still owns the state file
     # (don't yank it out from under a restart).
-    if STATE_FILE.exists():
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if data.get("pid") == os.getpid():
-                _state_clear()
-        except (OSError, json.JSONDecodeError, ValueError):
-            pass
+    service_state.clear_state(owner_pid=os.getpid(), path=STATE_FILE)
 
 
 app = FastAPI(title="rag", version="0.1.0", lifespan=lifespan)
@@ -185,7 +176,14 @@ class AskRequest(BaseModel):
     topic: str | None = None
     top_k_dense: int | None = Field(None, ge=1, le=100)
     top_k_final: int | None = Field(None, ge=1, le=20)
-    hybrid: bool = Field(False, description="Use hybrid dense+sparse search.")
+    # None = inherit config pipeline.hybrid / pipeline.dense_weight. These are
+    # swept by `rag eval --sweep`; hardcoding the defaults here would pin the
+    # GUI to dense-only 0.5 no matter what the sweep found.
+    hybrid: bool | None = Field(
+        None, description="Use hybrid dense+sparse search. Default: config pipeline.hybrid.")
+    dense_weight: float | None = Field(
+        None, ge=0.0, le=1.0,
+        description="Hybrid dense-vs-sparse balance. Default: config pipeline.dense_weight.")
     session_id: str | None = Field(
         None, max_length=64,
         description="Session ID for conversation memory. If provided, this turn is stored.",
@@ -202,9 +200,18 @@ class AskResponse(BaseModel):
 def api_ask(req: AskRequest):
     if not S.ready:
         raise HTTPException(503, "server not ready")
-    pipeline_cfg = (S.config or {}).get("pipeline", {})
+    if not req.query.strip():
+        # AskRequest's min_length=1 does not strip, so "   " passes
+        # validation and then hits embed_query, which correctly raises
+        # ValueError — surfacing in the GUI as an unhandled 500 traceback.
+        # A blank question is a bad request, so say so.
+        raise HTTPException(400, "query is empty or whitespace-only")
+    pipeline_cfg = (S.config or {}).get("pipeline") or {}
     top_k_dense = req.top_k_dense or pipeline_cfg.get("top_k_dense", 20)
     top_k_final = req.top_k_final or pipeline_cfg.get("top_k_final", 5)
+    hybrid = req.hybrid if req.hybrid is not None else pipeline_cfg.get("hybrid", False)
+    dense_weight = (req.dense_weight if req.dense_weight is not None
+                    else pipeline_cfg.get("dense_weight", 0.5))
     result = ask_pipeline(
         req.query,
         embedder=S.embedder,
@@ -215,7 +222,8 @@ def api_ask(req: AskRequest):
         top_k_final=top_k_final,
         topic=req.topic,
         metadata=S.metadata,
-        hybrid=req.hybrid,
+        hybrid=hybrid,
+        dense_weight=dense_weight,
     )
     response = AskResponse(
         answer=result.answer,
@@ -319,7 +327,7 @@ async def api_ingest(files: list[UploadFile] = File(...)):
                 skipped.append(name)
 
         # Run the right ingester on each bucket.
-        chunking = (S.config or {}).get("chunking", {})
+        cp = chunking_params(S.config or {})
         ing = (S.config or {}).get("ingest", {})
         total = 0
         ran_for: list[str] = []
@@ -341,32 +349,32 @@ async def api_ingest(files: list[UploadFile] = File(...)):
                 from ingest.pdf_dir import PdfDirIngester
                 inst = PdfDirIngester(
                     path=str(bucket),
-                    target_tokens=chunking.get("target_tokens", 768),
-                    overlap_pct=chunking.get("overlap_pct", 12),
-                    min_chunk_tokens=chunking.get("min_chunk_tokens", 32),
-                    default_topic=ing.get("default_topic", "default"),
-                    max_chunks_per_doc=chunking.get("max_chunks_per_doc", 2000),
+                    target_tokens=cp["target_tokens"],
+                    overlap_pct=cp["overlap_pct"],
+                    min_chunk_tokens=cp["min_chunk_tokens"],
+                    default_topic=cp["default_topic"],
+                    max_chunks_per_doc=cp["max_chunks_per_doc"],
                 )
             elif ing_cls == "EpubDirIngester":
                 from ingest.epub_dir import EpubDirIngester
                 inst = EpubDirIngester(
                     path=str(bucket),
-                    target_tokens=chunking.get("target_tokens", 768),
-                    overlap_pct=chunking.get("overlap_pct", 12),
-                    min_chunk_tokens=chunking.get("min_chunk_tokens", 32),
-                    default_topic=ing.get("default_topic", "default"),
-                    max_chunks_per_doc=chunking.get("max_chunks_per_doc", 2000),
+                    target_tokens=cp["target_tokens"],
+                    overlap_pct=cp["overlap_pct"],
+                    min_chunk_tokens=cp["min_chunk_tokens"],
+                    default_topic=cp["default_topic"],
+                    max_chunks_per_doc=cp["max_chunks_per_doc"],
                 )
             else:
                 from ingest.markdown_dir import MarkdownDirIngester
                 inst = MarkdownDirIngester(
                     root=str(bucket),
-                    target_tokens=chunking.get("target_tokens", 768),
-                    overlap_pct=chunking.get("overlap_pct", 12),
-                    min_chunk_tokens=chunking.get("min_chunk_tokens", 32),
-                    default_topic=ing.get("default_topic", "default"),
+                    target_tokens=cp["target_tokens"],
+                    overlap_pct=cp["overlap_pct"],
+                    min_chunk_tokens=cp["min_chunk_tokens"],
+                    default_topic=cp["default_topic"],
                     frontmatter_topic_key=ing.get("markdown", {}).get("frontmatter_topic_key", "topic"),
-                    max_chunks_per_doc=chunking.get("max_chunks_per_doc", 2000),
+                    max_chunks_per_doc=cp["max_chunks_per_doc"],
                 )
             # Don't recreate the collection when called from the GUI -
             # it might already hold the user's previous ingests.
@@ -402,24 +410,13 @@ def api_topics():
     filter dropdown uses this."""
     if not S.ready:
         raise HTTPException(503, "server not ready")
-    # Lightweight: scroll the collection, dedupe topics from payloads.
+    # Lightweight: stream the payloads, dedupe topics.
     # We don't bother caching; this is fast for a few thousand points.
     seen: set[str] = set()
-    offset = None
-    while True:
-        points, offset = S.store.client.scroll(
-            collection_name=S.store.collection,
-            limit=256,
-            offset=offset,
-            with_payload=True,
-            with_vectors=False,
-        )
-        for p in points:
-            t = (p.payload or {}).get("topic")
-            if t:
-                seen.add(t)
-        if offset is None:
-            break
+    for _pid, payload in S.store.iter_payloads():
+        t = payload.get("topic")
+        if t:
+            seen.add(t)
     return sorted(seen)
 
 

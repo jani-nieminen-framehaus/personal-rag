@@ -1,0 +1,12 @@
+# Minimal on purpose: pytest configuration only, locked in before the
+# first heavy (slow/gpu/integration) test lands. Packaging metadata can
+# come later if the project ever ships as a package.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "slow: takes noticeably long; deselect with -m 'not slow'",
+    "gpu: requires a CUDA-capable GPU and the full .venv",
+    "integration: requires live services (Qdrant, Ollama)",
+]

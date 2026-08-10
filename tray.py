@@ -12,6 +12,7 @@ so we don't need to ship a binary asset.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -21,9 +22,20 @@ from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw
 
+import service_state
+
 
 REPO_ROOT = Path(__file__).resolve().parent
-GUI_URL = "http://localhost:8420"
+
+
+def _gui_url() -> str:
+    """The GUI URL, resolved at click time: the state file first (it knows
+    the port the server actually bound), then RAG_PORT, then the default."""
+    state = service_state.read_state()
+    if state and state.get("url"):
+        return state["url"]
+    port = os.environ.get("RAG_PORT") or service_state.DEFAULT_PORT
+    return f"http://localhost:{port}"
 
 
 # -- icon image --------------------------------------------------------------
@@ -67,7 +79,7 @@ def _run_subprocess_in_thread(args: list[str], on_done, timeout: int = 120) -> N
 
 
 def _on_open_gui(icon, item) -> None:
-    webbrowser.open(GUI_URL)
+    webbrowser.open(_gui_url())
 
 
 def _on_run_eval(icon, item) -> None:

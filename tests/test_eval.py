@@ -7,6 +7,8 @@ Currently covers:
 """
 from __future__ import annotations
 
+import sys
+
 from eval import run_ragas
 
 
@@ -23,8 +25,6 @@ def test_print_report_survives_cp1252_stdout():
     doesn't replace the underlying file object, so subsequent tests
     can still print.
     """
-    if not hasattr(sys := __import__("sys"), "stdout"):
-        pytest.skip("no sys.stdout")  # type: ignore[name-defined]
     reconfigure = getattr(sys.stdout, "reconfigure", None)
     if reconfigure is None:
         # Python < 3.7 or non-TTY stdout - nothing to test.
@@ -52,8 +52,8 @@ def test_print_report_survives_cp1252_stdout():
             pass
 
 
-def test_print_report_handles_optional_faithfulness():
-    """The faithfulness_proxy line is only printed when the metric is present."""
+def test_print_report_handles_optional_faithfulness(capsys):
+    """The faithfulness line is printed exactly when the metric is present."""
     metrics = {
         "n_questions": 1,
         "recall_at_5": 1.0,
@@ -63,9 +63,12 @@ def test_print_report_handles_optional_faithfulness():
             {"question": "q", "recall_at_5": 1.0, "recall_at_dense": 1.0, "mrr": 1.0},
         ],
     }
-    # Without faithfulness - no KeyError on the lookup.
     run_ragas.print_report(metrics)
+    out = capsys.readouterr().out
+    assert "faithfulness" not in out.lower()
 
-    # With faithfulness - should still print.
     metrics["faithfulness_proxy"] = 0.42
     run_ragas.print_report(metrics)
+    out = capsys.readouterr().out
+    assert "faithfulness" in out.lower()
+    assert "0.420" in out

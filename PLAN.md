@@ -1,12 +1,15 @@
 # RAG Walking Skeleton — P0 Plan
 
-> Status: P0 implemented and pushed. P1 (BGE reranker, PDF ingester,
-> SQLite metadata, browser GUI + tray) also shipped. See git log on
-> `main` (commits `5880de9`, `f2259e9`, `d5b34fc`, `38de978`, `1c775d0`,
-> `fc7401e`, `9423b72`, `e009162`, `acbb58c`, `49f4e65`, `1447af9`,
-> `82c7942`).
-> Owner: Jani. Target: runnable P0 + P1 with end-to-end `rag ask` over
-> personal notes + Zeal docsets + PDFs.
+> Status: P0–P2 shipped (P2: EPUB ingester, BM25 hybrid, NLI faithfulness,
+> conversation memory — commit `3f976c9`), then hardened by the verified
+> 2026-08 audit fix waves (branch `fix/p2-audit`). The plan below is the
+> HISTORICAL P0 design — kept for reference.
+>
+> Current work: **P3** — see
+> `docs/superpowers/specs/2026-08-10-p3-quality-eval-design.md` for the
+> five-step roadmap (Quality & Eval → Living index → Business memory →
+> Agent layer → GUI QoL) and the active sub-project.
+> Owner: Jani.
 
 ## 1. Goal & non-goals
 

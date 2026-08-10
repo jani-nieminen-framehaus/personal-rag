@@ -19,6 +19,7 @@ from pathlib import Path
 
 import click
 
+import service_state
 from core import pipeline
 from core.pipeline import (
     load_config,
@@ -27,6 +28,7 @@ from core.pipeline import (
     make_generator,
     make_store,
     make_metadata,
+    chunking_params,
     format_citation_footer,
     ask as ask_pipeline,
     ingest as ingest_pipeline,
@@ -39,12 +41,11 @@ from ingest.pdf_dir import PdfDirIngester
 from ingest.epub_dir import EpubDirIngester
 
 
-# Persistent service state for the GUI. Lives in the user's home so
-# `rag status` works from any CWD. The server writes this on startup,
-# clears it on clean shutdown. PIDs guard against stale state during
-# restarts — we only clear on exit if the PID in the file is ours.
-SERVICE_STATE_DIR = Path.home() / ".rag"
-SERVICE_STATE_FILE = SERVICE_STATE_DIR / "state.json"
+# Persistent service state for the GUI. Path + helpers live in
+# service_state.py (single source of truth, mirrored for PowerShell in
+# scripts/_config.ps1). Module-level aliases kept for monkeypatchability.
+SERVICE_STATE_DIR = service_state.STATE_DIR
+SERVICE_STATE_FILE = service_state.STATE_FILE
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -83,14 +84,28 @@ def cli(ctx, config, verbose):
 @click.option("--topic", default=None, help="Restrict retrieval to a single topic.")
 @click.option("--no-citations", is_flag=True, help="Print the answer only.")
 @click.option("--json", "as_json", is_flag=True, help="Print a machine-readable AskResult.")
-@click.option("--hybrid", is_flag=True, help="Use hybrid (dense + sparse BM25) search.")
+@click.option("--hybrid/--no-hybrid", default=None,
+              help="Use hybrid (dense + sparse BM25) search. Default: config pipeline.hybrid.")
+@click.option("--dense-weight", default=None, type=float,
+              help="Hybrid dense-vs-sparse balance (0.0–1.0). Default: config pipeline.dense_weight.")
 @click.pass_context
-def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json, hybrid):
+def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json, hybrid, dense_weight):
     """Ask a question over the knowledge base."""
+    if not query.strip():
+        # providers.embed_qwen3.embed_query raises ValueError on blank input;
+        # without this the user gets a traceback for a typo.
+        raise click.UsageError("query is empty or whitespace-only")
+
     cfg = ctx.obj["config"]
-    pip = cfg.get("pipeline", {})
+    pip = cfg.get("pipeline") or {}
     top_k_dense = top_k_dense or pip.get("top_k_dense", 20)
     top_k_final = top_k_final or pip.get("top_k_final", 5)
+    # Both knobs are swept by `rag eval --sweep`; the config keys are what
+    # make a sweep winner applicable to live queries. Flags still win.
+    if hybrid is None:
+        hybrid = pip.get("hybrid", False)
+    if dense_weight is None:
+        dense_weight = pip.get("dense_weight", 0.5)
 
     embedder = make_embedder(cfg)
     store = make_store(cfg)
@@ -109,6 +124,7 @@ def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json, hybr
         topic=topic,
         metadata=metadata,
         hybrid=hybrid,
+        dense_weight=dense_weight,
     )
     if metadata is not None:
         metadata.close()
@@ -136,14 +152,16 @@ def ask(ctx, query, top_k_dense, top_k_final, topic, no_citations, as_json, hybr
 @click.option("--batch-size", default=None, type=int, help="Override embedder batch size.")
 @click.option("--populate-sparse", is_flag=True,
               help="After ingest, compute BM25 sparse vectors for hybrid search.")
+@click.option("--yes", "-y", is_flag=True,
+              help="Skip the confirmation prompt when using --recreate.")
 @click.pass_context
-def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_size, populate_sparse):
+def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_size, populate_sparse, yes):
     """Ingest Markdown notes, Zeal docsets, PDFs, and/or EPUBs into the index."""
     if not (markdown_path or zeal_path or pdf_path or epub_path):
         raise click.UsageError("pass at least one of --markdown, --zeal, --pdf, or --epub")
 
     cfg = ctx.obj["config"]
-    ch = cfg.get("chunking", {})
+    cp = chunking_params(cfg)
     ing = cfg.get("ingest", {})
 
     embedder = make_embedder(cfg)
@@ -151,15 +169,22 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
     metadata = make_metadata(cfg)
     total = 0
 
+    if recreate and not yes:
+        click.confirm(
+            f"--recreate will DROP collection '{store.collection}' before "
+            "re-ingesting; a failed ingest then leaves a partial index. Continue?",
+            abort=True,
+        )
+
     if markdown_path:
         mi = MarkdownDirIngester(
             root=markdown_path,
-            target_tokens=ch.get("target_tokens", 768),
-            overlap_pct=ch.get("overlap_pct", 12),
-            min_chunk_tokens=ch.get("min_chunk_tokens", 32),
-            default_topic=ing.get("default_topic", "default"),
+            target_tokens=cp["target_tokens"],
+            overlap_pct=cp["overlap_pct"],
+            min_chunk_tokens=cp["min_chunk_tokens"],
+            default_topic=cp["default_topic"],
             frontmatter_topic_key=ing.get("markdown", {}).get("frontmatter_topic_key", "topic"),
-            max_chunks_per_doc=ch.get("max_chunks_per_doc", 2000),
+            max_chunks_per_doc=cp["max_chunks_per_doc"],
         )
         click.echo(f"ingesting markdown from {markdown_path} …")
         total += ingest_pipeline(
@@ -170,10 +195,10 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
     if zeal_path:
         zi = ZealIngester(
             docset_path=zeal_path,
-            target_tokens=ch.get("target_tokens", 768),
-            overlap_pct=ch.get("overlap_pct", 12),
-            min_chunk_tokens=ch.get("min_chunk_tokens", 32),
-            default_topic=ing.get("default_topic", "default"),
+            target_tokens=cp["target_tokens"],
+            overlap_pct=cp["overlap_pct"],
+            min_chunk_tokens=cp["min_chunk_tokens"],
+            default_topic=cp["default_topic"],
             sqlite_filename=ing.get("zeal", {}).get("sqlite_filename", "docSet.dsidx"),
             pages_dirname=ing.get("zeal", {}).get("pages_dirname", "Contents/Resources/Documents"),
         )
@@ -188,11 +213,11 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
     if pdf_path:
         pi = PdfDirIngester(
             path=pdf_path,
-            target_tokens=ch.get("target_tokens", 768),
-            overlap_pct=ch.get("overlap_pct", 12),
-            min_chunk_tokens=ch.get("min_chunk_tokens", 32),
-            default_topic=ing.get("default_topic", "default"),
-            max_chunks_per_doc=ch.get("max_chunks_per_doc", 2000),
+            target_tokens=cp["target_tokens"],
+            overlap_pct=cp["overlap_pct"],
+            min_chunk_tokens=cp["min_chunk_tokens"],
+            default_topic=cp["default_topic"],
+            max_chunks_per_doc=cp["max_chunks_per_doc"],
         )
         click.echo(f"ingesting PDF from {pdf_path} …")
         # If this is the only source, --recreate is honored. If the
@@ -207,11 +232,11 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
     if epub_path:
         ei = EpubDirIngester(
             path=epub_path,
-            target_tokens=ch.get("target_tokens", 768),
-            overlap_pct=ch.get("overlap_pct", 12),
-            min_chunk_tokens=ch.get("min_chunk_tokens", 32),
-            default_topic=ing.get("default_topic", "default"),
-            max_chunks_per_doc=ch.get("max_chunks_per_doc", 2000),
+            target_tokens=cp["target_tokens"],
+            overlap_pct=cp["overlap_pct"],
+            min_chunk_tokens=cp["min_chunk_tokens"],
+            default_topic=cp["default_topic"],
+            max_chunks_per_doc=cp["max_chunks_per_doc"],
         )
         click.echo(f"ingesting EPUB from {epub_path} …")
         # If this is the only source, --recreate is honored.
@@ -230,7 +255,14 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
             store.enable_hybrid()
             click.echo("sparse vectors populated.")
         except Exception as e:
-            click.echo(f"warning: sparse population failed: {e}", err=True)
+            click.echo(f"error: sparse population failed: {e}", err=True)
+            click.echo(
+                f"wrote {total} chunks into {store.collection}, but the index is "
+                "dense-only — hybrid queries will fall back to dense search. "
+                "Re-run with --populate-sparse after fixing the error.",
+                err=True,
+            )
+            sys.exit(1)
 
     click.echo(f"done. wrote {total} chunks into {store.collection}.")
 
@@ -269,6 +301,24 @@ def _resolve_repo_path(path_str: str) -> Path:
     return p
 
 
+def _exit_if_no_combo_succeeded(results: list[dict], label: str) -> None:
+    """Exit 1 when not a single sweep row came back ok.
+
+    Wave A's theme: honest exit codes (`ingest --populate-sparse` already
+    does this). A table of nothing but failures is not a successful run —
+    returning 0 lets a scripted sweep, or a tired operator, read it as one.
+    The table is printed first, because it carries the diagnosis.
+    """
+    if any(r.get("status") == "ok" for r in results):
+        return
+    click.echo(
+        f"error: every combination failed — {len(results)} {label} combination(s) "
+        "attempted, none produced metrics. See the status column above.",
+        err=True,
+    )
+    sys.exit(1)
+
+
 @cli.command()
 @click.option("--golden", default="eval/golden_set.jsonl",
               help="Path to golden_set.jsonl. Resolved against CWD, then the repo root.")
@@ -276,11 +326,23 @@ def _resolve_repo_path(path_str: str) -> Path:
 @click.option("--with-faithfulness", is_flag=True,
               help="Also run the (slow) LLM generation step to compute faithfulness. "
                    "Requires Ollama to be running with the configured generator model.")
-@click.option("--nli", is_flag=True,
+@click.option("--nli/--no-nli", default=None,
               help="Use NLI cross-encoder (cross-encoder/nli-deberta-v3-xsmall) "
-                   "for the faithfulness score. Falls back to token-overlap if unavailable.")
+                   "for the faithfulness score. Falls back to token-overlap if unavailable. "
+                   "Default: config eval.nli (true).")
+@click.option("--sweep", is_flag=True,
+              help="Grid over retrieval knobs; prints a results table.")
+@click.option("--sweep-chunking", is_flag=True,
+              help="Heavy: re-ingest --markdown root into scratch collections per chunk size.")
+@click.option("--markdown", "markdown_root", default=None,
+              help="Source root for --sweep-chunking.")
+@click.option("--hybrid/--no-hybrid", default=None,
+              help="Use hybrid (dense + sparse BM25) search. Default: config pipeline.hybrid.")
+@click.option("--dense-weight", default=None, type=float,
+              help="Hybrid dense-vs-sparse balance (0.0–1.0). Default: config pipeline.dense_weight.")
 @click.pass_context
-def eval(ctx, golden, as_json, with_faithfulness, nli):
+def eval(ctx, golden, as_json, with_faithfulness, nli, sweep, sweep_chunking, markdown_root,
+         hybrid, dense_weight):
     """Run the eval harness: recall@5, MRR, NLI faithfulness."""
     # Lazy import so the eval dependencies don't load on every command.
     from eval import run_ragas
@@ -289,16 +351,30 @@ def eval(ctx, golden, as_json, with_faithfulness, nli):
     cfg = ctx.obj["config"]
     embedder = make_embedder(cfg)
     store = make_store(cfg)
-    reranker = make_reranker(cfg)
     metadata = make_metadata(cfg)
     # Generator is only loaded when --with-faithfulness is set. By default
     # the eval is retrieval-only (no LLM call) so it's fast and works even
     # when Ollama isn't running.
     generator = make_generator(cfg) if with_faithfulness else None
 
-    # NLI faithfulness scorer — loaded lazily; None if unavailable.
+    if nli is None:
+        nli = (cfg.get("eval") or {}).get("nli", True)
+
+    # The baseline run (runbook step 3) has to measure the SAME retrieval
+    # stack the sweep (step 4) varies, or the "measured delta" between them
+    # compares incomparable numbers. The sweep pins hybrid=True; these keys
+    # are how the baseline gets there too.
+    pip = cfg.get("pipeline") or {}
+    if hybrid is None:
+        hybrid = pip.get("hybrid", False)
+    if dense_weight is None:
+        dense_weight = pip.get("dense_weight", 0.5)
+
+    # NLI faithfulness scorer — loaded lazily; None if unavailable. Only
+    # worth loading when there's a generator to score (faithfulness isn't
+    # computed on retrieval-only runs), so a plain `rag eval` stays fast.
     nli_scorer = None
-    if nli:
+    if nli and generator is not None:
         try:
             from eval.nli_faithfulness import make_nli_faithfulness
             nli_scorer = make_nli_faithfulness(cfg)
@@ -307,16 +383,44 @@ def eval(ctx, golden, as_json, with_faithfulness, nli):
         except Exception as e:
             click.echo(f"nli: could not load scorer: {e} — skipping")
 
+    if sweep_chunking:
+        if not markdown_root:
+            raise click.UsageError("--sweep-chunking requires --markdown <root>")
+        from eval import sweep as sweep_mod
+        results = sweep_mod.run_chunking_sweep(
+            golden_path, cfg, markdown_root=markdown_root,
+            embedder=embedder, metadata=metadata)
+        if metadata is not None:
+            metadata.close()
+        click.echo(sweep_mod.format_chunking_table(results))
+        _exit_if_no_combo_succeeded(results, "chunking sweep")
+        return
+
+    if sweep:
+        from eval import sweep as sweep_mod
+        results = sweep_mod.run_sweep(
+            golden_path, cfg, embedder=embedder, store=store,
+            metadata=metadata, generator=generator, nli=nli_scorer)
+        if metadata is not None:
+            metadata.close()
+        click.echo(sweep_mod.format_table(results))
+        _exit_if_no_combo_succeeded(results, "sweep")
+        return
+
+    reranker = make_reranker(cfg)
+
     metrics = run_ragas.run(
         golden_path=golden_path,
         embedder=embedder,
         store=store,
         reranker=reranker,
         generator=generator,
-        top_k_dense=cfg.get("pipeline", {}).get("top_k_dense", 20),
-        top_k_final=cfg.get("pipeline", {}).get("top_k_final", 5),
+        top_k_dense=pip.get("top_k_dense", 20),
+        top_k_final=pip.get("top_k_final", 5),
         metadata=metadata,
         nli_faithfulness=nli_scorer,
+        hybrid=hybrid,
+        dense_weight=dense_weight,
     )
     if metadata is not None:
         metadata.close()
@@ -324,6 +428,111 @@ def eval(ctx, golden, as_json, with_faithfulness, nli):
         click.echo(json.dumps(metrics, indent=2))
     else:
         run_ragas.print_report(metrics)
+
+
+# -----------------------------------------------------------------------------
+# rag golden generate / review / stats
+# -----------------------------------------------------------------------------
+#
+# Curation flow for the golden eval set. `generate` drafts candidate rows
+# over the live index (needs Ollama); `review` is an interactive y/n/e/q
+# pass that promotes accepted candidates into golden_real.jsonl; `stats`
+# reports counts. Both files are gitignored (personal corpus).
+#
+# NOTE: these two constants are deliberately NOT run through
+# `_resolve_repo_path` — that helper falls back to a bare CWD-relative
+# path when the target file doesn't exist yet, which is correct for an
+# INPUT like --golden (read-only, must already exist) but wrong for an
+# OUTPUT path like these: `rag golden generate` run from outside the repo
+# root would then write to (or fail creating) the wrong `eval/` directory.
+# Anchoring to DEFAULT_CONFIG_PATH.parent (the repo root) makes the
+# output location independent of CWD.
+GOLDEN_CANDIDATES = DEFAULT_CONFIG_PATH.parent / "eval" / "golden_candidates.jsonl"
+GOLDEN_REAL = DEFAULT_CONFIG_PATH.parent / "eval" / "golden_real.jsonl"
+
+
+@cli.group()
+def golden():
+    """Build and curate the golden question set over the LIVE index."""
+
+
+@golden.command("generate")
+@click.option("--n", default=100, type=int, help="Candidates to draft.")
+@click.option("--topic", "topics", multiple=True, help="Restrict to topic(s). Repeatable.")
+@click.option("--seed", default=1337, type=int, help="Sampling seed (determinism).")
+@click.pass_context
+def golden_generate(ctx, n, topics, seed):
+    """Sample chunks from the live index and draft candidate questions (needs Ollama)."""
+    from eval import golden_gen
+
+    cfg = ctx.obj["config"]
+    store = make_store(cfg)
+    try:
+        generator = make_generator(cfg)
+    except Exception as e:
+        click.echo(f"error: generator unavailable ({e}) — is Ollama running?", err=True)
+        sys.exit(1)
+    GOLDEN_CANDIDATES.parent.mkdir(parents=True, exist_ok=True)
+    written = golden_gen.generate_candidates(
+        store, generator, GOLDEN_CANDIDATES, n=n, topics=list(topics) or None, seed=seed)
+    click.echo(f"wrote {written} candidates to {GOLDEN_CANDIDATES}. Next: rag golden review")
+
+
+@golden.command("review")
+@click.pass_context
+def golden_review_cmd(ctx):
+    """Interactive y/n/e/q pass over pending candidates."""
+    from eval import golden_review
+
+    rows = golden_review.load_rows(GOLDEN_CANDIDATES)
+    todo = golden_review.pending(rows)
+    if not todo:
+        click.echo("no pending candidates. Run: rag golden generate")
+        return
+    accepted: list[dict] = golden_review.load_rows(GOLDEN_REAL)
+    done = 0
+    # The atomic write in save_rows() only protects a single write; it does
+    # NOT protect the review SESSION. Without this try/finally, a Ctrl-C
+    # (KeyboardInterrupt — Click converts it to Abort -> "Aborted!" + exit 1)
+    # or any other exception mid-loop would skip straight past both
+    # save_rows() calls below and silently discard every y/n/e decision made
+    # earlier in the pass, not just the in-flight one. Both saves now run on
+    # every exit path (normal completion, "q", or an exception), and the
+    # exception/interrupt is left to propagate afterward — never swallowed.
+    try:
+        for cand in todo:
+            click.echo(f"\nQ: {cand['question']}")
+            click.echo(f"   [{cand.get('topic', 'default')}] {cand.get('preview', '')}")
+            choice = click.prompt("accept? [y]es / [n]o / [e]dit / [q]uit",
+                                  type=click.Choice(["y", "n", "e", "q"]))
+            if choice == "q":
+                break
+            edited = None
+            if choice == "e":
+                # Re-prompt until non-blank so apply_decision's ValueError
+                # ("edit decision requires a non-empty question") can never
+                # actually be raised from here. Ctrl-C is the "back out" —
+                # it's still persisted by the try/finally above.
+                while not edited or not edited.strip():
+                    edited = click.prompt("edited question")
+            _, golden_row = golden_review.apply_decision(cand, choice, edited=edited)
+            if golden_row:
+                accepted.append(golden_row)
+            done += 1
+    finally:
+        golden_review.save_rows(GOLDEN_CANDIDATES, rows)          # statuses updated in place
+        golden_review.save_rows(GOLDEN_REAL, accepted)
+    click.echo(f"reviewed {done}; accepted total now {len(accepted)}")
+
+
+@golden.command("stats")
+@click.pass_context
+def golden_stats(ctx):
+    """Counts: pending / rejected / accepted (per topic)."""
+    from eval import golden_review
+
+    s = golden_review.stats(GOLDEN_CANDIDATES, GOLDEN_REAL)
+    click.echo(json.dumps(s, indent=2))
 
 
 # -----------------------------------------------------------------------------
@@ -338,58 +547,12 @@ def eval(ctx, golden, as_json, with_faithfulness, nli):
 
 def _read_service_state() -> dict | None:
     """Read the service state file. Returns None if absent or invalid."""
-    if not SERVICE_STATE_FILE.is_file():
-        return None
-    try:
-        return json.loads(SERVICE_STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    return service_state.read_state(path=SERVICE_STATE_FILE)
 
 
 def _pid_alive(pid: int) -> bool:
-    """Best-effort check: is the given PID still running on this host?
-
-    On Windows, `os.kill(pid, 0)` raises ValueError (the signal-0 trick
-    is a Unix idiom). We fall back to the Win32 OpenProcess API.
-    On Unix, signal 0 is the standard check.
-    """
-    if not pid or pid <= 0:
-        return False
-    if sys.platform == "win32":
-        # Win32 OpenProcess. Returns 0 (NULL handle) if the process
-        # doesn't exist or we don't have access. PROCESS_QUERY_LIMITED_
-        # INFORMATION is enough to check existence without elevated rights.
-        try:
-            import ctypes
-            from ctypes import wintypes
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            STILL_ACTIVE = 259
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid))
-            if handle == 0:
-                return False
-            try:
-                # OpenProcess alone succeeds for a just-exited process whose
-                # kernel object hasn't been reaped — ask for the exit code
-                # to distinguish "running" from "zombie".
-                code = wintypes.DWORD()
-                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                    return False
-                return code.value == STILL_ACTIVE
-            finally:
-                kernel32.CloseHandle(handle)
-        except Exception:
-            return False
-    # Unix: signal 0 is the standard "is the process alive" check.
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True   # exists, we just don't own it
-    except OSError:
-        return False
+    """Best-effort check: is the given PID still running? (service_state)"""
+    return service_state.pid_alive(pid)
 
 
 @cli.command()
@@ -492,8 +655,8 @@ def start(no_browser):
     # Ollama + Qdrant themselves).
     click.echo("start: non-Windows detected; only starting the rag server.")
     click.echo("start: you'll need to run Ollama and Qdrant separately.")
-    if no_browser:
-        os.environ["RAG_NO_BROWSER"] = "1"
+    # --no-browser needs no plumbing here: the non-Windows path never
+    # opens a browser in the first place.
     import serve as serve_mod
     serve_mod.run()
 

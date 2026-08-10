@@ -14,15 +14,15 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 import yaml
 
-from core.interfaces import Chunk, Embedder, Reranker, Generator, Ingester
+from core.interfaces import Chunk, Embedder, Reranker, Generator, Ingester, VectorStore
 from core.metadata import MetadataStore, hash_text
-from store.qdrant_store import QdrantStore
 
 
 log = logging.getLogger(__name__)
@@ -45,6 +45,25 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     if not isinstance(cfg, dict):
         raise ValueError(f"config root must be a mapping; got {type(cfg).__name__}")
     return cfg
+
+
+def chunking_params(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Chunking + ingest defaults, resolved in exactly one place.
+
+    Every ingester construction site (cli, serve, eval/build_golden) reads
+    these through here. The defaults used to be copy-pasted at 8+ call
+    sites — one copy drifting was the main way the eval could silently
+    index a different corpus than the live one.
+    """
+    ch = cfg.get("chunking", {}) or {}
+    ing = cfg.get("ingest", {}) or {}
+    return {
+        "target_tokens": ch.get("target_tokens", 768),
+        "overlap_pct": ch.get("overlap_pct", 12),
+        "min_chunk_tokens": ch.get("min_chunk_tokens", 32),
+        "default_topic": ing.get("default_topic", "default"),
+        "max_chunks_per_doc": ch.get("max_chunks_per_doc", 2000),
+    }
 
 
 def _import_class(dotted: str):
@@ -95,7 +114,7 @@ def make_generator(cfg: dict[str, Any]) -> Generator:
     return cls(**kwargs)
 
 
-def make_store(cfg: dict[str, Any]) -> QdrantStore:
+def make_store(cfg: dict[str, Any]) -> VectorStore:
     """P0 only has one store impl, so this is direct — but the factory keeps
     the same shape as the others so a new store only needs to be added to
     store/ and pointed at via config."""
@@ -141,7 +160,7 @@ class PassthroughReranker(Reranker):
 def ingest(
     ingester: Ingester,
     embedder: Embedder,
-    store: QdrantStore,
+    store: VectorStore,
     *,
     recreate: bool = False,
     batch_size: int | None = None,
@@ -196,17 +215,12 @@ def ingest(
             progress(total, -1)
         buffer.clear()
 
-    for chunk in ingester.iter_chunks():
-        buffer.append(chunk)
-        if len(buffer) >= bs:
-            _flush()
-    _flush()
-    log.info("ingest: wrote %d chunks into %s", total, store.collection)
-
-    # P1 metadata: one row per unique source file. Cheap (one
-    # row per file, not per chunk) and idempotent — re-ingest
-    # just refreshes chunk_count + content_hash.
-    if metadata is not None and sources:
+    def _record_sources() -> None:
+        # P1 metadata: one row per unique source file. Cheap (one
+        # row per file, not per chunk) and idempotent — re-ingest
+        # just refreshes chunk_count + content_hash.
+        if metadata is None or not sources:
+            return
         for source_path, (doc_type, topic, texts) in sources.items():
             metadata.record_source(
                 source_path=source_path,
@@ -216,6 +230,30 @@ def ingest(
                 content_hash=hash_text("\n\n".join(texts)),
             )
         log.info("metadata: recorded %d source rows", len(sources))
+
+    try:
+        for chunk in ingester.iter_chunks():
+            buffer.append(chunk)
+            if len(buffer) >= bs:
+                _flush()
+        _flush()
+    except Exception:
+        # A source failing mid-stream leaves the collection partially
+        # updated. Record the sources that DID land so metadata matches
+        # what is actually in the collection, then propagate.
+        log.error(
+            "ingest: aborted after %d chunks — collection %s is partially updated",
+            total, store.collection,
+        )
+        _record_sources()
+        raise
+    finally:
+        # The corpus changed (or may have) — a stale IDF map would silently
+        # skew hybrid scores on the next query.
+        invalidate_hybrid_cache()
+
+    log.info("ingest: wrote %d chunks into %s", total, store.collection)
+    _record_sources()
 
     return total
 
@@ -260,16 +298,52 @@ def _build_query_sparse_vector(query: str, vocab: dict[str, int] | None, idf: di
     return SparseVector(indices=indices, values=values)
 
 
-# Cached corpus stats for hybrid search — built lazily on first hybrid query.
+# Cached corpus stats for hybrid search — built lazily on first hybrid query,
+# guarded by _hybrid_lock so two FastAPI threadpool workers can't both scroll
+# the corpus on a cold start. Invalidated after every ingest.
 _hybrid_cache: dict = {"vocab": None, "idf": None, "built": False}
+_hybrid_lock = threading.Lock()
+
+
+# How much wider than top_k the hybrid branch retrieves when a topic filter
+# is in play.
+#
+# WHY THIS EXISTS: the hybrid path can only filter by topic AFTER fusing,
+# because RRF fuses two ranked lists the store returns independently — there
+# is no per-branch filtered query to push the predicate into (the dense-only
+# path does push it down, via store.search_with_filter). Post-filtering a
+# bare top_k slice threw away most of the candidate budget, and — far worse
+# — made the amount thrown away depend on top_k_dense, which is a SWEPT AXIS
+# in `rag eval --sweep`. top_k_dense=40 then scored better than 20 partly
+# because more in-topic hits survived the filter, which says nothing about
+# retrieval quality; committing that winner to config would be committing a
+# measurement artifact. Over-fetching before the filter decouples the two:
+# the filter no longer interacts with the axis being measured.
+#
+# 4 is a budget, not a guarantee: a topic holding less than 1/4 of the corpus
+# can still come up short, which is honest (the corpus cannot supply more)
+# rather than confounded (the budget was spent on other topics).
+OVERFETCH = 4
+
+
+def invalidate_hybrid_cache() -> None:
+    """Drop the cached corpus IDF map so the next hybrid query rebuilds it.
+
+    Must be called after anything that changes the corpus (ingest, delete):
+    a stale IDF map silently shifts hybrid scores against the new corpus."""
+    with _hybrid_lock:
+        _hybrid_cache["vocab"] = None
+        _hybrid_cache["idf"] = None
+        _hybrid_cache["built"] = False
 
 
 def _retrieve_hybrid(
     query: str,
     qvec: list[float],
-    store: QdrantStore,
+    store: VectorStore,
     top_k: int,
     topic: str | None,
+    dense_weight: float = 0.5,
 ) -> list[tuple]:
     """Dense + sparse hybrid search with RRF fusion.
 
@@ -284,70 +358,73 @@ def _retrieve_hybrid(
 
     global _hybrid_cache
 
-    # Lazy IDF build.
-    if not _hybrid_cache["built"]:
-        log.info("hybrid: building corpus IDF map...")
-        _TOKEN_RE = re.compile(r"\w{2,}")
+    # Lazy IDF build. The lock makes the check-then-build atomic: a second
+    # worker arriving mid-build blocks here instead of scrolling the corpus
+    # a second time.
+    with _hybrid_lock:
+        if not _hybrid_cache["built"]:
+            log.info("hybrid: building corpus IDF map...")
+            _TOKEN_RE = re.compile(r"\w{2,}")
 
-        def tokenize(t: str) -> list[str]:
-            return _TOKEN_RE.findall(t.lower())
+            def tokenize(t: str) -> list[str]:
+                return _TOKEN_RE.findall(t.lower())
 
-        all_texts: list[tuple[str, str]] = []
-        offset = None
-        while True:
-            pts, offset = store.client.scroll(
-                collection_name=store.collection,
-                limit=256, offset=offset,
-                with_payload=True, with_vectors=False,
-            )
-            for p in pts:
-                text = (p.payload or {}).get("text", "")
-                if text:
-                    all_texts.append((p.id, text))
-            if offset is None:
-                break
+            all_texts: list[tuple[str, str]] = list(store.iter_texts())
 
-        N = len(all_texts)
-        doc_freq: Counter = Counter()
-        for _, text in all_texts:
-            for tok in set(tokenize(text)):
-                doc_freq[tok] += 1
+            N = len(all_texts)
+            doc_freq: Counter = Counter()
+            for _, text in all_texts:
+                for tok in set(tokenize(text)):
+                    doc_freq[tok] += 1
 
-        _hybrid_cache["idf"] = {
-            t: math.log((N - df + 0.5) / (df + 0.5) + 1.0)
-            for t, df in doc_freq.items()
-        }
-        _hybrid_cache["vocab"] = {t: i for i, t in enumerate(sorted(_hybrid_cache["idf"]))}
-        _hybrid_cache["built"] = True
-        log.info("hybrid: IDF map ready — vocab=%d terms", len(_hybrid_cache["vocab"]))
+            _hybrid_cache["idf"] = {
+                t: math.log((N - df + 0.5) / (df + 0.5) + 1.0)
+                for t, df in doc_freq.items()
+            }
+            _hybrid_cache["vocab"] = {t: i for i, t in enumerate(sorted(_hybrid_cache["idf"]))}
+            _hybrid_cache["built"] = True
+            log.info("hybrid: IDF map ready — vocab=%d terms", len(_hybrid_cache["vocab"]))
 
-    # Build query sparse vector.
-    vocab = _hybrid_cache["vocab"]
-    idf = _hybrid_cache["idf"]
+        # Snapshot under the lock. Invalidation replaces these dicts rather
+        # than mutating them, so using the snapshots outside the lock is safe.
+        vocab = _hybrid_cache["vocab"]
+        idf = _hybrid_cache["idf"]
     query_sparse = _build_query_sparse_vector(query, vocab, idf)
+
+    # A topic post-filter discards hits after retrieval, so retrieve wider
+    # and truncate back — see OVERFETCH. Without a topic nothing is
+    # discarded, so the budget stays exactly top_k and the reranker sees
+    # the same candidate list it always did.
+    fetch_k = top_k * OVERFETCH if topic else top_k
+
+    def _post_filter(pairs: list[tuple]) -> list[tuple]:
+        """Apply the topic post-filter, then truncate to the caller's top_k.
+
+        Every return path in this function goes through here — including the
+        dense fallbacks, which previously returned an unfiltered slice and
+        silently leaked other topics into a topic-scoped query."""
+        if topic:
+            pairs = [(c, s) for c, s in pairs if c.topic == topic]
+        return pairs[:top_k]
 
     if query_sparse is None:
         log.warning("hybrid: no query terms found in vocabulary — falling back to dense")
-        return store.search_dense(qvec, top_k=top_k)
+        return _post_filter(store.search_dense(qvec, top_k=fetch_k))
 
     # Call the store's hybrid search.
     try:
         hits = store.search_hybrid(
             query_vector=qvec,
             query_sparse=query_sparse,
-            top_k=top_k,
-            dense_weight=0.5,
+            top_k=fetch_k,
+            dense_weight=dense_weight,
         )
     except Exception as e:
         log.warning("hybrid search failed (%s) — falling back to dense", e)
-        return store.search_dense(qvec, top_k=top_k)
-
-    # Filter by topic if requested (simple post-filter).
-    if topic:
-        hits = [(c, ds, hs) for c, ds, hs in hits if c.topic == topic]
+        return _post_filter(store.search_dense(qvec, top_k=fetch_k))
 
     # Return as (chunk, score) tuples for compatibility with the rest of ask().
-    return [(c, hs) for c, ds, hs in hits]
+    return _post_filter([(c, hs) for c, ds, hs in hits])
 
 
 # -----------------------------------------------------------------------------
@@ -367,7 +444,7 @@ class AskResult:
 def ask(
     query: str,
     embedder: Embedder,
-    store: QdrantStore,
+    store: VectorStore,
     reranker: Reranker,
     generator: Generator,
     *,
@@ -376,6 +453,7 @@ def ask(
     topic: str | None = None,
     metadata: MetadataStore | None = None,
     hybrid: bool = False,
+    dense_weight: float = 0.5,
 ) -> AskResult:
     """Full retrieve → rerank → build → generate pipeline.
 
@@ -383,6 +461,8 @@ def ask(
         hybrid: if True, use hybrid (dense + sparse BM25) search with RRF fusion.
             Requires sparse vectors to be populated first via `store.enable_hybrid()`
             or `rag ingest --populate-sparse`.
+        dense_weight: dense-vs-sparse balance for hybrid search, passed through
+            to `store.search_hybrid()`. Ignored unless `hybrid=True`.
     """
     # 1. Embed the query. Audit #9: use embed_query (with the model's
     #    retrieval instruction prefix) instead of plain embed. Documents
@@ -392,7 +472,7 @@ def ask(
 
     # 2. Retrieve top_k_dense from the store (or hybrid search).
     if hybrid:
-        hits = _retrieve_hybrid(query, qvec, store, top_k=top_k_dense, topic=topic)
+        hits = _retrieve_hybrid(query, qvec, store, top_k=top_k_dense, topic=topic, dense_weight=dense_weight)
     else:
         hits = store.search_with_filter(qvec, top_k=top_k_dense, topic=topic) if topic \
             else store.search_dense(qvec, top_k=top_k_dense)

@@ -66,6 +66,10 @@ class BgeReranker(Reranker):
             max_length=max_length,
             device=device,
         )
+        self._has_rank = hasattr(self._model, "rank")
+        if not self._has_rank:
+            log.info("reranker: CrossEncoder has no rank() (older "
+                     "sentence-transformers) — using predict() fallback")
         log.info("reranker ready (model=%s, device=%s)", model, device)
 
     def rerank(self, query: str, chunks: list[Chunk], top_k: int) -> list[Chunk]:
@@ -86,10 +90,7 @@ class BgeReranker(Reranker):
         if top_k > len(chunks):
             top_k = len(chunks)
 
-        # Build the (query, text) pairs. Use chunk.text — the model
-        # needs to see the actual content, not the source path.
-        pairs: list[tuple[str, str]] = [(query, c.text) for c in chunks]
-        try:
+        if self._has_rank:
             ranked = self._model.rank(
                 query=query,
                 documents=[c.text for c in chunks],
@@ -98,10 +99,12 @@ class BgeReranker(Reranker):
                 show_progress_bar=False,
                 return_documents=False,
             )
-        except Exception:
+        else:
             # `rank()` is a convenience wrapper that some older
-            # CrossEncoder versions don't have. Fall back to predict()
-            # and sort manually. Same semantics, slightly more code.
+            # CrossEncoder versions don't have (decided once in
+            # __init__). Fall back to predict() and sort manually.
+            # Same semantics, slightly more code.
+            pairs: list[tuple[str, str]] = [(query, c.text) for c in chunks]
             scores = self._model.predict(
                 pairs,
                 batch_size=self.batch_size,

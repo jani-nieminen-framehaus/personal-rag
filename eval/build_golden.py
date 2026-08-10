@@ -20,9 +20,19 @@ Inputs
 Output
 ------
 - eval/golden_set.jsonl : the same schema as before — one JSON per line
-                          with `question`, `relevant_chunk_ids`, and
-                          optional `topic`. The chunk_ids are the
-                          current ones, computed from the chunker.
+                          with `question`, `relevant_chunk_ids`,
+                          `relevant_refs`, and optional `topic`. The
+                          chunk_ids are the current ones, computed from
+                          the chunker.
+
+PORTABILITY NOTE on `relevant_refs`: chunk_ids are root-relative and so
+survive a clone, but `relevant_refs.source_path` must be the ABSOLUTE path
+because that is what the chunker stamps onto every chunk, and section mode
+matches it verbatim against live citations. A committed golden_set.jsonl
+therefore carries paths from whichever machine last ran this script. That
+only affects `--match-mode section` runs (i.e. `rag eval --sweep-chunking`);
+plain `rag eval` matches on chunk_id and is unaffected. Re-run this script
+after cloning if you intend to sweep chunking over samples/notes.
 
 When to run
 -----------
@@ -61,21 +71,14 @@ log = logging.getLogger("build_golden")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
-def _load_chunking_config() -> tuple[int, int, int, str]:
-    """Read the relevant chunking config from config.yaml directly.
-
-    Returns (target_tokens, overlap_pct, min_chunk_tokens, default_topic).
-    """
+def _load_chunking_config() -> dict:
+    """Chunking params from config.yaml via the SAME resolver the live
+    ingest paths use (core.pipeline.chunking_params) — the golden set must
+    chunk exactly like the live corpus or recall silently drifts."""
+    from core.pipeline import chunking_params
     with CONFIG.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    ch = cfg.get("chunking", {})
-    ing = cfg.get("ingest", {})
-    return (
-        ch.get("target_tokens", 768),
-        ch.get("overlap_pct", 12),
-        ch.get("min_chunk_tokens", 32),
-        ing.get("default_topic", "default"),
-    )
+    return chunking_params(cfg)
 
 
 def build_index():
@@ -86,14 +89,18 @@ def build_index():
     the caller can pick the first chunk_id, or all of them for a more
     thorough eval.
     """
-    target, overlap, min_size, default_topic = _load_chunking_config()
+    cp = _load_chunking_config()
 
     mi = MarkdownDirIngester(
         root=SAMPLES,
-        target_tokens=target,
-        overlap_pct=overlap,
-        min_chunk_tokens=min_size,
-        default_topic=default_topic,
+        target_tokens=cp["target_tokens"],
+        overlap_pct=cp["overlap_pct"],
+        min_chunk_tokens=cp["min_chunk_tokens"],
+        default_topic=cp["default_topic"],
+        # Every other ingester construction site passes this. Dropping it
+        # here let the golden set chunk a huge file differently from the
+        # live corpus — the exact drift chunking_params() exists to prevent.
+        max_chunks_per_doc=cp["max_chunks_per_doc"],
     )
 
     index: dict[tuple[str, str], list[str]] = {}
@@ -124,6 +131,7 @@ def main() -> int:
             continue
         q = json.loads(line)
         rel_ids: list[str] = []
+        rel_refs: list[dict] = []
         for rel in q.get("relevant", []):
             key = (rel["path"], rel["section"])
             if key not in index:
@@ -133,10 +141,22 @@ def main() -> int:
             # was token-split into multiple pieces, we want any of them to
             # count as a hit — recall@5 is more forgiving, MRR still works.
             rel_ids.extend(index[key])
+            # …and the chunking-independent key alongside it. run_ragas's
+            # section mode matches on f'{source_path}::{section}' built from
+            # live citations, and the chunker stamps citations with the
+            # ABSOLUTE path (core/chunker.py: source_path=str(path)) — while
+            # the index above is keyed by a repo-relative posix path. Emitting
+            # the relative form would look right and silently score every
+            # section-mode row 0.0, so re-join it onto SAMPLES here.
+            rel_refs.append({
+                "source_path": str(SAMPLES / rel["path"]),
+                "section": rel["section"],
+            })
 
         entry: dict = {
             "question": q["question"],
             "relevant_chunk_ids": rel_ids,
+            "relevant_refs": rel_refs,
         }
         if "topic" in q:
             entry["topic"] = q["topic"]
@@ -150,6 +170,12 @@ def main() -> int:
 
     GOLDEN.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
     log.info("wrote %s  (%d questions)", GOLDEN, len(out_lines))
+    if missing:
+        # The file is still written (useful for inspecting the drift), but a
+        # golden set with dangling references must fail the build — otherwise
+        # CI quietly runs evals against a shrunken question set.
+        log.error("golden set has %d drifted references — exiting 1", len(missing))
+        return 1
     return 0
 
 

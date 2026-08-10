@@ -11,14 +11,35 @@ import pytest
 
 # -- service state read/write ----------------------------------------------
 
-def test_state_round_trip(tmp_path: Path, monkeypatch):
-    """The service state file can be written and read back."""
+def test_state_round_trip(tmp_path: Path):
+    """service_state.write_state → read_state round-trips through the
+    actual repo helpers (atomic temp+rename write, tolerant read)."""
+    import service_state
     state = {"port": 8420, "pid": 1234, "started_at": "2026-08-09T10:00:00Z",
              "url": "http://localhost:8420", "host": "127.0.0.1"}
     state_file = tmp_path / "state.json"
-    state_file.write_text(json.dumps(state), encoding="utf-8")
-    read_back = json.loads(state_file.read_text(encoding="utf-8"))
-    assert read_back == state
+    service_state.write_state(state, path=state_file)
+    assert service_state.read_state(path=state_file) == state
+    assert list(tmp_path.glob("*.tmp")) == [], "atomic write must not leave temp files"
+
+
+def test_read_state_tolerates_torn_file(tmp_path: Path):
+    """A truncated/garbage state file reads as None, never raises."""
+    import service_state
+    state_file = tmp_path / "state.json"
+    state_file.write_text('{"port": 84', encoding="utf-8")
+    assert service_state.read_state(path=state_file) is None
+
+
+def test_clear_state_respects_ownership(tmp_path: Path):
+    """clear_state(owner_pid=...) must refuse to delete another server's file."""
+    import service_state
+    state_file = tmp_path / "state.json"
+    service_state.write_state({"pid": 1234}, path=state_file)
+    assert service_state.clear_state(owner_pid=9999, path=state_file) is False
+    assert state_file.exists()
+    assert service_state.clear_state(owner_pid=1234, path=state_file) is True
+    assert not state_file.exists()
 
 
 def test_status_no_state_file(tmp_path: Path, monkeypatch, capsys):
@@ -91,11 +112,8 @@ def test_ask_request_validation():
     """An empty query is rejected by Pydantic (min_length=1)."""
     from pydantic import ValidationError
     from serve import AskRequest
-    try:
+    with pytest.raises(ValidationError):
         AskRequest(query="")
-    except ValidationError:
-        return
-    raise AssertionError("expected ValidationError for empty query")
 
 
 # -- rag start / rag open (P2) ----------------------------------------------
@@ -139,47 +157,29 @@ def test_open_invokes_webbrowser_when_running(tmp_path, monkeypatch):
     assert captured.get("url") == "http://localhost:8420"
 
 
-def test_start_dispatches_to_powershell_on_windows(tmp_path, monkeypatch):
-    """On Windows, `rag start --no-browser` invokes the PowerShell start_all.ps1.
-
-    We mock subprocess.call so no real PowerShell runs, and we verify
-    the call shape (powershell.exe, the script path, the -NoBrowser
-    flag) without depending on the script lookup.
-    """
+def test_start_dispatches_to_powershell_on_windows(monkeypatch):
+    """On Windows, `rag start --no-browser` invokes start_all.ps1 with the
+    -NoBrowser flag. subprocess.call is mocked; the real script exists in
+    this repo, so the dispatch actually fires and we assert the call shape."""
     from click.testing import CliRunner
     from cli import cli as cli_group
-    # Real test of the dispatch path: invoke the click command with
-    # subprocess.call mocked. The script lookup will fail (no scripts/
-    # dir in tmp_path), so we use the real repo by checking that the
-    # command runs the PowerShell invocation when given the real path.
-    # Easier: just verify the command shape directly via the click
-    # runner. We mock sys.platform to keep the non-Windows fallback
-    # out of the way; the test is for the WINDOWS path.
+
     captured: dict = {}
+
     def fake_call(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
         return 0
-    monkeypatch.setattr("subprocess.call", fake_call)
-    monkeypatch.setattr("sys.platform", "win32")
-    # Run the command. It may fail at the script lookup, but
-    # subprocess.call should have been called already (before the
-    # is_file check). Actually no - cli.py checks is_file BEFORE the
-    # subprocess call. So the mocked call won't fire on a clean tmp_path.
-    # Instead, just verify the command exits without crashing, and
-    # confirm by direct call that subprocess.call is reachable.
-    runner = CliRunner()
-    res = runner.invoke(cli_group, ["start", "--no-browser"])
-    # The exit code is either 0 (if mocked subprocess was called) or
-    # 1 (if the script was missing and we exited). Either is fine;
-    # what matters is no Python traceback.
-    assert "Traceback" not in res.output, f"unexpected traceback:\n{res.output}"
 
+    monkeypatch.setattr("cli.subprocess.call", fake_call)
+    monkeypatch.setattr("cli.sys.platform", "win32")
+    res = CliRunner().invoke(cli_group, ["start", "--no-browser"])
 
-def test_start_reports_missing_script_cleanly(tmp_path, monkeypatch):
-    """If start_all.ps1 is missing, `rag start` exits 1 with a clear message."""
-    # This test would require re-pointing the repo path which is brittle
-    # to monkeypatch. The live test (in production smoke) already
-    # exercises this; the dispatch test above covers the happy path.
+    assert res.exit_code == 0, res.output
+    cmd = captured.get("cmd")
+    assert cmd, "subprocess.call was never invoked"
+    assert cmd[0] == "powershell.exe"
+    assert any(str(a).endswith("start_all.ps1") for a in cmd)
+    assert "-NoBrowser" in cmd
 
 
 def test_start_script_file_exists():
@@ -234,30 +234,27 @@ def test_api_ingest_route_registered():
     assert "/api/ingest" in paths, f"/api/ingest missing; routes: {paths}"
 
 
-def test_api_ingest_rejects_empty_upload():
+def test_api_ingest_rejects_empty_upload(serve_state):
     """POST /api/ingest with no files returns 400."""
     from fastapi.testclient import TestClient
     import serve
     # Force the server into the "ready" state without loading the real
     # ABCs (which would download models and take minutes).
-    serve.S.ready = True
-    try:
-        client = TestClient(serve.app)
-        # No files key at all.
-        r = client.post("/api/ingest", files=[])
-        # FastAPI returns 422 for missing required parameter; 400 for
-        # empty list. Either is acceptable for "no files".
-        assert r.status_code in (400, 422)
-    finally:
-        serve.S.ready = False
+    serve_state.ready = True
+    client = TestClient(serve.app)
+    # No files key at all.
+    r = client.post("/api/ingest", files=[])
+    # FastAPI returns 422 for missing required parameter; 400 for
+    # empty list. Either is acceptable for "no files".
+    assert r.status_code in (400, 422)
 
 
-def test_api_ingest_rejects_when_not_ready():
+def test_api_ingest_rejects_when_not_ready(serve_state):
     """POST /api/ingest returns 503 when the server hasn't finished startup."""
     from fastapi.testclient import TestClient
     import serve
     # Make sure ready is False.
-    serve.S.ready = False
+    serve_state.ready = False
     client = TestClient(serve.app)
     # Use a dummy in-memory file; the ready check happens first.
     r = client.post(
@@ -267,71 +264,56 @@ def test_api_ingest_rejects_when_not_ready():
     assert r.status_code == 503
 
 
-def test_api_ingest_handles_unsupported_extensions():
+class _NopEmbedder:
+    def dim(self): return 4
+    def embed(self, texts): return [[0.0] * 4 for _ in texts]
+    def embed_query(self, t): return [0.0] * 4
+    def embed_documents(self, texts): return [[0.0] * 4 for _ in texts]
+
+
+class _NopStore:
+    collection = "test"
+    def ensure_collection(self, recreate=False, expected_dense_dim=None): pass
+    def upsert_chunks(self, chunks, vectors): return len(chunks)
+
+
+def test_api_ingest_handles_unsupported_extensions(serve_state):
     """Unsupported file types are reported in `skipped`, not in `files`."""
     from fastapi.testclient import TestClient
     import serve
-    serve.S.ready = True
-    class _NopEmbedder:
-        def dim(self): return 4
-        def embed(self, texts): return [[0.0] * 4 for _ in texts]
-        def embed_query(self, t): return [0.0] * 4
-        def embed_documents(self, texts): return [[0.0] * 4 for _ in texts]
-    class _NopStore:
-        collection = "test"
-        def ensure_collection(self, recreate=False, expected_dense_dim=None): pass
-        def upsert_chunks(self, chunks, vectors): return len(chunks)
-    try:
-        serve.S.embedder = _NopEmbedder()
-        serve.S.store = _NopStore()
-        client = TestClient(serve.app)
-        r = client.post(
-            "/api/ingest",
-            files=[("files", ("foo.txt", b"hi"))],  # not supported
-        )
-        assert r.status_code == 200, r.text
-        j = r.json()
-        assert j["ingested"] == 0
-        assert "foo.txt" in j["skipped"]
-        assert j["chunks"] == 0
-    finally:
-        serve.S.ready = False
-        serve.S.embedder = None
-        serve.S.store = None
+    serve_state.ready = True
+    serve_state.embedder = _NopEmbedder()
+    serve_state.store = _NopStore()
+    client = TestClient(serve.app)
+    r = client.post(
+        "/api/ingest",
+        files=[("files", ("foo.txt", b"hi"))],  # not supported
+    )
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["ingested"] == 0
+    assert "foo.txt" in j["skipped"]
+    assert j["chunks"] == 0
 
 
-def test_api_ingest_uploads_markdown():
+def test_api_ingest_uploads_markdown(serve_state):
     """A markdown upload should be accepted and 'ingested' via the nop store."""
     from fastapi.testclient import TestClient
     import serve
-    serve.S.ready = True
-    class _NopEmbedder:
-        def dim(self): return 4
-        def embed(self, texts): return [[0.0] * 4 for _ in texts]
-        def embed_query(self, t): return [0.0] * 4
-        def embed_documents(self, texts): return [[0.0] * 4 for _ in texts]
-    class _NopStore:
-        collection = "test"
-        def ensure_collection(self, recreate=False, expected_dense_dim=None): pass
-        def upsert_chunks(self, chunks, vectors): return len(chunks)
-    try:
-        serve.S.embedder = _NopEmbedder()
-        serve.S.store = _NopStore()
-        client = TestClient(serve.app)
-        r = client.post(
-            "/api/ingest",
-            files=[("files", ("notes.md", b"# Hello\nbody of the note\n"))],
-        )
-        assert r.status_code == 200, r.text
-        j = r.json()
-        assert j["ingested"] == 1
-        assert j["chunks"] >= 1
-        assert "notes.md" in j["files"]
-        assert "md" in j["types"]
-    finally:
-        serve.S.ready = False
-        serve.S.embedder = None
-        serve.S.store = None
+    serve_state.ready = True
+    serve_state.embedder = _NopEmbedder()
+    serve_state.store = _NopStore()
+    client = TestClient(serve.app)
+    r = client.post(
+        "/api/ingest",
+        files=[("files", ("notes.md", b"# Hello\nbody of the note\n"))],
+    )
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["ingested"] == 1
+    assert j["chunks"] >= 1
+    assert "notes.md" in j["files"]
+    assert "md" in j["types"]
 
 
 def test_static_dir_is_mounted():

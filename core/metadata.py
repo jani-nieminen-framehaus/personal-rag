@@ -38,8 +38,10 @@ log = logging.getLogger(__name__)
 
 
 # -----------------------------------------------------------------------------
-# Schema
+# Schema & Migrations
 # -----------------------------------------------------------------------------
+
+_LATEST_SCHEMA_VERSION = 1
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -126,10 +128,52 @@ class MetadataStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._lock = threading.Lock()
         self._init_schema()
+        self._migrate()
 
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(_SCHEMA)
+
+    def _migrate(self) -> None:
+        """Additive migrations, versioned via PRAGMA user_version.
+
+        v0 -> v1: eval_runs gains params (JSON) + faithfulness_method.
+        _SCHEMA stays at the v0 shape so fresh and existing DBs take the
+        exact same path through here.
+
+        The migration is deliberately TOLERANT rather than transactional.
+        The connection autocommits (`isolation_level=None`) and `self._lock`
+        is a threading.Lock, which does nothing across processes — and this
+        deployment runs the FastAPI server as a scheduled task alongside CLI
+        commands against the same metadata.sqlite3. So two concurrent opens
+        of a v0 DB, or a crash between the ALTERs and the PRAGMA, can leave
+        a column present with user_version still 0. Checking table_info
+        before each ADD COLUMN makes that state self-repairing on the next
+        open instead of a permanent `duplicate column name: params` out of
+        __init__ that needs manual sqlite surgery. (A BEGIN IMMEDIATE
+        transaction would close the race but could NOT repair a database
+        that is already half-migrated.)
+        """
+        with self._lock:
+            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version >= _LATEST_SCHEMA_VERSION:
+                return
+            existing = {row[1] for row in self._conn.execute("PRAGMA table_info(eval_runs)")}
+            for column, decl in (("params", "TEXT"), ("faithfulness_method", "TEXT")):
+                if column in existing:
+                    continue
+                try:
+                    self._conn.execute(f"ALTER TABLE eval_runs ADD COLUMN {column} {decl}")
+                except sqlite3.OperationalError as e:
+                    # Another process won the race between our table_info
+                    # read and this ALTER. The column exists either way,
+                    # which is all we need — anything else re-raises.
+                    if "duplicate column" not in str(e).lower():
+                        raise
+                    log.debug("metadata: %s already added concurrently", column)
+            # Set the version regardless of which ALTERs we actually ran, so
+            # a half-migrated database converges to v1 on this open.
+            self._conn.execute(f"PRAGMA user_version = {_LATEST_SCHEMA_VERSION}")
 
     def close(self) -> None:
         with self._lock:
@@ -196,14 +240,17 @@ class MetadataStore:
         mrr: float,
         recall_at_dense: float | None = None,
         faithfulness_proxy: float | None = None,
+        params: dict | None = None,
+        faithfulness_method: str | None = None,
     ) -> None:
         """Append one row to `eval_runs`. The eval harness calls this once per run."""
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO eval_runs
-                    (ran_at, n_questions, recall_at_5, mrr, recall_at_dense, faithfulness_proxy)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (ran_at, n_questions, recall_at_5, mrr, recall_at_dense,
+                     faithfulness_proxy, params, faithfulness_method)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _now_iso(),
@@ -212,6 +259,8 @@ class MetadataStore:
                     float(mrr),
                     None if recall_at_dense is None else float(recall_at_dense),
                     None if faithfulness_proxy is None else float(faithfulness_proxy),
+                    None if params is None else json.dumps(params, ensure_ascii=False),
+                    faithfulness_method,
                 ),
             )
 
@@ -249,12 +298,15 @@ class MetadataStore:
     def get_eval_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         """Recent eval runs, most recent first."""
         cur = self._conn.execute(
-            "SELECT id, ran_at, n_questions, recall_at_5, mrr, recall_at_dense, faithfulness_proxy "
+            "SELECT id, ran_at, n_questions, recall_at_5, mrr, recall_at_dense, faithfulness_proxy, params, faithfulness_method "
             "FROM eval_runs ORDER BY ran_at DESC, id DESC LIMIT ?",
             (int(limit),),
         )
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        for r in rows:
+            r["params"] = json.loads(r["params"]) if r.get("params") else None
+        return rows
 
     def get_stats(self) -> dict[str, Any]:
         """Aggregate counts and the top-cited source. One row, fast."""

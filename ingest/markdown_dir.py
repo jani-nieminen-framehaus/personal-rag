@@ -89,11 +89,14 @@ class MarkdownDirIngester(Ingester):
                 log.warning("chunking failed for %s: %s — skipping", path, e)
                 continue
             if len(chunks) > self.max_chunks_per_doc:
+                # Truncate, don't drop: pdf_dir/epub_dir keep the first N
+                # chunks at the cap, and a partially indexed file beats a
+                # silently missing one.
                 log.warning(
-                    "skipping %s — produced %d chunks (cap=%d)",
-                    path, len(chunks), self.max_chunks_per_doc,
+                    "truncating %s — produced %d chunks (cap=%d); keeping the first %d",
+                    path, len(chunks), self.max_chunks_per_doc, self.max_chunks_per_doc,
                 )
-                continue
+                chunks = chunks[: self.max_chunks_per_doc]
             for c in chunks:
                 yield c
 

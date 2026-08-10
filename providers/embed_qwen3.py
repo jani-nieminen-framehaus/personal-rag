@@ -129,7 +129,10 @@ class Qwen3Embedder(Embedder):
         prefix; queries (one at retrieval time) are embedded WITH it.
         This asymmetry measurably improves recall on Qwen3-Embedding.
         """
-        if not text:
-            return [0.0] * self._dim
+        if not text.strip():
+            # A zero vector has no direction — cosine against it is undefined,
+            # and whitespace-only input would embed just the instruction
+            # prefix. Both silently return junk matches; fail loudly instead.
+            raise ValueError("embed_query: query text is empty or whitespace-only")
         prompted = f"{self.query_instruction}\n{text}"
         return self.embed_documents([prompted])[0]
