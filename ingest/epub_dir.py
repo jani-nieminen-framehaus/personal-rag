@@ -28,6 +28,7 @@ from typing import Iterator
 
 from core.chunker import _split_by_tokens, count_tokens
 from core.interfaces import Chunk, Ingester, make_chunk_id, make_parent_id
+from core.walk import iter_source_files
 
 
 log = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ class EpubDirIngester(Ingester):
         self.default_topic = default_topic
         self.max_chunks_per_doc = max_chunks_per_doc
         self.skip_hidden = skip_hidden
+        self.only_paths = None
 
     @property
     def name(self) -> str:
@@ -92,20 +94,10 @@ class EpubDirIngester(Ingester):
     # -- helpers --------------------------------------------------------------
 
     def _collect_files(self) -> list[Path]:
-        if self.is_file:
-            return [self.path]
-        out: list[Path] = []
-        for p in self.path.rglob("*"):
-            if not p.is_file():
-                continue
-            if p.suffix.lower() != ".epub":
-                continue
-            if self.skip_hidden and any(
-                part.startswith(".") for part in p.relative_to(self.path).parts
-            ):
-                continue
-            out.append(p)
-        return sorted(out)
+        return iter_source_files(
+            self.path, {".epub"},
+            skip_hidden=self.skip_hidden, only_paths=self.only_paths,
+        )
 
     def _iter_one_epub(self, file: Path) -> Iterator[Chunk]:
         # Lazy import so epub is an optional dep.
