@@ -60,6 +60,15 @@ def test_only_paths_ignores_entries_that_do_not_match_the_walk(tmp_path):
     assert got == []
 
 
+def test_empty_only_paths_means_no_files_not_no_filter(tmp_path):
+    """set() must mean "restrict to nothing", NOT "no restriction". Task 5's
+    refresh relies on this: collapsing the two would make a no-change refresh
+    silently re-ingest the whole corpus."""
+    _tree(tmp_path)
+    assert iter_source_files(tmp_path, {".md"}) != []      # files DO exist
+    assert iter_source_files(tmp_path, {".md"}, only_paths=set()) == []
+
+
 def test_single_file_root_returns_that_file(tmp_path):
     f = tmp_path / "only.pdf"
     f.write_text("x", encoding="utf-8")
