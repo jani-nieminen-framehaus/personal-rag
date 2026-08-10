@@ -19,6 +19,7 @@ from pathlib import Path
 
 import click
 
+import service_state
 from core import pipeline
 from core.pipeline import (
     load_config,
@@ -27,6 +28,7 @@ from core.pipeline import (
     make_generator,
     make_store,
     make_metadata,
+    chunking_params,
     format_citation_footer,
     ask as ask_pipeline,
     ingest as ingest_pipeline,
@@ -39,12 +41,11 @@ from ingest.pdf_dir import PdfDirIngester
 from ingest.epub_dir import EpubDirIngester
 
 
-# Persistent service state for the GUI. Lives in the user's home so
-# `rag status` works from any CWD. The server writes this on startup,
-# clears it on clean shutdown. PIDs guard against stale state during
-# restarts — we only clear on exit if the PID in the file is ours.
-SERVICE_STATE_DIR = Path.home() / ".rag"
-SERVICE_STATE_FILE = SERVICE_STATE_DIR / "state.json"
+# Persistent service state for the GUI. Path + helpers live in
+# service_state.py (single source of truth, mirrored for PowerShell in
+# scripts/_config.ps1). Module-level aliases kept for monkeypatchability.
+SERVICE_STATE_DIR = service_state.STATE_DIR
+SERVICE_STATE_FILE = service_state.STATE_FILE
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -145,7 +146,7 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
         raise click.UsageError("pass at least one of --markdown, --zeal, --pdf, or --epub")
 
     cfg = ctx.obj["config"]
-    ch = cfg.get("chunking", {})
+    cp = chunking_params(cfg)
     ing = cfg.get("ingest", {})
 
     embedder = make_embedder(cfg)
@@ -163,12 +164,12 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
     if markdown_path:
         mi = MarkdownDirIngester(
             root=markdown_path,
-            target_tokens=ch.get("target_tokens", 768),
-            overlap_pct=ch.get("overlap_pct", 12),
-            min_chunk_tokens=ch.get("min_chunk_tokens", 32),
-            default_topic=ing.get("default_topic", "default"),
+            target_tokens=cp["target_tokens"],
+            overlap_pct=cp["overlap_pct"],
+            min_chunk_tokens=cp["min_chunk_tokens"],
+            default_topic=cp["default_topic"],
             frontmatter_topic_key=ing.get("markdown", {}).get("frontmatter_topic_key", "topic"),
-            max_chunks_per_doc=ch.get("max_chunks_per_doc", 2000),
+            max_chunks_per_doc=cp["max_chunks_per_doc"],
         )
         click.echo(f"ingesting markdown from {markdown_path} …")
         total += ingest_pipeline(
@@ -179,10 +180,10 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
     if zeal_path:
         zi = ZealIngester(
             docset_path=zeal_path,
-            target_tokens=ch.get("target_tokens", 768),
-            overlap_pct=ch.get("overlap_pct", 12),
-            min_chunk_tokens=ch.get("min_chunk_tokens", 32),
-            default_topic=ing.get("default_topic", "default"),
+            target_tokens=cp["target_tokens"],
+            overlap_pct=cp["overlap_pct"],
+            min_chunk_tokens=cp["min_chunk_tokens"],
+            default_topic=cp["default_topic"],
             sqlite_filename=ing.get("zeal", {}).get("sqlite_filename", "docSet.dsidx"),
             pages_dirname=ing.get("zeal", {}).get("pages_dirname", "Contents/Resources/Documents"),
         )
@@ -197,11 +198,11 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
     if pdf_path:
         pi = PdfDirIngester(
             path=pdf_path,
-            target_tokens=ch.get("target_tokens", 768),
-            overlap_pct=ch.get("overlap_pct", 12),
-            min_chunk_tokens=ch.get("min_chunk_tokens", 32),
-            default_topic=ing.get("default_topic", "default"),
-            max_chunks_per_doc=ch.get("max_chunks_per_doc", 2000),
+            target_tokens=cp["target_tokens"],
+            overlap_pct=cp["overlap_pct"],
+            min_chunk_tokens=cp["min_chunk_tokens"],
+            default_topic=cp["default_topic"],
+            max_chunks_per_doc=cp["max_chunks_per_doc"],
         )
         click.echo(f"ingesting PDF from {pdf_path} …")
         # If this is the only source, --recreate is honored. If the
@@ -216,11 +217,11 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
     if epub_path:
         ei = EpubDirIngester(
             path=epub_path,
-            target_tokens=ch.get("target_tokens", 768),
-            overlap_pct=ch.get("overlap_pct", 12),
-            min_chunk_tokens=ch.get("min_chunk_tokens", 32),
-            default_topic=ing.get("default_topic", "default"),
-            max_chunks_per_doc=ch.get("max_chunks_per_doc", 2000),
+            target_tokens=cp["target_tokens"],
+            overlap_pct=cp["overlap_pct"],
+            min_chunk_tokens=cp["min_chunk_tokens"],
+            default_topic=cp["default_topic"],
+            max_chunks_per_doc=cp["max_chunks_per_doc"],
         )
         click.echo(f"ingesting EPUB from {epub_path} …")
         # If this is the only source, --recreate is honored.
@@ -354,58 +355,12 @@ def eval(ctx, golden, as_json, with_faithfulness, nli):
 
 def _read_service_state() -> dict | None:
     """Read the service state file. Returns None if absent or invalid."""
-    if not SERVICE_STATE_FILE.is_file():
-        return None
-    try:
-        return json.loads(SERVICE_STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    return service_state.read_state(path=SERVICE_STATE_FILE)
 
 
 def _pid_alive(pid: int) -> bool:
-    """Best-effort check: is the given PID still running on this host?
-
-    On Windows, `os.kill(pid, 0)` raises ValueError (the signal-0 trick
-    is a Unix idiom). We fall back to the Win32 OpenProcess API.
-    On Unix, signal 0 is the standard check.
-    """
-    if not pid or pid <= 0:
-        return False
-    if sys.platform == "win32":
-        # Win32 OpenProcess. Returns 0 (NULL handle) if the process
-        # doesn't exist or we don't have access. PROCESS_QUERY_LIMITED_
-        # INFORMATION is enough to check existence without elevated rights.
-        try:
-            import ctypes
-            from ctypes import wintypes
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            STILL_ACTIVE = 259
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid))
-            if handle == 0:
-                return False
-            try:
-                # OpenProcess alone succeeds for a just-exited process whose
-                # kernel object hasn't been reaped — ask for the exit code
-                # to distinguish "running" from "zombie".
-                code = wintypes.DWORD()
-                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                    return False
-                return code.value == STILL_ACTIVE
-            finally:
-                kernel32.CloseHandle(handle)
-        except Exception:
-            return False
-    # Unix: signal 0 is the standard "is the process alive" check.
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True   # exists, we just don't own it
-    except OSError:
-        return False
+    """Best-effort check: is the given PID still running? (service_state)"""
+    return service_state.pid_alive(pid)
 
 
 @cli.command()
@@ -508,8 +463,8 @@ def start(no_browser):
     # Ollama + Qdrant themselves).
     click.echo("start: non-Windows detected; only starting the rag server.")
     click.echo("start: you'll need to run Ollama and Qdrant separately.")
-    if no_browser:
-        os.environ["RAG_NO_BROWSER"] = "1"
+    # --no-browser needs no plumbing here: the non-Windows path never
+    # opens a browser in the first place.
     import serve as serve_mod
     serve_mod.run()
 

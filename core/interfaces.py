@@ -1,8 +1,9 @@
 """Core ABCs for the RAG pipeline.
 
-All swap points live here. Concrete implementations are in `providers/` and
-`ingest/`. The pipeline and CLI depend ONLY on these abstractions, so swapping
-an embedding model or generator is a `config.yaml` change.
+All swap points live here. Concrete implementations are in `providers/`,
+`ingest/`, and `store/`. The pipeline and CLI depend ONLY on these
+abstractions, so swapping an embedding model, generator, or vector store is a
+`config.yaml` change.
 
 Design contract:
 - `Chunk` is the unit that flows everywhere: ingester → embedder → store → pipeline → generator.
@@ -162,3 +163,73 @@ class Ingester(ABC):
     @abstractmethod
     def name(self) -> str:
         """Human-readable name for logging, e.g. 'markdown_dir:/path/to/notes'."""
+
+
+class VectorStore(ABC):
+    """Vector store contract. The pipeline depends only on this surface.
+
+    Concrete adapters (store/qdrant_store.QdrantStore) subclass this; a new
+    backend is a subclass plus a `config.yaml` change — the pipeline never
+    imports a concrete store.
+
+    `enable_hybrid` / `search_hybrid` have raising defaults so a dense-only
+    backend works out of the box: the pipeline already falls back to dense
+    search when the hybrid path raises. (Extras like QdrantStore's
+    `delete_by_source` are adapter-specific and deliberately not part of
+    this contract.)
+    """
+
+    collection: str
+
+    @abstractmethod
+    def ensure_collection(
+        self, recreate: bool = False, expected_dense_dim: int | None = None
+    ) -> None:
+        """Create the collection if missing; validate dims when it exists."""
+
+    @abstractmethod
+    def count(self) -> int:
+        """Number of points currently stored."""
+
+    @abstractmethod
+    def upsert_chunks(self, chunks: list[Chunk], vectors: list[list[float]]) -> int:
+        """Upsert (chunk, dense_vector) pairs. Returns count written."""
+
+    @abstractmethod
+    def search_dense(self, vector: list[float], top_k: int) -> list[tuple[Chunk, float]]:
+        """Return (chunk, score) pairs, best first."""
+
+    @abstractmethod
+    def search_with_filter(
+        self, vector: list[float], top_k: int, topic: str | None = None
+    ) -> list[tuple[Chunk, float]]:
+        """Same as search_dense, optionally constrained to one topic."""
+
+    @abstractmethod
+    def iter_payloads(self) -> Iterator[tuple[str, dict[str, Any]]]:
+        """Yield (point_id, payload) for every stored point. Streaming —
+        callers must not assume the corpus fits in memory."""
+
+    def iter_texts(self) -> Iterator[tuple[str, str]]:
+        """Yield (point_id, text) for every point with non-empty text."""
+        for pid, payload in self.iter_payloads():
+            text = (payload or {}).get("text", "")
+            if text:
+                yield pid, text
+
+    def enable_hybrid(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support hybrid (sparse) retrieval"
+        )
+
+    def search_hybrid(
+        self,
+        query_vector: list[float],
+        query_sparse: Any,
+        top_k: int = 20,
+        dense_weight: float = 0.5,
+    ) -> list[tuple[Chunk, float, float]]:
+        """(chunk, dense_score, hybrid_score) best-first. Raises by default."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support hybrid (sparse) retrieval"
+        )

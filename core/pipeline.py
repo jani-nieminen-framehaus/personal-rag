@@ -21,9 +21,8 @@ from typing import Any, Callable
 
 import yaml
 
-from core.interfaces import Chunk, Embedder, Reranker, Generator, Ingester
+from core.interfaces import Chunk, Embedder, Reranker, Generator, Ingester, VectorStore
 from core.metadata import MetadataStore, hash_text
-from store.qdrant_store import QdrantStore
 
 
 log = logging.getLogger(__name__)
@@ -46,6 +45,25 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     if not isinstance(cfg, dict):
         raise ValueError(f"config root must be a mapping; got {type(cfg).__name__}")
     return cfg
+
+
+def chunking_params(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Chunking + ingest defaults, resolved in exactly one place.
+
+    Every ingester construction site (cli, serve, eval/build_golden) reads
+    these through here. The defaults used to be copy-pasted at 8+ call
+    sites — one copy drifting was the main way the eval could silently
+    index a different corpus than the live one.
+    """
+    ch = cfg.get("chunking", {}) or {}
+    ing = cfg.get("ingest", {}) or {}
+    return {
+        "target_tokens": ch.get("target_tokens", 768),
+        "overlap_pct": ch.get("overlap_pct", 12),
+        "min_chunk_tokens": ch.get("min_chunk_tokens", 32),
+        "default_topic": ing.get("default_topic", "default"),
+        "max_chunks_per_doc": ch.get("max_chunks_per_doc", 2000),
+    }
 
 
 def _import_class(dotted: str):
@@ -96,7 +114,7 @@ def make_generator(cfg: dict[str, Any]) -> Generator:
     return cls(**kwargs)
 
 
-def make_store(cfg: dict[str, Any]) -> QdrantStore:
+def make_store(cfg: dict[str, Any]) -> VectorStore:
     """P0 only has one store impl, so this is direct — but the factory keeps
     the same shape as the others so a new store only needs to be added to
     store/ and pointed at via config."""
@@ -142,7 +160,7 @@ class PassthroughReranker(Reranker):
 def ingest(
     ingester: Ingester,
     embedder: Embedder,
-    store: QdrantStore,
+    store: VectorStore,
     *,
     recreate: bool = False,
     batch_size: int | None = None,
@@ -301,7 +319,7 @@ def invalidate_hybrid_cache() -> None:
 def _retrieve_hybrid(
     query: str,
     qvec: list[float],
-    store: QdrantStore,
+    store: VectorStore,
     top_k: int,
     topic: str | None,
 ) -> list[tuple]:
@@ -329,20 +347,7 @@ def _retrieve_hybrid(
             def tokenize(t: str) -> list[str]:
                 return _TOKEN_RE.findall(t.lower())
 
-            all_texts: list[tuple[str, str]] = []
-            offset = None
-            while True:
-                pts, offset = store.client.scroll(
-                    collection_name=store.collection,
-                    limit=256, offset=offset,
-                    with_payload=True, with_vectors=False,
-                )
-                for p in pts:
-                    text = (p.payload or {}).get("text", "")
-                    if text:
-                        all_texts.append((p.id, text))
-                if offset is None:
-                    break
+            all_texts: list[tuple[str, str]] = list(store.iter_texts())
 
             N = len(all_texts)
             doc_freq: Counter = Counter()
@@ -405,7 +410,7 @@ class AskResult:
 def ask(
     query: str,
     embedder: Embedder,
-    store: QdrantStore,
+    store: VectorStore,
     reranker: Reranker,
     generator: Generator,
     *,

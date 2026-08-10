@@ -31,13 +31,13 @@ from qdrant_client.http.models import (
     SparseVector,
 )
 
-from core.interfaces import Chunk
+from core.interfaces import Chunk, VectorStore
 
 
 log = logging.getLogger(__name__)
 
 
-class QdrantStore:
+class QdrantStore(VectorStore):
     """Thin adapter over the Qdrant HTTP/gRPC client.
 
     The class is intentionally simple — collection management, upsert, and
@@ -118,6 +118,22 @@ class QdrantStore:
         info = self.client.get_collection(self.collection)
         # `points_count` lives on the info in 1.10+
         return int(getattr(info, "points_count", 0) or 0)
+
+    def iter_payloads(self):
+        """Yield (point_id, payload) for every point, scrolling in batches."""
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.collection,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for p in points:
+                yield p.id, (p.payload or {})
+            if offset is None:
+                break
 
     # -- writes ---------------------------------------------------------------
 
@@ -210,23 +226,7 @@ class QdrantStore:
         """
         log.info("enable_hybrid: scrolling all points to build corpus vocabulary...")
         # Step 1: collect all chunk texts.
-        chunk_texts: list[tuple[str, str]] = []  # (chunk_id, text)
-        offset = None
-        while True:
-            points, offset = self.client.scroll(
-                collection_name=self.collection,
-                limit=256,
-                offset=offset,
-                with_payload=True,
-                with_vectors=False,
-            )
-            for p in points:
-                payload = p.payload or {}
-                text = payload.get("text", "")
-                if text:
-                    chunk_texts.append((p.id, text))
-            if offset is None:
-                break
+        chunk_texts: list[tuple[str, str]] = list(self.iter_texts())
 
         if not chunk_texts:
             log.warning("enable_hybrid: no chunks found in collection")
@@ -272,13 +272,13 @@ class QdrantStore:
             # Build sparse vector: indices + BM25-like TF-IDF values.
             # Use TF * IDF with k1=0 (binary-like, just IDF weighting).
             # This gives a pure IDF-weighted term vector.
+            # max_tf is loop-invariant per chunk — normalising by it gives
+            # BM25-like behaviour without a k1 param.
+            max_tf = max(tf.values()) if tf else 1
             indices: list[int] = []
             values: list[float] = []
             for term, count in tf.items():
                 if term in term_to_idx:
-                    # Simple TF-IDF: tf=count, idf from above.
-                    # Normalise by max_tf for BM25-like behaviour without k1 param.
-                    max_tf = max(tf.values()) or 1
                     score = (count / max_tf) * idf.get(term, 0.0)
                     if score > 0:
                         indices.append(term_to_idx[term])

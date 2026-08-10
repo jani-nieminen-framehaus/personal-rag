@@ -20,7 +20,9 @@
 
 $ErrorActionPreference = 'Stop'
 
-$TaskName    = 'rag-gui'
+# Shared constants ($TaskName etc.). Python mirror: service_state.py.
+. (Join-Path $PSScriptRoot '_config.ps1')
+
 $Description = 'rag personal RAG stack (Ollama + Qdrant + GUI on 127.0.0.1:8420)'
 $RepoRoot    = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $PythonExe   = Join-Path $RepoRoot '.venv\Scripts\python.exe'

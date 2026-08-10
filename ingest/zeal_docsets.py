@@ -112,23 +112,30 @@ class ZealIngester(Ingester):
                 except OSError as e:
                     log.debug("read failed: %s — %s", page_path, e)
                     continue
-                text = _html_to_text(html)
-                if not text.strip():
+                # One broken page (of ~50k in a big docset) must not kill
+                # the whole ingest — isolate parse + chunk per page.
+                try:
+                    text = _html_to_text(html)
+                    if not text.strip():
+                        continue
+                    # Synthetic "path" so Chunk.source_path is meaningful.
+                    # Bug #8 fix: use the FULL relative path (with subdirs),
+                    # not just page_path.name — two pages named index.html in
+                    # different subdirs used to collide on chunk_id.
+                    synth_path = self.docset_root / rel
+                    page_chunks = list(chunk_whole_file(
+                        path=synth_path,
+                        text=text,
+                        target=self.target_tokens,
+                        overlap_pct=self.overlap_pct,
+                        min_size=self.min_chunk_tokens,
+                        topic_resolver=lambda *_: topic,
+                        doc_type="zeal",
+                    ))
+                except Exception as e:
+                    log.warning("zeal: skipping page %s: %s", rel, e)
                     continue
-                # Synthetic "path" so Chunk.source_path is meaningful.
-                # Bug #8 fix: use the FULL relative path (with subdirs),
-                # not just page_path.name — two pages named index.html in
-                # different subdirs used to collide on chunk_id.
-                synth_path = self.docset_root / rel
-                for c in chunk_whole_file(
-                    path=synth_path,
-                    text=text,
-                    target=self.target_tokens,
-                    overlap_pct=self.overlap_pct,
-                    min_size=self.min_chunk_tokens,
-                    topic_resolver=lambda *_: topic,
-                    doc_type="zeal",
-                ):
+                for c in page_chunks:
                     c.section = str(section)
                     yield c
 

@@ -279,11 +279,12 @@ def test_pipeline_ask_accepts_hybrid_flag():
     """pipeline.ask() should accept hybrid=True and route to _retrieve_hybrid."""
     from core import pipeline
 
-    # Patch the store.
+    # Patch the store. The pipeline reaches the corpus only through the
+    # VectorStore surface (iter_texts), never through a raw client.
     mock_store = MagicMock()
     mock_store.search_dense.return_value = []
     mock_store.search_hybrid.return_value = []
-    mock_store.client.scroll.return_value = ([], None)
+    mock_store.iter_texts.return_value = []
     mock_store.collection = "kb"
 
     mock_embedder = MagicMock()

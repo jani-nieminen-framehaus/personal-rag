@@ -4,21 +4,16 @@
 # =============================================================================
 
 $ErrorActionPreference = 'Stop'
-$TaskName = 'rag-gui'
-$stateFile = Join-Path $env:USERPROFILE '.rag\state.json'
+
+# Shared constants + helpers ($TaskName, $StateFile, Read-StateJson).
+# Python mirror: service_state.py at the repo root.
+. (Join-Path $PSScriptRoot '_config.ps1')
 
 # Stop the service if it's running. The PID from the state file is
 # authoritative and works on every PowerShell version; the command-line
 # match is a fallback that needs PS 7+ ($_.CommandLine is $null on 5.1).
 $stopped = $false
-$statePid = $null
-if (Test-Path $stateFile) {
-    try {
-        $statePid = (Get-Content $stateFile -Raw | ConvertFrom-Json).pid
-    } catch {
-        # Truncated/invalid state file — fall through to the heuristic.
-    }
-}
+$statePid = (Read-StateJson).pid
 if ($statePid) {
     $proc = Get-Process -Id $statePid -ErrorAction SilentlyContinue
     if ($proc -and $proc.ProcessName -match 'python') {

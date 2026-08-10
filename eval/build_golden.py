@@ -61,21 +61,14 @@ log = logging.getLogger("build_golden")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
-def _load_chunking_config() -> tuple[int, int, int, str]:
-    """Read the relevant chunking config from config.yaml directly.
-
-    Returns (target_tokens, overlap_pct, min_chunk_tokens, default_topic).
-    """
+def _load_chunking_config() -> dict:
+    """Chunking params from config.yaml via the SAME resolver the live
+    ingest paths use (core.pipeline.chunking_params) — the golden set must
+    chunk exactly like the live corpus or recall silently drifts."""
+    from core.pipeline import chunking_params
     with CONFIG.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    ch = cfg.get("chunking", {})
-    ing = cfg.get("ingest", {})
-    return (
-        ch.get("target_tokens", 768),
-        ch.get("overlap_pct", 12),
-        ch.get("min_chunk_tokens", 32),
-        ing.get("default_topic", "default"),
-    )
+    return chunking_params(cfg)
 
 
 def build_index():
@@ -86,14 +79,14 @@ def build_index():
     the caller can pick the first chunk_id, or all of them for a more
     thorough eval.
     """
-    target, overlap, min_size, default_topic = _load_chunking_config()
+    cp = _load_chunking_config()
 
     mi = MarkdownDirIngester(
         root=SAMPLES,
-        target_tokens=target,
-        overlap_pct=overlap,
-        min_chunk_tokens=min_size,
-        default_topic=default_topic,
+        target_tokens=cp["target_tokens"],
+        overlap_pct=cp["overlap_pct"],
+        min_chunk_tokens=cp["min_chunk_tokens"],
+        default_topic=cp["default_topic"],
     )
 
     index: dict[tuple[str, str], list[str]] = {}

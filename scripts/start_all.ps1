@@ -33,13 +33,17 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Shared constants + helpers (TaskName, RagPort, StateFile, Read-StateJson,
+# Test-PidAlive). Python mirror: service_state.py at the repo root.
+. (Join-Path $PSScriptRoot '_config.ps1')
+
 # -- config -----------------------------------------------------------------
 
 $RepoRoot    = if ($env:RAG_REPO) { $env:RAG_REPO } else { (Resolve-Path (Join-Path $PSScriptRoot '..')).Path }
 $VenvDir     = if ($env:RAG_VENV) { $env:RAG_VENV } else { Join-Path $RepoRoot '.venv' }
 $PythonExe   = if ($env:RAG_PYTHON) { $env:RAG_PYTHON } else { Join-Path $VenvDir 'Scripts\python.exe' }
 $BindHost    = if ($env:RAG_HOST) { $env:RAG_HOST } else { '127.0.0.1' }
-$Port        = if ($env:RAG_PORT) { [int]$env:RAG_PORT } else { 8420 }
+$Port        = $RagPort
 $OllamaUrl   = if ($env:OLLAMA_URL) { $env:OLLAMA_URL } else { 'http://localhost:11434/api/tags' }
 $OllamaBin   = if ($env:OLLAMA_BIN) { $env:OLLAMA_BIN } else { 'ollama' }
 $QdrantUrl   = if ($env:QDRANT_URL) { $env:QDRANT_URL } else { 'http://localhost:7333/' }
@@ -47,8 +51,7 @@ $QdrantBin   = if ($env:QDRANT_BIN) { $env:QDRANT_BIN } else { 'C:\Tools\qdrant\
 $QdrantArgs  = if ($env:QDRANT_ARGS) { $env:QDRANT_ARGS } else { '--storage-snapshots-dir C:\qdrant\storage' }
 $WaitTimeout = if ($env:WAIT_TIMEOUT_S) { [int]$env:WAIT_TIMEOUT_S } else { 120 }
 
-$StateFile = Join-Path $env:USERPROFILE '.rag\state.json'
-$GuiUrl    = "http://localhost:$Port"
+$GuiUrl = "http://localhost:$Port"
 
 # -- helpers ----------------------------------------------------------------
 
@@ -77,46 +80,12 @@ function Wait-Healthy {
     return $false
 }
 
-function Read-State-Json {
-    if (-not (Test-Path $StateFile)) { return $null }
-    try {
-        return Get-Content $StateFile -Raw | ConvertFrom-Json
-    } catch { return $null }
-}
-
-function Test-Pid-Alive {
-    param([int]$ProcessId)
-    if ($ProcessId -le 0) { return $false }
-    $sig = @'
-using System;
-using System.Runtime.InteropServices;
-public class Win32 {
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern bool GetExitCodeProcess(IntPtr h, out uint code);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern bool CloseHandle(IntPtr h);
-}
-'@
-    if (-not ('Win32' -as [type])) {
-        Add-Type -TypeDefinition $sig
-    }
-    $h = [Win32]::OpenProcess(0x1000, $false, [uint32]$ProcessId)
-    if ($h -eq [IntPtr]::Zero) { return $false }
-    try {
-        $code = 0
-        [void][Win32]::GetExitCodeProcess($h, [ref]$code)
-        return $code -eq 259   # STILL_ACTIVE
-    } finally {
-        [void][Win32]::CloseHandle($h)
-    }
-}
+# Read-StateJson / Test-PidAlive come from _config.ps1.
 
 function Is-RagServer-Running {
-    $state = Read-State-Json
+    $state = Read-StateJson
     if ($state -and $state.pid) {
-        if (Test-Pid-Alive -ProcessId ([int]$state.pid)) { return $true }
+        if (Test-PidAlive -ProcessId ([int]$state.pid)) { return $true }
     }
     return $false
 }
@@ -133,7 +102,7 @@ if (-not (Test-Path $PythonExe)) {
 
 Write-Stage 1 "rag server"
 if (Is-RagServer-Running) {
-    Write-Host "    already running (pid=$((Read-State-Json).pid)) -> $GuiUrl" -ForegroundColor Green
+    Write-Host "    already running (pid=$((Read-StateJson).pid)) -> $GuiUrl" -ForegroundColor Green
 } else {
     Write-Host "    not running, starting..."
 
@@ -141,12 +110,11 @@ if (Is-RagServer-Running) {
     # task runs in its own session, fully detached, so closing the
     # orchestrator (or its parent terminal) won't kill the server.
     $taskTriggered = $false
-    $taskName = 'rag-gui'
     try {
-        $null = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
-        Start-ScheduledTask -TaskName $taskName
+        $null = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        Start-ScheduledTask -TaskName $TaskName
         $taskTriggered = $true
-        Write-Host "    triggered scheduled task '$taskName'" -ForegroundColor Gray
+        Write-Host "    triggered scheduled task '$TaskName'" -ForegroundColor Gray
     } catch {
         # No scheduled task installed - fall back to a manual spawn.
     }
