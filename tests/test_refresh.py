@@ -217,6 +217,9 @@ class _MemStore:
             self.points[c.chunk_id] = c
         return len(chunks)
 
+    def count(self) -> int:
+        return len(self.points)
+
     def delete_by_source(self, source_path: str) -> int:
         self.deleted.append(source_path)
         gone = [k for k, c in self.points.items() if c.source_path == source_path]

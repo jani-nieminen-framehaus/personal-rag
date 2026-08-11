@@ -358,6 +358,24 @@ class MetadataStore:
         cur = self._conn.execute("SELECT source_path, file_hash FROM sources")
         return {row[0]: row[1] for row in cur.fetchall()}
 
+    def delete_all_sources(self) -> int:
+        """Empty the `sources` table. Returns the number of rows removed.
+
+        Exists for exactly one caller: an ingest that DROPPED the collection.
+        Every row is a claim that a file's chunks are in the index, so once the
+        collection is gone every row is false — and the falsehood is not inert.
+        `rag refresh` compares a file against its recorded hash, matches, and
+        reports the index up to date, which makes the one command that could
+        restore the corpus the one command that refuses to.
+
+        Deleting rather than clearing the hashes: the chunks are gone, not
+        stale, and a row that survives would also keep the file listed by
+        `rag sources` as indexed when it is not.
+        """
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM sources")
+            return int(cur.rowcount or 0)
+
     def delete_source(self, source_path: str) -> bool:
         """Remove one source row. Returns True if a row was deleted."""
         with self._lock:

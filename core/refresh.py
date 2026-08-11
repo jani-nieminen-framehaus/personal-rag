@@ -397,8 +397,48 @@ def _plan_one(
     return plan
 
 
-def plan_refresh(cfg: dict[str, Any], metadata: MetadataStore) -> RefreshPlan:
-    """Decide what a refresh would do. Filesystem and database reads only."""
+def _index_is_deserted(store: Any, recorded_rows: int) -> bool:
+    """True when the vector index holds nothing while the catalog holds rows.
+
+    The index-side counterpart of `_plan_one`'s disk-side guard: a root that
+    enumerates zero files while the DB holds rows is unknown, not empty. Point
+    the same reasoning at the other side of the comparison and an index holding
+    zero points while the DB holds rows is unknown, not up to date.
+
+    Reached by `rag ingest --recreate` (which drops the whole collection), by a
+    wiped Qdrant volume, or by a recreate that died before it wrote anything
+    back. In every case the recorded hashes describe chunks that are not there,
+    and believing them means refusing to rebuild.
+
+    Fails OPEN. A store that cannot answer returns False, because the cost of
+    guessing wrong here is a full re-embed of the entire corpus on a run that
+    should have cost a directory walk.
+    """
+    if store is None or not recorded_rows:
+        return False
+    count = getattr(store, "count", None)
+    if not callable(count):
+        return False
+    try:
+        n = count()
+        return n is not None and int(n) == 0
+    except Exception as e:
+        log.warning(
+            "refresh: could not read the index size (%s) — assuming it is "
+            "populated", e,
+        )
+        return False
+
+
+def plan_refresh(
+    cfg: dict[str, Any], metadata: MetadataStore, store: Any = None
+) -> RefreshPlan:
+    """Decide what a refresh would do. Filesystem and database reads only.
+
+    `store` is optional and read-only here: it is asked for a point count so an
+    emptied index cannot be mistaken for an up-to-date one. Omitting it just
+    skips that check.
+    """
     if metadata is None:
         raise ValueError(
             "refresh needs a metadata store — it is the only record of what "
@@ -406,6 +446,14 @@ def plan_refresh(cfg: dict[str, Any], metadata: MetadataStore) -> RefreshPlan:
         )
     entries = configured_sources(cfg)
     indexed = _index_recorded(metadata.source_hashes())
+    if _index_is_deserted(store, len(indexed)):
+        log.warning(
+            "refresh: the index holds 0 points while the catalog holds %d "
+            "row(s) — treating every recorded hash as unknown and re-ingesting. "
+            "This is what `rag ingest --recreate` over part of the corpus, or a "
+            "wiped Qdrant volume, looks like from here.", len(indexed),
+        )
+        indexed = {norm: (stored, None) for norm, (stored, _h) in indexed.items()}
     owned = _assign_owners([_norm(e["path"]) for e in entries], indexed)
     index_name = zeal_index_name(cfg)
     return RefreshPlan(
@@ -577,7 +625,7 @@ def run_refresh(
     the prune never ran, and the hybrid cache was left stale over chunks that
     had already been written.
     """
-    plan = plan_refresh(cfg, metadata)
+    plan = plan_refresh(cfg, metadata, store)
 
     if dry_run:
         log.info(

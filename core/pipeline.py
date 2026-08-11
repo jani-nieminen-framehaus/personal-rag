@@ -221,6 +221,40 @@ def ingest(
     # the embedder's actual dim was never checked.
     store.ensure_collection(recreate=recreate, expected_dense_dim=embedder.dim())
 
+    # The drop and the catalog move together, or they diverge.
+    #
+    # `recreate` drops the WHOLE collection and then re-ingests only what this
+    # invocation was pointed at. Every OTHER recorded source keeps a row
+    # claiming a valid file_hash for chunks that no longer exist — and `rag
+    # refresh` reads exactly that column, matches file to hash, and reports
+    # "index is up to date". The one mechanism that could rebuild the corpus is
+    # the one that refuses to, silently and forever.
+    #
+    # Not theoretical: `QdrantStore.ensure_collection` tells the user to run
+    # `rag ingest --recreate` when the embedder's dim stops matching the
+    # collection. Following that advice used to lose every source not named on
+    # that command line.
+    #
+    # After ensure_collection, not before: if the drop itself fails there is
+    # nothing to reconcile and the catalog is still true.
+    if recreate and metadata is not None:
+        try:
+            dropped = metadata.delete_all_sources()
+        except Exception as e:  # pragma: no cover — defensive
+            log.error(
+                "ingest: collection %s was dropped but the source catalog could "
+                "not be cleared (%s) — run `rag refresh` and expect it to under-"
+                "report; the stale rows claim chunks that no longer exist",
+                store.collection, e,
+            )
+        else:
+            if dropped:
+                log.warning(
+                    "ingest: recreate dropped %s, so %d catalog row(s) went with "
+                    "it — sources not re-ingested now will be picked up by the "
+                    "next `rag refresh`", store.collection, dropped,
+                )
+
     # Buffer chunks for batched embedding. We pick the embedder's batch size
     # unless the caller overrides.
     bs = batch_size or getattr(embedder, "batch_size", 32) or 32
