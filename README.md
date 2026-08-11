@@ -356,9 +356,13 @@ So **a source root that isn't there is treated as "unknown", never as
 "empty"** — planned, reported, and skipped, with nothing under it
 ingested or pruned. Same for a root that's present but enumerates zero
 files while the index holds rows for it, and same for an unreachable
-subtree below a healthy root. `rag refresh` exits non-zero when this
-happens so you find out. If you emptied a folder *on purpose*, that's
-what `rag forget` is for — refusing to guess is the point.
+subtree below a healthy root.
+
+A **missing root** also makes `rag refresh` exit non-zero, so a scheduled
+run flags it rather than passing silently. A **refusal to prune** is the
+safety property working as designed, not a failure: it exits 0 and prints
+the reason it wouldn't. If you emptied a folder *on purpose*, that's what
+`rag forget` is for — refusing to guess is the point.
 
 ### Doing it on a schedule
 
