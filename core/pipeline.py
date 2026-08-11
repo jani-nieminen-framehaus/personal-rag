@@ -474,7 +474,7 @@ def _read_corpus_stamp() -> str | None:
         return None
     try:
         return path.read_text(encoding="utf-8").strip() or None
-    except OSError:
+    except Exception:
         return None
 
 

@@ -439,6 +439,18 @@ def test_a_stamp_that_cannot_be_read_never_blocks_a_query(stamped, monkeypatch):
     assert store.scrolls == 1
 
 
+def test_a_stamp_with_invalid_utf8_never_blocks_a_query(stamped):
+    """A torn write after an unclean shutdown can leave the stamp holding
+    bytes that are not valid UTF-8. That has to fail open exactly like a
+    missing stamp — not raise UnicodeDecodeError into the query."""
+    store = _TextStore(["alpha beta"])
+    _query(store)
+
+    stamped.write_bytes(b"\xff\xfe\x00corrupt")
+    _query(store)
+    assert store.scrolls == 1
+
+
 def test_the_stamp_sits_next_to_the_metadata_database(tmp_path, monkeypatch):
     """It has to be somewhere every process agrees on and can write to. The
     metadata DB is exactly that, and is already gitignored alongside it."""
