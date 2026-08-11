@@ -316,6 +316,10 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
 # of the topic indexed.
 FORGET_SOURCE_LIMIT = 1_000_000
 
+# How many vanished paths a refresh summary spells out per source before it
+# says "… and N more". Matches the preview `forget` prints before its prompt.
+VANISHED_PREVIEW = 10
+
 
 def _print_refresh_summary(plan, *, prune: bool, dry_run: bool) -> None:
     """One block per source: what moved, and anything that needs a human.
@@ -336,6 +340,17 @@ def _print_refresh_summary(plan, *, prune: bool, dry_run: bool) -> None:
             f"unchanged {s.unchanged}  "
             f"{'pruned' if pruned else 'vanished'} {len(s.vanished)}"
         )
+        if s.vanished:
+            # The count alone is not enough to consent to a delete: `vanished
+            # 40` from a renamed folder and `vanished 40` from forty files you
+            # meant to delete read identically, and --prune's own prompt tells
+            # the operator to come here and look. Capped so a corpus-wide prune
+            # cannot bury the summary under thousands of lines.
+            click.echo(f"      {'removed' if pruned else 'gone from disk, still indexed'}:")
+            for path in s.vanished[:VANISHED_PREVIEW]:
+                click.echo(f"        {path}")
+            if len(s.vanished) > VANISHED_PREVIEW:
+                click.echo(f"        … and {len(s.vanished) - VANISHED_PREVIEW} more")
         if s.unreadable:
             click.echo(
                 f"      unreadable {len(s.unreadable)} — left exactly as they "
@@ -412,7 +427,7 @@ def refresh_cmd(ctx, prune, dry_run, yes):
         click.confirm(
             "--prune will permanently DELETE the indexed chunks and catalog "
             "rows of every recorded file that is no longer on disk. "
-            "Run with --dry-run to see the exact list first. Continue?",
+            "Run with --dry-run to see what it would remove first. Continue?",
             abort=True,
         )
 

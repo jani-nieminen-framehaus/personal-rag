@@ -337,7 +337,7 @@ overwrites. Both ask for confirmation first (`-y` skips it, for
 scripts).
 
 ```powershell
-rag refresh --dry-run --prune   # the exact list, before you agree to it
+rag refresh --dry-run --prune   # the paths it would remove, before you agree
 rag forget --source D:\notes\old.md    # one file, by the path `rag sources` shows
 rag forget --topic photography         # everything filed under a topic
 ```

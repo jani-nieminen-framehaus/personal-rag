@@ -223,6 +223,29 @@ def test_refresh_says_pruned_once_the_rows_are_actually_gone(monkeypatch):
     assert "--prune" in plain.output          # the hint, not a claim of removal
 
 
+def test_refresh_lists_the_paths_behind_the_vanished_count(monkeypatch):
+    """The --prune confirmation prompt sends the operator to --dry-run to see
+    what would be deleted, and the README says the same. A count is not a list:
+    `vanished 40` from a renamed folder and `vanished 40` from a genuinely
+    deleted one are the same two words, and only one of them is fine to
+    confirm. Capped, so a corpus-wide prune cannot bury the summary."""
+    cli_mod = _patch(monkeypatch)
+    s = _source(vanished=[f"gone{i}.md" for i in range(12)])
+    plan = MagicMock(has_work=False, has_missing_roots=False,
+                     has_errors=False, has_blocked_prunes=False, sources=[s])
+    monkeypatch.setattr("core.refresh.run_refresh", lambda *a, **k: plan)
+
+    res = CliRunner().invoke(cli_mod.cli, ["refresh", "--prune", "--dry-run"])
+    assert res.exit_code == 0
+    assert "gone0.md" in res.output
+    assert "gone9.md" in res.output
+    assert "gone11.md" not in res.output
+    assert "2 more" in res.output
+    # Nothing was written, so they are still indexed — the heading must not
+    # imply otherwise.
+    assert "still indexed" in res.output
+
+
 def test_refresh_does_not_claim_to_have_pruned_a_blocked_source(monkeypatch):
     """A blocked source is skipped by the prune loop, so its rows are still
     there — the planning word is the honest one."""
