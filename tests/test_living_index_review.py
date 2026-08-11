@@ -347,3 +347,105 @@ def test_the_catalog_commands_resolve_the_same_path(tmp_path, monkeypatch):
         assert md.path == repo / "meta.sqlite3"
     finally:
         md.close()
+
+
+# -----------------------------------------------------------------------------
+# IMPORTANT — a running server never learns the corpus changed
+#
+# `invalidate_hybrid_cache()` only drops the module global in the CALLING
+# process. The `rag-gui` scheduled task keeps `rag serve` alive with its own
+# copy, so after a nightly refresh the server's `vocab` lacks every term the
+# new documents introduced — and `_build_query_sparse_vector` DROPS unknown
+# terms rather than down-weighting them. Silent hybrid-quality decay in the
+# GUI, for as long as the server stays up.
+# -----------------------------------------------------------------------------
+
+class _TextStore:
+    """Just enough store surface for `_retrieve_hybrid`, counting scrolls."""
+
+    def __init__(self, texts):
+        self.texts = list(texts)
+        self.scrolls = 0
+
+    def iter_texts(self):
+        self.scrolls += 1
+        return [(str(i), t) for i, t in enumerate(self.texts)]
+
+    def search_hybrid(self, query_vector, query_sparse, top_k, dense_weight):
+        return []
+
+    def search_dense(self, qvec, top_k):
+        return []
+
+
+@pytest.fixture
+def stamped(tmp_path, monkeypatch):
+    """A private corpus stamp + a clean hybrid cache, restored afterwards."""
+    saved = dict(pipeline._hybrid_cache)
+    monkeypatch.setattr(pipeline, "_corpus_stamp_path", tmp_path / "meta.sqlite3.corpus-stamp")
+    pipeline.invalidate_hybrid_cache()
+    yield tmp_path / "meta.sqlite3.corpus-stamp"
+    pipeline._hybrid_cache.clear()
+    pipeline._hybrid_cache.update(saved)
+
+
+def _query(store):
+    return pipeline._retrieve_hybrid("alpha", [0.1, 0.2, 0.3], store, top_k=3, topic=None)
+
+
+def test_an_unchanged_corpus_is_scrolled_exactly_once(stamped):
+    """The cache still has to be a cache."""
+    store = _TextStore(["alpha beta", "gamma delta"])
+    _query(store)
+    _query(store)
+    assert store.scrolls == 1
+
+
+def test_a_refresh_in_another_process_makes_this_one_rebuild(stamped):
+    """The nightly `rag refresh` runs as its own process. All the server can
+    see of it is the stamp it left behind."""
+    store = _TextStore(["alpha beta"])
+    _query(store)
+    assert store.scrolls == 1
+
+    # What the refresh process does, from over there.
+    stamped.write_text("999999999999999999", encoding="utf-8")
+    store.texts.append("newterm arrived tonight")
+
+    _query(store)
+    assert store.scrolls == 2, "the server kept serving a vocabulary from before the refresh"
+    assert "newterm" in pipeline._hybrid_cache["vocab"], \
+        "and queries for it would have had the term silently dropped"
+
+
+def test_invalidating_the_cache_leaves_the_signal_for_other_processes(stamped):
+    """Every corpus-moving path already funnels through invalidate_hybrid_cache
+    — ingest, refresh, forget — so that is where the cross-process signal
+    belongs, rather than in each of them separately."""
+    assert stamped.exists(), "nothing left a signal for the other process"
+    before = stamped.read_text(encoding="utf-8")
+    pipeline.invalidate_hybrid_cache()
+    assert stamped.read_text(encoding="utf-8") != before, "the signal never moved"
+
+
+def test_a_stamp_that_cannot_be_read_never_blocks_a_query(stamped, monkeypatch):
+    """Fail open. A missing or unreadable stamp means "no news", not a rebuild
+    on every query and certainly not a crashed answer."""
+    store = _TextStore(["alpha beta"])
+    _query(store)
+
+    monkeypatch.setattr(pipeline, "_corpus_stamp_path", Path("//nonexistent-host/nope/x"))
+    _query(store)
+    assert store.scrolls == 1
+
+
+def test_the_stamp_sits_next_to_the_metadata_database(tmp_path, monkeypatch):
+    """It has to be somewhere every process agrees on and can write to. The
+    metadata DB is exactly that, and is already gitignored alongside it."""
+    monkeypatch.setattr(pipeline, "_corpus_stamp_path", None)
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("metadata:\n  path: ./meta.sqlite3\n", encoding="utf-8")
+    md = pipeline.make_metadata(pipeline.load_config(cfg_file))
+    md.close()
+    assert pipeline._corpus_stamp_path.parent == tmp_path
+    assert pipeline._corpus_stamp_path.name.startswith("meta.sqlite3")

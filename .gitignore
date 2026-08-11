@@ -25,6 +25,8 @@ eval/runs/
 
 # Metadata store (runtime artifact; recreate via `rag ingest` / `rag ask`)
 metadata.sqlite3*
+# ...and the corpus stamp beside it, wherever metadata.path points
+*.corpus-stamp
 
 # Smoke / debug artifacts
 test_out.pdf

@@ -15,6 +15,7 @@ import importlib
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -208,7 +209,12 @@ def make_metadata(cfg: dict[str, Any]) -> MetadataStore | None:
     section = cfg.get("metadata", {}) or {}
     if not section.get("enabled", True):
         return None
-    return MetadataStore(resolve_metadata_path(cfg))
+    path = resolve_metadata_path(cfg)
+    # Every process that opens the catalog registers the same corpus stamp
+    # location, which is how a long-lived `rag serve` learns that a refresh in
+    # another process moved the corpus under it.
+    set_corpus_stamp_path(path)
+    return MetadataStore(path)
 
 
 # -----------------------------------------------------------------------------
@@ -412,8 +418,75 @@ def _build_query_sparse_vector(query: str, vocab: dict[str, int] | None, idf: di
 # Cached corpus stats for hybrid search — built lazily on first hybrid query,
 # guarded by _hybrid_lock so two FastAPI threadpool workers can't both scroll
 # the corpus on a cold start. Invalidated after every ingest.
-_hybrid_cache: dict = {"vocab": None, "idf": None, "built": False}
+#
+# `stamp` is what the cache was built against, for the cross-process case
+# below: the in-process flags say nothing to a `rag serve` running in another
+# process.
+_hybrid_cache: dict = {"vocab": None, "idf": None, "built": False, "stamp": None}
 _hybrid_lock = threading.Lock()
+
+
+# -----------------------------------------------------------------------------
+# The cross-process corpus signal
+#
+# `invalidate_hybrid_cache()` drops a module global, which reaches exactly one
+# process. But `rag serve` is kept alive by the `rag-gui` scheduled task with
+# its own copy, while `rag refresh` runs nightly as a SEPARATE process. So
+# after every refresh the server's vocabulary was missing every term the new
+# documents introduced — and `_build_query_sparse_vector` DROPS a term that is
+# not in the vocab rather than down-weighting it, so those documents were
+# simply unreachable via the sparse half of every hybrid query. Nothing failed;
+# retrieval quality just decayed in the GUI until someone restarted it.
+#
+# The signal is a small file beside the metadata DB, rewritten by whichever
+# process moved the corpus and compared before the cache is reused. Not the
+# DB's own mtime: the connection runs in WAL mode, so a write lands in the -wal
+# file and the main file's mtime need not move at all.
+#
+# Everything here fails OPEN. An unreadable stamp means "no news" — reusing a
+# possibly-stale IDF map degrades a ranking, while raising here would fail a
+# query the user asked.
+# -----------------------------------------------------------------------------
+
+CORPUS_STAMP_SUFFIX = ".corpus-stamp"
+
+_corpus_stamp_path: Path | None = None
+
+
+def set_corpus_stamp_path(metadata_path: str | Path | None) -> None:
+    """Point the cross-process corpus signal beside the metadata database.
+
+    Called from `make_metadata`, so every process that opens the catalog — the
+    CLI running a refresh, the long-lived server answering queries — agrees on
+    the same file without anyone passing it around.
+    """
+    global _corpus_stamp_path
+    _corpus_stamp_path = (
+        None if metadata_path is None
+        else Path(f"{Path(metadata_path)}{CORPUS_STAMP_SUFFIX}")
+    )
+
+
+def _read_corpus_stamp() -> str | None:
+    """The corpus stamp, or None if there isn't one we can read."""
+    path = _corpus_stamp_path
+    if path is None:
+        return None
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _write_corpus_stamp() -> None:
+    """Mark the corpus as moved, for every other process."""
+    path = _corpus_stamp_path
+    if path is None:
+        return
+    try:
+        path.write_text(str(time.time_ns()), encoding="utf-8")
+    except OSError as e:
+        log.debug("hybrid: could not write the corpus stamp at %s (%s)", path, e)
 
 
 # How much wider than top_k the hybrid branch retrieves when a topic filter
@@ -441,11 +514,19 @@ def invalidate_hybrid_cache() -> None:
     """Drop the cached corpus IDF map so the next hybrid query rebuilds it.
 
     Must be called after anything that changes the corpus (ingest, delete):
-    a stale IDF map silently shifts hybrid scores against the new corpus."""
+    a stale IDF map silently shifts hybrid scores against the new corpus.
+
+    Also rewrites the corpus stamp, which is how a `rag serve` in ANOTHER
+    process finds out. Every corpus-moving path already funnels through here,
+    so this is the one place the signal belongs."""
     with _hybrid_lock:
         _hybrid_cache["vocab"] = None
         _hybrid_cache["idf"] = None
         _hybrid_cache["built"] = False
+        _hybrid_cache["stamp"] = None
+    # Outside the lock: a file write must not block a query that is only
+    # waiting to read a dict.
+    _write_corpus_stamp()
 
 
 def _retrieve_hybrid(
@@ -473,6 +554,19 @@ def _retrieve_hybrid(
     # worker arriving mid-build blocks here instead of scrolling the corpus
     # a second time.
     with _hybrid_lock:
+        # Read BEFORE the build, so a corpus that moves while we are scrolling
+        # leaves the cache marked against the older stamp and rebuilds next
+        # time, rather than claiming to be current.
+        stamp = _read_corpus_stamp()
+        if (
+            _hybrid_cache["built"]
+            and stamp is not None
+            and stamp != _hybrid_cache.get("stamp")
+        ):
+            # Another process moved the corpus — a nightly `rag refresh`, a
+            # `rag forget`, a manual ingest. This one's vocabulary predates it.
+            log.info("hybrid: the corpus moved elsewhere — rebuilding the IDF map")
+            _hybrid_cache["built"] = False
         if not _hybrid_cache["built"]:
             log.info("hybrid: building corpus IDF map...")
             _TOKEN_RE = re.compile(r"\w{2,}")
@@ -493,6 +587,7 @@ def _retrieve_hybrid(
                 for t, df in doc_freq.items()
             }
             _hybrid_cache["vocab"] = {t: i for i, t in enumerate(sorted(_hybrid_cache["idf"]))}
+            _hybrid_cache["stamp"] = stamp
             _hybrid_cache["built"] = True
             log.info("hybrid: IDF map ready — vocab=%d terms", len(_hybrid_cache["vocab"]))
 

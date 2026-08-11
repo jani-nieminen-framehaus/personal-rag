@@ -400,7 +400,17 @@ back.
 
 Since it never prunes, files you delete from disk stay in the index
 until you run `rag refresh --prune` by hand. Refresh tells you the count
-each time it notices. Check on the task with:
+each time it notices.
+
+A refresh that fires while the GUI server is up is picked up without a
+restart: the refresh leaves a stamp beside the metadata DB, and the
+server rebuilds its BM25 vocabulary on the next hybrid query rather than
+answering out of one that predates your new documents.
+
+Everything the run printed goes to `%USERPROFILE%\.rag\refresh.log`
+(appended). That is where to look when `LastTaskResult` isn't 0 — which
+source failed, and which files it left for the next run. Check on the
+task with:
 
 ```powershell
 Get-ScheduledTaskInfo -TaskName rag-refresh   # LastTaskResult 0 = clean run
