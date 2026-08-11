@@ -8,6 +8,10 @@
 #
 # What gets scheduled:
 #     <repo>\.venv\Scripts\python.exe -m cli refresh
+#         >> %USERPROFILE%\.rag\refresh.log 2>&1
+#
+# (via cmd.exe, which is only there to do the redirect: a task with nowhere to
+# write leaves you a bare LastTaskResult and no idea which source failed.)
 #
 # `refresh` re-ingests only the files whose CONTENT changed since the last
 # run, working from the `sources:` list in config.yaml. An unchanged corpus
@@ -97,11 +101,30 @@ try {
     $ErrorActionPreference = $PrevEap
 }
 
-# The action. Same shape as install-service.ps1: the venv interpreter, run
-# from the repo root so config.yaml and the metadata DB resolve.
-$ActionArgs = '-m cli refresh'
+# The action: the venv interpreter, run from the repo root so config.yaml and
+# the metadata DB resolve — via cmd.exe, purely so the output has somewhere to
+# go.
+#
+# Task Scheduler starts a process, not a shell, so an unredirected task writes
+# stdout and stderr into nothing. All that survived was LastTaskResult: a bare
+# 1, with no way to tell WHICH source failed or which files were left
+# half-indexed — while `rag refresh` builds that summary for, in its own
+# words, "an operator reading a scheduled task's log". cmd.exe is the smallest
+# thing that can redirect, and it exits with python's own code, so
+# LastTaskResult still means what it meant.
+#
+# Appended, not truncated: a nightly incremental run prints a handful of lines,
+# and losing last night's log to tonight's run is exactly the wrong trade when
+# the interesting case is "it has been failing for a while".
+$LogDir     = Split-Path -Parent $RefreshLogFile
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$CmdExe     = Join-Path $env:SystemRoot 'System32\cmd.exe'
+# cmd's own quoting rule: when the string after /c starts with a quote and
+# holds more than two, it strips the outer pair and runs the rest — which is
+# what lets both the interpreter path and the log path contain spaces.
+$ActionArgs = '/c ""{0}" -m cli refresh >> "{1}" 2>&1"' -f $PythonExe, $RefreshLogFile
 $Action     = New-ScheduledTaskAction `
-    -Execute $PythonExe `
+    -Execute $CmdExe `
     -Argument $ActionArgs `
     -WorkingDirectory $RepoRoot
 
@@ -165,6 +188,7 @@ Write-Host "  name        : $RefreshTaskName"
 Write-Host "  python      : $PythonExe"
 Write-Host "  args        : $ActionArgs"
 Write-Host "  working dir : $RepoRoot"
+Write-Host "  log         : $RefreshLogFile  (appended, every run)"
 Write-Host ("  trigger     : daily at {0}" -f $RunAt.ToString('HH:mm'))
 Write-Host "  run level   : Limited (not elevated — it does not need to be)"
 Write-Host ""
@@ -197,6 +221,8 @@ Write-Host "    2. Run it now instead of waiting for tonight:" -ForegroundColor 
 Write-Host "         Start-ScheduledTask -TaskName $RefreshTaskName" -ForegroundColor Gray
 Write-Host "    3. Check how the last run went (0 = clean):" -ForegroundColor Gray
 Write-Host "         Get-ScheduledTaskInfo -TaskName $RefreshTaskName" -ForegroundColor Gray
-Write-Host "    4. To remove the schedule later:" -ForegroundColor Gray
+Write-Host "    4. Read what it actually said — which source, which files:" -ForegroundColor Gray
+Write-Host "         Get-Content '$RefreshLogFile' -Tail 40" -ForegroundColor Gray
+Write-Host "    5. To remove the schedule later:" -ForegroundColor Gray
 Write-Host "         scripts\uninstall-refresh-task.ps1" -ForegroundColor Gray
 Write-Host ""

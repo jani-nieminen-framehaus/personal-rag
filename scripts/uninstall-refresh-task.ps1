@@ -32,6 +32,8 @@ if ($existing.State -eq 'Running') {
 Unregister-ScheduledTask -TaskName $RefreshTaskName -Confirm:$false
 Write-Host "  scheduled task '$RefreshTaskName' removed" -ForegroundColor Green
 Write-Host ""
+Write-Host "  its log is left where it is: $RefreshLogFile" -ForegroundColor Gray
+Write-Host ""
 Write-Host "  the index is untouched — it just stops updating itself. To bring it back:" -ForegroundColor Cyan
 Write-Host "       scripts\install-refresh-task.ps1" -ForegroundColor Gray
 Write-Host "  or refresh by hand whenever you like:" -ForegroundColor Cyan

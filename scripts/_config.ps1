@@ -15,6 +15,10 @@ $Script:TaskName        = 'rag-gui'
 $Script:RefreshTaskName = 'rag-refresh'
 $Script:RagPort         = if ($env:RAG_PORT) { [int]$env:RAG_PORT } else { 8420 }
 $Script:StateFile       = Join-Path $env:USERPROFILE '.rag\state.json'
+# Where the SCHEDULED refresh writes what it printed. No Python mirror: only
+# the scheduler redirects anywhere — `rag refresh` run by hand still prints to
+# your terminal like everything else.
+$Script:RefreshLogFile  = Join-Path $env:USERPROFILE '.rag\refresh.log'
 
 function Read-StateJson {
     if (-not (Test-Path $Script:StateFile)) { return $null }
