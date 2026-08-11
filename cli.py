@@ -466,6 +466,8 @@ def forget(ctx, source_path, topic, yes):
         )
         sys.exit(1)
 
+    removed = 0
+    deleted_any = False
     try:
         rows = metadata.get_sources(limit=FORGET_SOURCE_LIMIT)
         if topic:
@@ -504,7 +506,6 @@ def forget(ctx, source_path, topic, yes):
                 abort=True,
             )
 
-        removed = 0
         for path in targets:
             n = store.delete_by_source(path)
             # Guarded, not `+= n`: a store returning None would raise here,
@@ -512,13 +513,16 @@ def forget(ctx, source_path, topic, yes):
             # the cache invalidation over a cosmetic count.
             removed += n if isinstance(n, int) else 0
             metadata.delete_source(path)
+            deleted_any = True
     finally:
         metadata.close()
-
-    # The corpus shrank; a cached IDF map built over the old one silently skews
-    # the next hybrid query. Called through the module so the live function is
-    # the one that runs.
-    pipeline.invalidate_hybrid_cache()
+        if deleted_any:
+            # The corpus shrank; a cached IDF map built over the old one
+            # silently skews the next hybrid query. In a finally, like the
+            # engine's prune loop: a store that dies halfway through has still
+            # moved the corpus, and that is exactly when a stale map would go
+            # unnoticed. Called through the module so the live function runs.
+            pipeline.invalidate_hybrid_cache()
 
     click.echo(f"forgot {len(targets)} source(s); removed {removed} chunk(s).")
 

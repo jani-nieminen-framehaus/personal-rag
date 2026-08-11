@@ -236,6 +236,34 @@ def test_forget_invalidates_the_hybrid_cache(monkeypatch):
     assert calls == [1]
 
 
+def test_forget_invalidates_the_cache_even_if_a_delete_blows_up_halfway(monkeypatch):
+    """A store that dies mid-loop has still shrunk the corpus — that is exactly
+    when a stale IDF map would go unnoticed."""
+    store, meta = MagicMock(), MagicMock()
+    store.delete_by_source.side_effect = [2, RuntimeError("qdrant went away")]
+    meta.get_sources.return_value = [
+        {"source_path": "/a.md", "topic": "t"}, {"source_path": "/b.md", "topic": "t"},
+    ]
+    cli_mod = _patch(monkeypatch, store=store, metadata=meta)
+    calls = []
+    monkeypatch.setattr("core.pipeline.invalidate_hybrid_cache", lambda: calls.append(1))
+    res = CliRunner().invoke(cli_mod.cli, ["forget", "--topic", "t", "--yes"])
+    assert res.exit_code != 0
+    assert calls == [1]
+    meta.close.assert_called_once()
+
+
+def test_forget_does_not_invalidate_the_cache_when_it_deleted_nothing(monkeypatch):
+    store, meta = MagicMock(), MagicMock()
+    meta.get_sources.return_value = [{"source_path": "/a.md", "topic": "t"}]
+    cli_mod = _patch(monkeypatch, store=store, metadata=meta)
+    calls = []
+    monkeypatch.setattr("core.pipeline.invalidate_hybrid_cache", lambda: calls.append(1))
+    res = CliRunner().invoke(cli_mod.cli, ["forget", "--source", "/a.md"], input="n\n")
+    assert res.exit_code != 0
+    assert calls == []
+
+
 def test_forget_asks_for_every_source_not_just_the_first_fifty(monkeypatch):
     """get_sources() defaults to limit=50. Taking the default would delete a
     subset and report success."""
