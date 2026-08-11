@@ -214,7 +214,12 @@ class MetadataStore:
         file_hash: str | None = None,
     ) -> None:
         """Upsert a source row. Idempotent - re-ingesting the same file just
-        refreshes chunk_count, content_hash, file_hash, and ingested_at."""
+        refreshes chunk_count, content_hash, file_hash, and ingested_at.
+
+        `file_hash` is the exception: passing None leaves whatever is already
+        stored alone. It is the input `rag refresh` uses to decide whether a
+        file needs re-ingesting at all, so a caller that simply doesn't know
+        it must not be able to destroy it."""
         with self._lock:
             self._conn.execute(
                 """
@@ -226,7 +231,12 @@ class MetadataStore:
                     ingested_at  = excluded.ingested_at,
                     chunk_count  = excluded.chunk_count,
                     content_hash = excluded.content_hash,
-                    file_hash    = excluded.file_hash
+                    -- COALESCE, not `excluded.file_hash`: omitting the
+                    -- argument must PRESERVE a stored hash, not erase it.
+                    -- Otherwise any caller that doesn't hash (a plain
+                    -- `rag ingest`) nulls the hash `rag refresh` relies on,
+                    -- and the next refresh sees the file as changed again.
+                    file_hash    = COALESCE(excluded.file_hash, sources.file_hash)
                 """,
                 (source_path, doc_type, topic, _now_iso(), int(chunk_count), content_hash, file_hash),
             )

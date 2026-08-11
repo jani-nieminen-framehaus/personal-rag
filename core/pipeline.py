@@ -22,7 +22,7 @@ from typing import Any, Callable
 import yaml
 
 from core.interfaces import Chunk, Embedder, Reranker, Generator, Ingester, VectorStore
-from core.metadata import MetadataStore, hash_text
+from core.metadata import MetadataStore, hash_file, hash_text
 
 
 log = logging.getLogger(__name__)
@@ -252,6 +252,13 @@ def ingest(
         # P1 metadata: one row per unique source file. Cheap (one
         # row per file, not per chunk) and idempotent — re-ingest
         # just refreshes chunk_count + content_hash.
+        #
+        # file_hash is what makes `rag refresh` converge. Refresh re-ingests
+        # THROUGH this function, so if the hash were not written here the
+        # column would stay NULL, the next refresh would see the file as
+        # changed again, and the whole feature would degrade into a permanent
+        # full re-ingest. It is the raw-bytes hash, not hash_text of the
+        # chunks: refresh has to decide whether to parse a file at all.
         if metadata is None or not sources:
             return
         for source_path, (doc_type, topic, texts) in sources.items():
@@ -261,6 +268,7 @@ def ingest(
                 topic=topic,
                 chunk_count=len(texts),
                 content_hash=hash_text("\n\n".join(texts)),
+                file_hash=hash_file(source_path),
             )
         log.info("metadata: recorded %d source rows", len(sources))
 
