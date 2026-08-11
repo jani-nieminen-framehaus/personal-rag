@@ -34,6 +34,12 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
+# Where the loaded config came from, stashed in the config dict itself so any
+# factory can anchor a relative path to the config file's directory rather than
+# to whatever directory the process happens to be sitting in. Underscored: it
+# is not a user-facing key, and nothing writes the config back out.
+CONFIG_PATH_KEY = "_config_path"
+
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
     """Load the YAML config. Path is overridable via RAG_CONFIG env var."""
@@ -44,6 +50,7 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
         raise ValueError(f"config root must be a mapping; got {type(cfg).__name__}")
+    cfg[CONFIG_PATH_KEY] = str(p.resolve())
     return cfg
 
 
@@ -160,19 +167,48 @@ def make_store(cfg: dict[str, Any]) -> VectorStore:
     return cls(**kwargs)
 
 
+DEFAULT_METADATA_PATH = "./metadata.sqlite3"
+
+
+def resolve_metadata_path(cfg: dict[str, Any]) -> Path:
+    """Where the metadata DB lives. One resolution, for every caller.
+
+    A RELATIVE `metadata.path` is anchored to the config file's directory, not
+    to the process's current directory. `rag.ps1` tells the user to put `rag` on
+    PATH and run it from anywhere, and config resolution has always been
+    repo-anchored — so a cwd-relative DB path meant that running `rag refresh`
+    from any other directory opened, or silently CREATED, an empty database
+    there. Nothing errored: refresh read an empty catalog, called the entire
+    corpus new, and started a full re-embed, reporting success the whole way.
+    The one promise of this feature — that an unchanged corpus costs nothing —
+    inverted into hours of GPU time, quietly.
+
+    An absolute path is used exactly as written.
+    """
+    section = cfg.get("metadata", {}) or {}
+    raw = section.get("path") or DEFAULT_METADATA_PATH
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    # No config file behind this dict (a hand-built config, an embedded
+    # caller): fall back to the repo root, where config.yaml lives. Still not
+    # the cwd — the whole point is that the cwd is not where the data is.
+    anchor = Path(cfg.get(CONFIG_PATH_KEY) or DEFAULT_CONFIG_PATH)
+    return (anchor.resolve().parent / p).resolve()
+
+
 def make_metadata(cfg: dict[str, Any]) -> MetadataStore | None:
     """Build a MetadataStore from the `metadata:` config block, or None if disabled.
 
     Config shape:
         metadata:
           enabled: true            # default true
-          path: ./metadata.sqlite3 # default ./metadata.sqlite3
+          path: ./metadata.sqlite3 # relative -> next to config.yaml
     """
     section = cfg.get("metadata", {}) or {}
     if not section.get("enabled", True):
         return None
-    path = section.get("path", "./metadata.sqlite3")
-    return MetadataStore(path)
+    return MetadataStore(resolve_metadata_path(cfg))
 
 
 # -----------------------------------------------------------------------------

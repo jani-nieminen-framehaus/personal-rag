@@ -123,8 +123,14 @@ pipeline:
 
 # ---- Metadata ----------------------------------------------------------------
 # SQLite store for the side-channel: which files are indexed, what you've
-# cited recently, eval-run history. Defaults to ./metadata.sqlite3 (one file,
-# trivial to back up). Set enabled: false to disable.
+# cited recently, eval-run history. One file, trivial to back up. Set
+# enabled: false to disable.
+#
+# A RELATIVE path is resolved against THIS FILE's directory, not against
+# whatever directory you ran `rag` from. Otherwise running it from anywhere
+# else would open — or create — an empty database there, and `rag refresh`
+# would call the whole corpus new and re-embed it. Absolute paths are used
+# exactly as written.
 metadata:
   enabled: true
   path: ./metadata.sqlite3

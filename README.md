@@ -439,7 +439,11 @@ Mechanics (see `ingest/pdf_dir.py`):
 
 Every ingest and every `rag ask` writes a small side-channel to a
 SQLite file at `metadata.sqlite3` (override via `metadata.path` in
-`config.yaml`). Three tables:
+`config.yaml`). A relative path is resolved against `config.yaml`'s own
+directory, so `rag` finds the same database from whatever directory you
+run it in — a cwd-relative one would create an empty database next to
+you, and `rag refresh` would then call your whole corpus new. Three
+tables:
 
 ```sql
 CREATE TABLE sources (

@@ -280,3 +280,70 @@ def test_the_failure_is_still_reported_against_the_source(tmp_path, meta_store):
     assert "OOMs the embedder" in (plan.sources[0].error or "")
     assert str(bad) in (plan.sources[0].error or ""), \
         "and it names the file, which is the whole point of isolating them"
+
+
+# -----------------------------------------------------------------------------
+# IMPORTANT — `metadata.path` was cwd-relative while config resolution is
+# repo-anchored
+#
+# `rag.ps1` tells the user to put `rag` on PATH and run it from anywhere. Run
+# from any directory other than the repo, `make_metadata` opened — or CREATED —
+# an empty database there. Everything still "worked": refresh saw the whole
+# corpus as new and started a full re-embed, reporting success throughout. The
+# branch's headline promise inverted into hours of GPU time, silently.
+# -----------------------------------------------------------------------------
+
+def test_metadata_path_is_anchored_to_the_config_not_the_cwd(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg_file = repo / "config.yaml"
+    cfg_file.write_text(
+        "metadata:\n  enabled: true\n  path: ./metadata.sqlite3\n", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    cfg = pipeline.load_config(cfg_file)
+    md = pipeline.make_metadata(cfg)
+    try:
+        assert md.path == repo / "metadata.sqlite3"
+    finally:
+        md.close()
+    assert not (elsewhere / "metadata.sqlite3").exists(), \
+        "an empty database was created in the cwd; the corpus now reads as new"
+
+
+def test_an_absolute_metadata_path_is_left_exactly_as_written(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    absolute = (tmp_path / "elsewhere" / "meta.sqlite3").resolve()
+    cfg = {"metadata": {"path": str(absolute)}}
+    assert pipeline.resolve_metadata_path(cfg) == absolute
+
+
+def test_a_config_dict_with_no_file_behind_it_falls_back_to_the_repo(tmp_path, monkeypatch):
+    """Hand-built config dicts (tests, embedded callers) have no config file to
+    anchor to. The repo root is the right fallback: it is where config.yaml and
+    the owner's live metadata.sqlite3 both are — never the cwd."""
+    monkeypatch.chdir(tmp_path)
+    resolved = pipeline.resolve_metadata_path({"metadata": {"path": "./metadata.sqlite3"}})
+    assert resolved == pipeline.DEFAULT_CONFIG_PATH.parent / "metadata.sqlite3"
+    assert resolved.parent != tmp_path
+
+
+def test_the_catalog_commands_resolve_the_same_path(tmp_path, monkeypatch):
+    """`rag sources` / `rag stats` open the store themselves. A second
+    resolution is a second answer — and pointing them at an empty DB in the
+    cwd would report a corpus of zero files that is sitting there indexed."""
+    import cli as cli_mod
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg_file = repo / "config.yaml"
+    cfg_file.write_text("metadata:\n  path: ./meta.sqlite3\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    md = cli_mod._open_metadata(pipeline.load_config(cfg_file))
+    try:
+        assert md.path == repo / "meta.sqlite3"
+    finally:
+        md.close()

@@ -1010,7 +1010,10 @@ def _open_metadata(cfg: dict) -> MetadataStore:
         raise click.UsageError(
             "metadata is disabled in config.yaml. Set `metadata.enabled: true` to use this command."
         )
-    return MetadataStore(meta_cfg.get("path", "./metadata.sqlite3"))
+    # Through the same resolver make_metadata uses. A second spelling of the
+    # default is a second answer: these commands would report on an empty
+    # database in whatever directory the user happened to be standing in.
+    return MetadataStore(pipeline.resolve_metadata_path(cfg))
 
 
 @cli.command("citations")
