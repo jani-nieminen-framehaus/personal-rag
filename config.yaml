@@ -141,3 +141,13 @@ eval:
     top_k_dense: [20, 40]
     top_k_final: [5]
     reranker: [passthrough, bge]
+
+# ---- Sources -----------------------------------------------------------------
+# What the index is supposed to contain. `rag refresh` re-ingests only the
+# files here whose content changed; `rag ingest --markdown X` still works for
+# one-offs. Leave empty until you know what you want tracked.
+sources: []
+#  - type: markdown          # markdown | pdf | epub | zeal
+#    path: D:/notes
+#  - type: pdf
+#    path: D:/papers

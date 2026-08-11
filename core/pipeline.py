@@ -66,6 +66,35 @@ def chunking_params(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+SOURCE_TYPES = ("markdown", "pdf", "epub", "zeal")
+
+
+def configured_sources(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """The `sources:` list from config.yaml, validated and normalised.
+
+    This is the record of what the index is SUPPOSED to contain. `rag ingest`
+    stays invocation-driven for one-offs; `rag refresh` works from here and
+    never guesses.
+
+    Raises ValueError on a malformed entry rather than skipping it — a typo in
+    a source type must not silently mean "that corpus is no longer indexed".
+    """
+    raw = cfg.get("sources") or []
+    out: list[dict[str, Any]] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(f"sources[{i}]: each entry must be a mapping of type + path")
+        if "type" not in entry or "path" not in entry:
+            raise ValueError(f"sources[{i}]: needs both 'type' and 'path'")
+        if entry["type"] not in SOURCE_TYPES:
+            raise ValueError(
+                f"sources[{i}]: unknown type {entry['type']!r}; "
+                f"expected one of {', '.join(SOURCE_TYPES)}"
+            )
+        out.append({"type": entry["type"], "path": Path(entry["path"]).resolve()})
+    return out
+
+
 def _import_class(dotted: str):
     """Import a class from a dotted path like 'providers.embed_qwen3.Qwen3Embedder'."""
     module_name, _, class_name = dotted.rpartition(".")
