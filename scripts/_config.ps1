@@ -8,9 +8,13 @@
 # Keep the two in sync.
 # =============================================================================
 
-$Script:TaskName  = 'rag-gui'
-$Script:RagPort   = if ($env:RAG_PORT) { [int]$env:RAG_PORT } else { 8420 }
-$Script:StateFile = Join-Path $env:USERPROFILE '.rag\state.json'
+$Script:TaskName        = 'rag-gui'
+# The nightly `rag refresh`. A separate task from the GUI one on purpose:
+# different trigger, different lifetime, and removing one must not remove
+# the other. install-refresh-task.ps1 / uninstall-refresh-task.ps1.
+$Script:RefreshTaskName = 'rag-refresh'
+$Script:RagPort         = if ($env:RAG_PORT) { [int]$env:RAG_PORT } else { 8420 }
+$Script:StateFile       = Join-Path $env:USERPROFILE '.rag\state.json'
 
 function Read-StateJson {
     if (-not (Test-Path $Script:StateFile)) { return $null }
