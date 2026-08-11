@@ -1,7 +1,15 @@
 """Ingesters can be restricted to a subset of files, so refresh can
-re-ingest just what changed instead of the whole tree."""
+re-ingest just what changed instead of the whole tree.
+
+Note: This module guards optional-dependency skips (pytest.importorskip) INSIDE
+each test function rather than at module level. This is deliberate — unlike
+test_pdf_ingest.py, the markdown tests have NO optional dependency, and a
+module-level skip would prevent them from running. Test functions that need
+optional deps call importorskip themselves.
+"""
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -44,7 +52,7 @@ def test_markdown_empty_only_paths_ingests_nothing(tmp_path):
 
 def _build_pdf(path: Path, pages: list[str], title: str = "Test Book") -> None:
     """Create a minimal PDF at `path` with one page per element in `pages`."""
-    import pymupdf  # noqa: F401 (used via pymupdf.open below)
+    import pymupdf
     doc = pymupdf.open()
     try:
         for body in pages:
@@ -61,9 +69,7 @@ def _build_pdf(path: Path, pages: list[str], title: str = "Test Book") -> None:
 
 
 def _pdfs(tmp_path):
-    (tmp_path / "keep.pdf").write_bytes(b"")  # placeholder
     _build_pdf(tmp_path / "keep.pdf", ["Keep page text."])
-    (tmp_path / "skip.pdf").write_bytes(b"")  # placeholder
     _build_pdf(tmp_path / "skip.pdf", ["Skip page text."])
     return tmp_path
 
@@ -98,38 +104,123 @@ def test_pdf_empty_only_paths_ingests_nothing(tmp_path):
 
 # ---- EPUB ingester tests --------------------------------------------------
 
-def _build_epub(path: Path, chapters: list[str], title: str = "Test Book") -> None:
-    """Create a minimal EPUB at `path` with one chapter per element in `chapters`."""
-    from ebooklib import epub
+def _build_epub(
+    path: Path,
+    chapters: list[dict],
+    title: str = "Test Book",
+) -> None:
+    """Create a minimal valid EPUB at `path` with one or more chapters.
 
-    book = epub.EpubBook()
-    book.set_identifier(str(path))
-    book.set_title(title)
-    book.set_language('en')
+    Args:
+        path: destination .epub file path.
+        chapters: list of dicts, each with keys `id` (str), `title` (str),
+                  and `body` (str).  These become OEBPS/chN.xhtml files.
 
-    c1 = epub.EpubAuthor('Test Author')
-    book.add_author(c1)
+    Uses zipfile + XML strings to hand-write a valid EPUB, deliberately
+    avoiding ebooklib's writer API which has structural bugs.
+    """
+    with zipfile.ZipFile(str(path), "w", zipfile.ZIP_DEFLATED) as zf:
+        # 1. mimetype — must be first, uncompressed, no extra attrs.
+        zf.writestr(
+            zipfile.ZipInfo("mimetype"),
+            "application/epub+zip",
+            compress_type=zipfile.ZIP_STORED,
+        )
+        # 2. META-INF/container.xml — tells ebooklib where the OPF is.
+        container = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0"
+           xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf"
+              media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"""
+        zf.writestr("META-INF/container.xml", container)
 
-    for i, chapter_text in enumerate(chapters, start=1):
-        c = epub.EpubHtml()
-        c.file_name = f'chap_{i:02d}.xhtml'
-        c.title = f'Chapter {i}'
-        c.content = chapter_text
-        book.add_item(c)
-        book.toc.append(c)
+        # 3. OEBPS/content.opf (EPUB 2.0.1 — ebooklib reads this most reliably)
+        manifest_items = "\n".join(
+            f'    <item id="{c["id"]}" href="{c["id"]}.xhtml" '
+            f'media-type="application/xhtml+xml"/>'
+            for c in chapters
+        )
+        manifest_items += (
+            f'\n    <item id="ncx" href="toc.ncx" '
+            f'media-type="application/x-dtbncx+xml"/>'
+        )
+        spine_items = "\n".join(
+            f'    <itemref idref="{c["id"]}"/>' for c in chapters
+        )
+        opf = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<package xmlns="http://www.idpf.org/2007/opf" version="2.0" '
+            'unique-identifier="uid">\n'
+            '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
+            f'    <dc:title>{title}</dc:title>\n'
+            '    <dc:language>en</dc:language>\n'
+            '    <dc:identifier id="uid">urn:uuid:test-book-001</dc:identifier>\n'
+            '  </metadata>\n'
+            '  <manifest>\n'
+            f'{manifest_items}\n'
+            '  </manifest>\n'
+            '  <spine toc="ncx">\n'
+            f'{spine_items}\n'
+            '  </spine>\n'
+            '</package>'
+        )
+        zf.writestr("OEBPS/content.opf", opf)
 
-    book.spine = ['nav'] + [item for item in book.items if isinstance(item, epub.EpubHtml)]
-    book.add_item(epub.EpubNcx())
-    book.add_item(epub.EpubNav())
+        # 4. OEBPS/toc.ncx (required for EPUB 2.0.1)
+        nav_points = "\n".join(
+            f'  <navPoint id="np{i+1}" playOrder="{i+1}">'
+            f'<navLabel><text>{c["title"]}</text></navLabel>'
+            f'<content src="{c["id"]}.xhtml"/></navPoint>'
+            for i, c in enumerate(chapters)
+        )
+        ncx = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">\n'
+            '  <head>\n'
+            '    <meta name="dtb:uid" content="urn:uuid:test-book-001"/>\n'
+            '  </head>\n'
+            f'  <docTitle><text>{title}</text></docTitle>\n'
+            '  <navMap>\n'
+            f'{nav_points}\n'
+            '  </navMap>\n'
+            '</ncx>'
+        )
+        zf.writestr("OEBPS/toc.ncx", ncx)
 
-    epub.write_epub(str(path), book)
+        # 5. OEBPS/chN.xhtml — one per chapter
+        for c in chapters:
+            body_escaped = (
+                c["body"]
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            xhtml = f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>{c["title"]}</title></head>
+<body>
+<h1>{c["title"]}</h1>
+<p>{body_escaped}</p>
+</body>
+</html>"""
+            zf.writestr(f"OEBPS/{c['id']}.xhtml", xhtml)
 
 
 def _epubs(tmp_path):
-    (tmp_path / "keep.epub").write_bytes(b"")  # placeholder
-    _build_epub(tmp_path / "keep.epub", ["Keep chapter text."])
-    (tmp_path / "skip.epub").write_bytes(b"")  # placeholder
-    _build_epub(tmp_path / "skip.epub", ["Skip chapter text."])
+    _build_epub(
+        tmp_path / "keep.epub",
+        [{"id": "ch1", "title": "Keep", "body": "Keep chapter text."}],
+    )
+    _build_epub(
+        tmp_path / "skip.epub",
+        [{"id": "ch1", "title": "Skip", "body": "Skip chapter text."}],
+    )
     return tmp_path
 
 
