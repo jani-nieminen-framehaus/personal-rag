@@ -380,3 +380,247 @@ def test_a_missing_docset_is_a_missing_root(tmp_path):
     assert plan.sources[0].root_missing is True
     assert plan.sources[0].vanished == []
     assert plan.has_work is False
+
+
+# -- review round 1: overlapping and nested roots ------------------------------
+#
+# No test covered two sources whose roots overlap, and both Critical findings
+# lived in exactly that blind spot. `vanished` was computed from prefix +
+# existence alone, with no notion of which source OWNS a recorded row.
+
+
+def _multi_cfg(sources):
+    return {"sources": sources,
+            "chunking": {"target_tokens": 768, "overlap_pct": 12,
+                         "min_chunk_tokens": 8},
+            "ingest": {"default_topic": "test"}}
+
+
+def test_a_missing_nested_source_is_not_pruned_by_its_present_parent(tmp_path, monkeypatch):
+    """Critical 1. An unreachable subtree BELOW a present root - a junction to
+    a NAS, a removable volume mounted into a folder. The parent enumerates
+    fine, so its own root_missing guard never fires, and it used to claim the
+    child's still-existing files as vanished and delete them."""
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    _md(docs, "kept.md", "body")
+    nas = docs / "nas"                      # never created: the unmounted share
+    cfg = _multi_cfg([{"type": "markdown", "path": str(docs)},
+                      {"type": "markdown", "path": str(nas)}])
+    recorded = str(nas / "report.md")
+
+    plan = refresh.plan_refresh(cfg, _meta({recorded: "abc"}))
+    parent, child = plan.sources
+    assert child.root_missing is True
+    assert child.vanished == []
+    assert parent.root_missing is False
+    assert parent.vanished == []            # the bug: used to be [recorded]
+
+    monkeypatch.setattr(refresh, "ingest_pipeline", MagicMock(return_value=1))
+    store = MagicMock()
+    refresh.run_refresh(cfg, _meta({recorded: "abc"}), store=store,
+                        embedder_factory=MagicMock(), prune=True)
+    store.delete_by_source.assert_not_called()
+
+
+def test_a_docset_under_a_markdown_root_is_never_swept_up(tmp_path, monkeypatch):
+    """Critical 2. ZealIngester records a page as <docset>/<rel> while the file
+    lives at <docset>/Contents/Resources/Documents/<rel>, so every one of a
+    docset's ~50k rows names a path that never exists. A parent source used to
+    sweep them all into `vanished` and destroy the real vectors - and the
+    .dsidx marker survived, so the docset then read `unchanged` forever and was
+    never rebuilt. The docset is NOT configured here: the suffix filter is what
+    has to save it."""
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    _md(docs, "kept.md", "body")
+    docset = docs / "Test.docset"
+    docset.mkdir()
+    _make_fake_docset(docset)
+
+    page_row = str(docset / "page_a.html")
+    assert not Path(page_row).exists()      # the synthetic path, as recorded
+    assert (docset / "Contents" / "Resources" / "Documents" / "page_a.html").is_file()
+
+    cfg = _multi_cfg([{"type": "markdown", "path": str(docs)}])
+    plan = refresh.plan_refresh(cfg, _meta({page_row: "abc"}))
+    assert plan.sources[0].vanished == []
+
+    monkeypatch.setattr(refresh, "ingest_pipeline", MagicMock(return_value=1))
+    store = MagicMock()
+    refresh.run_refresh(cfg, _meta({page_row: "abc"}), store=store,
+                        embedder_factory=MagicMock(), prune=True)
+    store.delete_by_source.assert_not_called()
+
+
+def test_a_root_that_enumerates_nothing_refuses_to_prune(tmp_path):
+    """A present root that yields zero files while the index holds rows for it
+    is "unknown", not "emptied". Could be a permissions change, a sync client
+    mid-reset, or a mount point whose volume is gone. Deliberate removal is
+    what `rag forget` is for; silent mass deletion is never the safe default."""
+    docs = tmp_path / "docs"
+    docs.mkdir()                            # present, but empty
+    recorded = str(docs / "was_here.md")
+    cfg = _multi_cfg([{"type": "markdown", "path": str(docs)}])
+
+    plan = refresh.plan_refresh(cfg, _meta({recorded: "abc"}))
+    sp = plan.sources[0]
+    assert sp.vanished == []
+    assert sp.prune_blocked                 # and it says why
+    assert plan.has_blocked_prunes is True
+
+    store = MagicMock()
+    refresh.run_refresh(cfg, _meta({recorded: "abc"}), store=store,
+                        embedder_factory=MagicMock(), prune=True)
+    store.delete_by_source.assert_not_called()
+
+
+def test_an_empty_root_with_no_recorded_rows_is_not_flagged(tmp_path):
+    """A genuinely new, still-empty source is not suspicious - no warning."""
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    plan = refresh.plan_refresh(_multi_cfg([{"type": "markdown", "path": str(docs)}]),
+                                _meta({}))
+    assert plan.sources[0].prune_blocked is None
+    assert plan.has_blocked_prunes is False
+
+
+# -- review round 1: replacing a changed file ----------------------------------
+
+def test_editing_a_file_shorter_leaves_no_orphaned_chunks(tmp_path, meta_store):
+    """chunk_id is deterministic on position, so a re-ingest overwrites
+    same-position chunks but orphans everything past the new end of the file.
+    Deleted text stayed queryable and kept turning up in citations."""
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    f = notes / "a.md"
+    f.write_text(
+        "# One\n\n" + "keep text " * 40
+        + "\n\n## Two\n\n" + "zzzremoved " * 40
+        + "\n\n## Three\n\n" + "zzzremoved " * 40 + "\n",
+        encoding="utf-8",
+    )
+    cfg = _cfg(notes)
+    store = _MemStore()
+
+    refresh.run_refresh(cfg, meta_store, store=store, embedder_factory=_TinyEmbedder)
+    assert any("zzzremoved" in c.text for c in store.points.values())
+
+    f.write_text("# One\n\n" + "keep text " * 40 + "\n", encoding="utf-8")
+    refresh.run_refresh(cfg, meta_store, store=store, embedder_factory=_TinyEmbedder)
+
+    assert store.points, "the surviving content must still be indexed"
+    assert not any("zzzremoved" in c.text for c in store.points.values())
+
+
+def test_a_new_file_is_not_deleted_before_it_is_ingested(tmp_path, monkeypatch):
+    """Only `changed` paths have old chunks to clear. Calling delete for a new
+    path is a pointless store round trip per file on a first ingest."""
+    _md(tmp_path, "a.md", "body")
+    monkeypatch.setattr(refresh, "ingest_pipeline", MagicMock(return_value=1))
+    store = MagicMock()
+    refresh.run_refresh(_cfg(tmp_path), _meta({}), store=store,
+                        embedder_factory=MagicMock())
+    store.delete_by_source.assert_not_called()
+
+
+# -- review round 1: per-source error isolation --------------------------------
+
+def test_one_failing_source_does_not_stop_the_others(tmp_path, monkeypatch):
+    """Unattended scheduled task: a single corrupt PDF must not mean no later
+    source refreshes, no prune runs, and a stale IDF map left behind chunks
+    that were already written."""
+    from core import pipeline
+
+    a = tmp_path / "a"
+    a.mkdir()
+    _md(a, "a.md", "body")
+    b = tmp_path / "b"
+    b.mkdir()
+    _md(b, "b.md", "body")
+    cfg = _multi_cfg([{"type": "markdown", "path": str(a)},
+                      {"type": "markdown", "path": str(b)}])
+
+    seen: list[Path] = []
+
+    def flaky(ingester, *args, **kwargs):
+        seen.append(Path(ingester.root))
+        if Path(ingester.root) == a.resolve():
+            raise RuntimeError("corrupt file")
+        return 1
+
+    monkeypatch.setattr(refresh, "ingest_pipeline", flaky)
+    pipeline._hybrid_cache.update({"vocab": {"x": 0}, "idf": {"x": 1.0}, "built": True})
+
+    plan = refresh.run_refresh(cfg, _meta({}), store=MagicMock(),
+                               embedder_factory=MagicMock())
+
+    assert len(seen) == 2, "the second source never got its turn"
+    assert "corrupt file" in (plan.sources[0].error or "")
+    assert plan.sources[1].error is None
+    assert plan.has_errors is True
+    assert pipeline._hybrid_cache["built"] is False
+
+
+def test_a_source_whose_ingest_failed_is_not_pruned(tmp_path, monkeypatch):
+    """Something is wrong with that source; deleting under it is the one
+    irreversible thing in this file. Skipping one run costs nothing."""
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    _md(docs, "a.md", "body")
+    gone = str(docs / "gone.md")
+    cfg = _multi_cfg([{"type": "markdown", "path": str(docs)}])
+
+    monkeypatch.setattr(refresh, "ingest_pipeline",
+                        MagicMock(side_effect=RuntimeError("locked")))
+    store = MagicMock()
+    plan = refresh.run_refresh(cfg, _meta({gone: "abc"}), store=store,
+                               embedder_factory=MagicMock(), prune=True)
+
+    assert plan.sources[0].vanished == [gone]     # still REPORTED
+    store.delete_by_source.assert_not_called()    # but not acted on
+
+
+# -- review round 1: an unreadable file is not a changed file ------------------
+
+def test_an_unreadable_file_is_not_reported_as_changed(tmp_path, monkeypatch):
+    """hash_file returns "" when it cannot read the file. Treating that as a
+    hash made a permanently locked-but-listed file re-ingest on every single
+    run - the exact perpetual work this feature exists to avoid."""
+    f = _md(tmp_path, "a.md", "body")
+    monkeypatch.setattr(refresh, "hash_file", lambda p: "")
+
+    plan = refresh.plan_refresh(_cfg(tmp_path), _meta({str(f): "abc"}))
+    sp = plan.sources[0]
+    assert sp.changed == []
+    assert sp.new == []
+    assert sp.unreadable == [f]
+    assert plan.has_work is False
+
+
+def test_record_source_with_an_empty_file_hash_preserves_the_stored_one(meta_store):
+    """COALESCE guards NULL; "" is not NULL. A transient read failure would
+    otherwise overwrite a perfectly good stored hash with empty."""
+    meta_store.record_source("/a.md", "markdown", "t", 3, "ch",
+                             file_hash="deadbeefdeadbeef")
+    meta_store.record_source("/a.md", "markdown", "t", 4, "ch2", file_hash="")
+
+    rows = meta_store.get_sources()
+    assert len(rows) == 1
+    assert rows[0]["file_hash"] == "deadbeefdeadbeef"
+    assert rows[0]["chunk_count"] == 4
+
+
+def test_record_zeal_marker_is_public_for_task_6(tmp_path, meta_store):
+    """Task 6 calls this after a manual `rag ingest --zeal`, so a docset the
+    owner ingested by hand does not read as new on the next refresh."""
+    docset = tmp_path / "Test.docset"
+    docset.mkdir()
+    _make_fake_docset(docset)
+
+    refresh.record_zeal_marker(meta_store, docset, "docSet.dsidx")
+
+    idx = docset / "Contents" / "Resources" / "docSet.dsidx"
+    rows = {r["source_path"]: r for r in meta_store.get_sources()}
+    assert rows[str(idx)]["file_hash"] == hash_file(idx)
+    assert rows[str(idx)]["doc_type"] == refresh.ZEAL_MARKER_DOC_TYPE

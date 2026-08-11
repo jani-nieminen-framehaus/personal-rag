@@ -18,9 +18,29 @@ An absent source root means "unknown", never "empty".
 
 This runs as a scheduled task. If a drive is unplugged or a share is unmounted
 when it fires, a naive implementation enumerates zero files, concludes the
-whole corpus was deleted, and `--prune` wipes the index. So a missing root sets
-`root_missing` and reports NOTHING as vanished — there is no flag combination
-that lets an unreachable root delete anything.
+whole corpus was deleted, and `--prune` wipes the index.
+
+"Unknown" is broader than "the configured root is gone", and the three cases
+below are all treated the same way — plan them, report them, prune nothing:
+
+1. The root itself is absent (or a docset has lost its `.dsidx`).
+2. An unreachable subtree BELOW a present root — a junction to a NAS, a
+   removable volume mounted into a folder. The parent enumerates perfectly
+   well, so its own guard never fires. Ownership (below) is what saves it.
+3. A present root that enumerates ZERO files while the index holds rows for
+   it. A genuinely emptied folder therefore never prunes automatically, which
+   is the right trade: `rag forget` exists for deliberate removal, and silent
+   mass deletion does not.
+
+OWNERSHIP
+---------
+Every recorded row belongs to exactly ONE configured source: the one whose
+root is the longest matching prefix. Without that, a parent source claims rows
+that belong to a nested one and deletes files it can only see half of. On top
+of ownership, a source may only ever report a row as vanished if the row's
+suffix is one its own enumeration could have produced — which independently
+keeps a Zeal docset's synthetic per-page paths out of a markdown source's
+prune list.
 """
 from __future__ import annotations
 
@@ -46,6 +66,10 @@ log = logging.getLogger(__name__)
 # Which suffixes each source type contributes. Must stay in step with
 # `pipeline.SOURCE_TYPES`; `_plan_one` raises rather than silently planning an
 # empty source if a new type is added here without a suffix set.
+#
+# This doubles as the prune whitelist: a source may only report a row vanished
+# if its suffix is in here. Zeal is deliberately absent — it is not walked, and
+# it must never prune anything.
 SUFFIXES: dict[str, set[str]] = {
     "markdown": {".md", ".markdown", ".py"},
     "pdf": {".pdf"},
@@ -55,7 +79,7 @@ SUFFIXES: dict[str, set[str]] = {
 DEFAULT_ZEAL_INDEX = "docSet.dsidx"
 
 # doc_type of the marker row a refreshed docset leaves behind. See
-# `_record_zeal_marker` for why the marker has to exist at all.
+# `record_zeal_marker` for why the marker has to exist at all.
 ZEAL_MARKER_DOC_TYPE = "zeal-docset"
 
 
@@ -72,10 +96,17 @@ class SourcePlan:
     new: list[Path] = field(default_factory=list)
     changed: list[Path] = field(default_factory=list)
     unchanged: int = 0
-    # Recorded source_paths, as stored, that live under this root and are gone
-    # from disk. Always empty when `root_missing` — see the module docstring.
+    # Recorded source_paths, as stored, that this source OWNS and that are gone
+    # from disk. Always empty when `prune_blocked` — see the module docstring.
     vanished: list[str] = field(default_factory=list)
+    # Enumerated, but hash_file could not read them. Left exactly as they are:
+    # not new, not changed, not vanished.
+    unreadable: list[Path] = field(default_factory=list)
     root_missing: bool = False
+    # Why this source may not prune this run, in words, or None if it may.
+    prune_blocked: str | None = None
+    # Set if this source's ingest raised. The other sources still run.
+    error: str | None = None
 
     @property
     def has_work(self) -> bool:
@@ -94,6 +125,14 @@ class RefreshPlan:
     def has_missing_roots(self) -> bool:
         return any(s.root_missing for s in self.sources)
 
+    @property
+    def has_blocked_prunes(self) -> bool:
+        return any(s.prune_blocked for s in self.sources)
+
+    @property
+    def has_errors(self) -> bool:
+        return any(s.error for s in self.sources)
+
 
 # -----------------------------------------------------------------------------
 # Path comparison
@@ -111,10 +150,10 @@ def _norm(p: str | Path) -> str:
     add ~25 s to every refresh — including the runs where nothing changed and
     the whole point is that it costs nothing.
 
-    What resolve() would buy is symlink canonicalisation. That only matters if
-    the same file is recorded under two different names, which cannot happen
-    here: a recorded path and the walk that re-finds it both come from the same
-    configured root.
+    The semantic gap is closed upstream rather than here: `configured_sources`
+    already resolves every root, and `iter_source_files` resolves the root it
+    walks, so both sides of every comparison descend from the same canonical
+    path.
     """
     return os.path.normcase(os.path.abspath(str(p)))
 
@@ -126,6 +165,36 @@ def _index_recorded(recorded: dict[str, str | None]) -> dict[str, tuple[str, str
     and `metadata.delete_source` need back.
     """
     return {_norm(key): (key, value) for key, value in recorded.items()}
+
+
+def _is_under(candidate: str, root: str) -> bool:
+    """Both already normalised by `_norm`."""
+    return candidate == root or candidate.startswith(root + os.sep)
+
+
+def _assign_owners(
+    roots: list[str], indexed: dict[str, tuple[str, str | None]]
+) -> list[dict[str, tuple[str, str | None]]]:
+    """Split the recorded rows across the configured roots, one owner each.
+
+    The owner is the LONGEST matching root, so a row under `…/docs/nas/`
+    belongs to the `nas` source and not to `…/docs/` above it. That is the
+    whole fix for a nested source whose own root is unreachable: the parent can
+    no longer claim its files and delete them while they sit intact on the
+    other side of an unmounted link.
+
+    Rows under no configured root at all are owned by nobody and can never be
+    pruned — dropping a source from config.yaml does not silently delete it.
+    """
+    owned: list[dict[str, tuple[str, str | None]]] = [{} for _ in roots]
+    # Longest first, so the first match is the most specific one.
+    order = sorted(range(len(roots)), key=lambda i: len(roots[i]), reverse=True)
+    for norm, record in indexed.items():
+        for i in order:
+            if _is_under(norm, roots[i]):
+                owned[i][norm] = record
+                break
+    return owned
 
 
 # -----------------------------------------------------------------------------
@@ -157,17 +226,30 @@ def _docset_topic(docset_root: Path) -> str:
     return name.strip().lower().replace(" ", "-")
 
 
-def _record_zeal_marker(
-    metadata: MetadataStore, docset_root: Path, sqlite_filename: str
+def record_zeal_marker(
+    metadata: MetadataStore,
+    docset_root: str | Path,
+    sqlite_filename: str = DEFAULT_ZEAL_INDEX,
 ) -> None:
-    """Record the docset's `.dsidx` as a source row in its own right.
+    """Record a docset's `.dsidx` as a source row in its own right.
 
     Ingest writes one `sources` row per PAGE, so nothing is ever keyed by the
     `.dsidx` that `plan_refresh` hashes. Without this marker the plan finds it
-    absent, calls the docset "new", and re-ingests ~50,000 pages on every
-    single refresh, forever. The per-page rows stay (they are what `rag
-    sources` lists); this is the row refresh compares against.
+    absent, calls the docset "new", and re-ingests a docset that can hold
+    ~50,000 pages on every single refresh, forever. The per-page rows stay
+    (they are what `rag sources` lists); this is the row refresh compares
+    against.
+
+    Public because a docset can also arrive via a manual `rag ingest --zeal`,
+    which must leave the same marker or the next refresh rebuilds it from
+    scratch. Call it after the ingest succeeds, never before.
+
+    Args:
+        metadata: the store to write the marker into.
+        docset_root: the `.docset` directory.
+        sqlite_filename: `ingest.zeal.sqlite_filename` from config, if set.
     """
+    docset_root = Path(docset_root)
     index_file = _zeal_index(docset_root, sqlite_filename)
     metadata.record_source(
         source_path=str(index_file),
@@ -183,28 +265,37 @@ def _record_zeal_marker(
 # Planning
 # -----------------------------------------------------------------------------
 
-def _vanished_under(root: Path, indexed: dict[str, tuple[str, str | None]]) -> list[str]:
-    """Recorded paths under `root` that are no longer on disk.
+def _prunable(
+    owned: dict[str, tuple[str, str | None]], suffixes: set[str]
+) -> dict[str, tuple[str, str | None]]:
+    """The owned rows this source is even allowed to consider deleting.
 
-    Only called once the root is known to be present — a missing root can never
-    reach here.
+    Defence in depth on top of ownership. A source may only prune a row its own
+    enumeration could have produced, so a markdown source can never delete the
+    `.html` rows of a Zeal docset that happens to live inside its tree — rows
+    which name synthetic paths that never exist on disk and would otherwise
+    look, to a plain existence check, exactly like 50,000 deleted files.
     """
-    root_norm = _norm(root)
-    prefix = root_norm + os.sep
-    gone = [
-        stored
-        for norm, (stored, _hash) in indexed.items()
-        if (norm == root_norm or norm.startswith(prefix)) and not os.path.exists(norm)
-    ]
-    return sorted(gone)
+    return {
+        norm: record
+        for norm, record in owned.items()
+        if os.path.splitext(norm)[1].lower() in suffixes
+    }
 
 
 def _plan_one(
     entry: dict[str, Any],
     indexed: dict[str, tuple[str, str | None]],
+    owned: dict[str, tuple[str, str | None]],
     zeal_index_name: str = DEFAULT_ZEAL_INDEX,
 ) -> SourcePlan:
-    """Classify one configured source. Reads only; never writes."""
+    """Classify one configured source. Reads only; never writes.
+
+    `indexed` is every recorded row — the hash lookup has to see all of them,
+    because a file under a nested source is enumerated by both roots and must
+    not look "new" to the outer one. `owned` is only this source's rows, and is
+    the sole input to `vanished`.
+    """
     stype = entry["type"]
     root = Path(entry["path"])
     plan = SourcePlan(type=stype, path=root)
@@ -215,42 +306,68 @@ def _plan_one(
         # treat both as "unknown", so neither ingests nor prunes.
         if not root.is_dir() or not index_file.is_file():
             plan.root_missing = True
+            plan.prune_blocked = "the docset or its .dsidx index is not present"
             log.warning("refresh: zeal docset unavailable — skipping %s", root)
             return plan
         files = [index_file]
+        # A docset's rows are per page and its pages are not the unit refresh
+        # tracks, so it never prunes. Reporting them would shred an intact
+        # docset. It either changed or it did not.
+        prunable: dict[str, tuple[str, str | None]] = {}
+        plan.prune_blocked = "a docset is all-or-nothing; its pages are not tracked"
     else:
         suffixes = SUFFIXES.get(stype)
         if suffixes is None:
             raise ValueError(f"refresh: no suffix map for source type {stype!r}")
         if not root.exists():
             plan.root_missing = True
+            plan.prune_blocked = "the source root is not present"
             log.warning(
                 "refresh: source root is not present — skipping %s "
                 "(nothing under it will be pruned)", root,
             )
             return plan
         files = iter_source_files(root, suffixes)
+        prunable = _prunable(owned, suffixes)
+        if not files and prunable:
+            # Present but yielding nothing, while the index says it held files.
+            # Unknown, not emptied.
+            plan.prune_blocked = (
+                f"the root is present but enumerated no files, while the index "
+                f"holds {len(prunable)} row(s) for it"
+            )
+            log.warning(
+                "refresh: %s enumerated 0 files but the index holds %d row(s) "
+                "for it — refusing to prune. If you emptied it on purpose, use "
+                "`rag forget`.", root, len(prunable),
+            )
+            return plan
 
     for f in files:
+        current = hash_file(f)
+        if not current:
+            # hash_file's documented failure return. Not a hash — treating it
+            # as one would re-ingest a permanently locked file every run.
+            plan.unreadable.append(f)
+            log.warning("refresh: cannot read %s — leaving it as it is", f)
+            continue
         record = indexed.get(_norm(f))
         if record is None:
             plan.new.append(f)
-            continue
-        recorded_hash = record[1]
-        if not recorded_hash:
-            # NULL file_hash: a row written before schema v2, or by a caller
-            # that did not hash. Unknown, so re-ingest once and record one.
+        elif not record[1]:
+            # NULL/empty file_hash: a row written before schema v2, or by a
+            # caller that did not hash. Unknown, so re-ingest once and record.
             plan.changed.append(f)
-        elif recorded_hash == hash_file(f):
+        elif record[1] == current:
             plan.unchanged += 1
         else:
             plan.changed.append(f)
 
-    # A docset's recorded rows are per page, and pages are not the unit refresh
-    # tracks — reporting them as vanished would let --prune shred a docset that
-    # is perfectly intact. The docset either changed or it did not.
-    if stype != "zeal":
-        plan.vanished = _vanished_under(root, indexed)
+    if plan.prune_blocked is None:
+        plan.vanished = sorted(
+            stored for norm, (stored, _hash) in prunable.items()
+            if not os.path.exists(norm)
+        )
 
     return plan
 
@@ -264,9 +381,13 @@ def plan_refresh(cfg: dict[str, Any], metadata: MetadataStore) -> RefreshPlan:
         )
     entries = configured_sources(cfg)
     indexed = _index_recorded(metadata.source_hashes())
+    owned = _assign_owners([_norm(e["path"]) for e in entries], indexed)
     zeal_index_name = _zeal_index_name(cfg)
     return RefreshPlan(
-        sources=[_plan_one(entry, indexed, zeal_index_name) for entry in entries]
+        sources=[
+            _plan_one(entry, indexed, own, zeal_index_name)
+            for entry, own in zip(entries, owned)
+        ]
     )
 
 
@@ -339,6 +460,36 @@ def _make_ingester(plan: SourcePlan, cfg: dict[str, Any], only_paths: set[Path])
     raise ValueError(f"refresh: no ingester for source type {plan.type!r}")
 
 
+def _refresh_one(
+    source: SourcePlan,
+    cfg: dict[str, Any],
+    metadata: MetadataStore,
+    store: Any,
+    embedder: Any,
+    zeal_index_name: str,
+) -> None:
+    """Re-ingest one source's new and changed files. Raises on failure."""
+    # A changed file's OLD chunks have to go first. chunk_id is deterministic
+    # on position, so re-ingesting overwrites same-position chunks but orphans
+    # every chunk whose heading was renamed or whose index no longer exists
+    # once the file shrank — and nothing ever prunes those, so deleted text
+    # stays queryable and keeps coming back in citations. Only `changed` needs
+    # this; a `new` path has nothing to delete.
+    if source.type != "zeal":
+        for path in source.changed:
+            store.delete_by_source(str(path))
+
+    ingester = _make_ingester(source, cfg, set(source.new) | set(source.changed))
+    written = ingest_pipeline(ingester, embedder, store, metadata=metadata)
+    log.info(
+        "refresh: %s %s — %d new, %d changed, %d unchanged, %s chunks written",
+        source.type, source.path, len(source.new), len(source.changed),
+        source.unchanged, written,
+    )
+    if source.type == "zeal":
+        record_zeal_marker(metadata, source.path, zeal_index_name)
+
+
 def run_refresh(
     cfg: dict[str, Any],
     metadata: MetadataStore,
@@ -352,6 +503,11 @@ def run_refresh(
 
     `embedder_factory` is called at most once, and only when there is
     something to ingest.
+
+    One source failing does not stop the others. This is an unattended
+    scheduled task: a single corrupt PDF must not mean nothing else refreshed,
+    the prune never ran, and the hybrid cache was left stale over chunks that
+    had already been written.
     """
     plan = plan_refresh(cfg, metadata)
 
@@ -368,38 +524,50 @@ def run_refresh(
     embedder = None
     touched = False
 
-    for source in plan.sources:
-        if not source.has_work:
-            continue
-        if embedder is None:
-            embedder = embedder_factory()
-        ingester = _make_ingester(source, cfg, set(source.new) | set(source.changed))
-        written = ingest_pipeline(ingester, embedder, store, metadata=metadata)
-        touched = True
-        log.info(
-            "refresh: %s %s — %d new, %d changed, %d unchanged, %s chunks written",
-            source.type, source.path, len(source.new), len(source.changed),
-            source.unchanged, written,
-        )
-        if source.type == "zeal":
-            _record_zeal_marker(metadata, source.path, zeal_index_name)
-
-    if prune:
+    try:
         for source in plan.sources:
-            # `vanished` is already empty for a missing root; this is the
-            # second lock on the same door, because the cost of being wrong
-            # here is a wiped index.
-            if source.root_missing:
+            if not source.has_work:
                 continue
-            for path in source.vanished:
-                store.delete_by_source(path)
-                metadata.delete_source(path)
-                touched = True
-                log.info("refresh: pruned %s", path)
+            if embedder is None:
+                embedder = embedder_factory()
+            # Set before the attempt, not after: `pipeline.ingest` records the
+            # chunks it managed to write before aborting, so a failure still
+            # means the corpus moved.
+            touched = True
+            try:
+                _refresh_one(source, cfg, metadata, store, embedder, zeal_index_name)
+            except Exception as e:
+                source.error = f"{type(e).__name__}: {e}"
+                log.error(
+                    "refresh: %s %s failed — %s (continuing with the "
+                    "remaining sources)", source.type, source.path, source.error,
+                )
 
-    if touched:
-        # The corpus moved; a cached IDF map built against the old one would
-        # silently skew the next hybrid query.
-        invalidate_hybrid_cache()
+        if prune:
+            for source in plan.sources:
+                # `vanished` is already empty whenever prune_blocked is set;
+                # this is the second lock on the same door, because the cost of
+                # being wrong here is a deleted corpus.
+                if source.prune_blocked:
+                    continue
+                if source.error:
+                    # Something is wrong with this source. Deleting under it is
+                    # the one irreversible thing here; skipping a run is free.
+                    log.warning(
+                        "refresh: not pruning %s — its ingest failed this run",
+                        source.path,
+                    )
+                    continue
+                for path in source.vanished:
+                    store.delete_by_source(path)
+                    metadata.delete_source(path)
+                    touched = True
+                    log.info("refresh: pruned %s", path)
+    finally:
+        if touched:
+            # The corpus moved; a cached IDF map built against the old one
+            # would silently skew the next hybrid query. In a finally so it
+            # still runs if the prune loop itself blows up.
+            invalidate_hybrid_cache()
 
     return plan
