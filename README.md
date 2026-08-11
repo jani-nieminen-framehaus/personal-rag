@@ -363,6 +363,14 @@ the last step removed. Read it as an upper bound — a real run deletes no
 more than it listed, and possibly fewer, because a source whose ingest
 fails that run is skipped by the prune.
 
+**`rag forget` erases the index entry, not the file.** If the file is
+still on disk under something listed in `sources:`, the next `rag
+refresh` finds it missing from the catalog, calls it *new*, and indexes
+it again — a nightly task quietly undoing your deletion. `forget` warns
+when that applies and names the source. To make an erasure stick, take
+that path out of `sources:` in `config.yaml` (or delete/move the files
+themselves) as well.
+
 ### Why an unplugged drive can't wipe your index
 
 This runs unattended, which means it will eventually fire while a USB

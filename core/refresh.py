@@ -198,6 +198,26 @@ def _assign_owners(
     return owned
 
 
+def owning_source(entries: list[dict[str, Any]], path: str | Path) -> Path | None:
+    """Which configured source would enumerate this path, or None.
+
+    The longest matching root, the same ownership rule `_assign_owners` applies
+    to the prune — so a caller asking "will a refresh pick this file up again?"
+    gets the source it would actually come back through, not the parent above
+    it. Public because `rag forget` needs exactly that question answered: a
+    deletion under a still-configured root is undone by the next refresh, which
+    sees the file missing from the catalog and calls it new.
+    """
+    norm = _norm(path)
+    best: Path | None = None
+    best_len = -1
+    for entry in entries:
+        root = _norm(entry["path"])
+        if _is_under(norm, root) and len(root) > best_len:
+            best, best_len = Path(entry["path"]), len(root)
+    return best
+
+
 # -----------------------------------------------------------------------------
 # Zeal
 # -----------------------------------------------------------------------------

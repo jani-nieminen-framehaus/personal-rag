@@ -449,3 +449,112 @@ def test_the_stamp_sits_next_to_the_metadata_database(tmp_path, monkeypatch):
     md.close()
     assert pipeline._corpus_stamp_path.parent == tmp_path
     assert pipeline._corpus_stamp_path.name.startswith("meta.sqlite3")
+
+
+# -----------------------------------------------------------------------------
+# IMPORTANT — `rag forget` is undone by the next refresh
+#
+# `forget --topic X` deletes chunks and rows for files that are still on disk
+# under a configured source. The next refresh sees them missing from
+# `source_hashes()`, calls them NEW, and re-ingests them. The spec calls this
+# "the GDPR-shaped capability", where erasure "must be one command" — and a
+# deletion a nightly task reverses is not that.
+#
+# The fix is honesty, not a new exclusion mechanism: say so, at the moment the
+# user is standing there having just typed it.
+# -----------------------------------------------------------------------------
+
+def _forget_cli(monkeypatch, tmp_path, rows, cfg_text):
+    import cli as cli_mod
+
+    store, meta = MagicMock(), MagicMock()
+    store.delete_by_source.return_value = 3
+    meta.get_sources.return_value = rows
+    monkeypatch.setattr(cli_mod, "make_store", lambda cfg: store)
+    monkeypatch.setattr(cli_mod, "make_metadata", lambda cfg: meta)
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(cfg_text, encoding="utf-8")
+    return cli_mod, cfg_file, store
+
+
+def test_forget_warns_when_the_next_refresh_will_bring_it_back(tmp_path, monkeypatch):
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    doomed = _md(notes, "client.md", "personal data")
+    cli_mod, cfg_file, _ = _forget_cli(
+        monkeypatch, tmp_path,
+        [{"source_path": str(doomed), "topic": "client"}],
+        f"sources:\n  - type: markdown\n    path: {notes.as_posix()}\n",
+    )
+
+    res = CliRunner().invoke(
+        cli_mod.cli, ["-c", str(cfg_file), "forget", "--topic", "client", "--yes"])
+    assert res.exit_code == 0, res.output
+    assert "refresh" in res.output
+    assert str(notes) in res.output, "the warning has to name the source to remove"
+    assert "config.yaml" in res.output
+
+
+def test_forget_says_nothing_when_the_file_is_gone_from_disk(tmp_path, monkeypatch):
+    """Refresh cannot re-ingest what it cannot enumerate. Warning here would be
+    noise on the ordinary case: delete the file, then forget it."""
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    cli_mod, cfg_file, _ = _forget_cli(
+        monkeypatch, tmp_path,
+        [{"source_path": str(notes / "already-deleted.md"), "topic": "client"}],
+        f"sources:\n  - type: markdown\n    path: {notes.as_posix()}\n",
+    )
+
+    res = CliRunner().invoke(
+        cli_mod.cli, ["-c", str(cfg_file), "forget", "--topic", "client", "--yes"])
+    assert res.exit_code == 0, res.output
+    assert "will index them again" not in res.output
+
+
+def test_forget_says_nothing_when_no_source_covers_the_file(tmp_path, monkeypatch):
+    """A one-off `rag ingest` of a path that was never added to `sources:` is
+    forgotten for good — nothing will walk it again."""
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    f = _md(loose, "note.md", "body")
+    cli_mod, cfg_file, _ = _forget_cli(
+        monkeypatch, tmp_path,
+        [{"source_path": str(f), "topic": "client"}],
+        "sources: []\n",
+    )
+
+    res = CliRunner().invoke(
+        cli_mod.cli, ["-c", str(cfg_file), "forget", "--topic", "client", "--yes"])
+    assert res.exit_code == 0, res.output
+    assert "will index them again" not in res.output
+
+
+def test_a_broken_sources_list_does_not_break_a_completed_forget(tmp_path, monkeypatch):
+    """The deletes already happened. A config that cannot be parsed must not
+    turn a successful erasure into a traceback."""
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    f = _md(notes, "a.md", "body")
+    cli_mod, cfg_file, store = _forget_cli(
+        monkeypatch, tmp_path,
+        [{"source_path": str(f), "topic": "client"}],
+        "sources:\n  - type: nonsense\n    path: nowhere\n",
+    )
+
+    res = CliRunner().invoke(
+        cli_mod.cli, ["-c", str(cfg_file), "forget", "--topic", "client", "--yes"])
+    assert res.exit_code == 0, res.output
+    store.delete_by_source.assert_called_once()
+
+
+def test_the_owning_source_is_the_longest_matching_root(tmp_path):
+    """Same ownership rule the prune uses, so the warning names the source the
+    file would actually come back through."""
+    entries = [{"type": "markdown", "path": tmp_path / "docs"},
+               {"type": "markdown", "path": tmp_path / "docs" / "nested"}]
+    inner = tmp_path / "docs" / "nested" / "a.md"
+    assert refresh.owning_source(entries, str(inner)) == tmp_path / "docs" / "nested"
+    outer = tmp_path / "docs" / "b.md"
+    assert refresh.owning_source(entries, str(outer)) == tmp_path / "docs"
+    assert refresh.owning_source(entries, str(tmp_path / "elsewhere" / "c.md")) is None

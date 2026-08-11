@@ -326,6 +326,54 @@ FORGET_SOURCE_LIMIT = 1_000_000
 VANISHED_PREVIEW = 10
 
 
+def _warn_if_refresh_will_undo_it(cfg: dict, deleted_paths: list[str]) -> None:
+    """After a forget, say so if the next refresh will simply put it back.
+
+    `forget` erases the chunks and the catalog row, but not the file. If that
+    file is still on disk under a configured source, the next `rag refresh`
+    finds it missing from `source_hashes()`, calls it NEW, and re-ingests it —
+    so a nightly task quietly reverses the one command the spec calls the
+    GDPR-shaped capability. There is no exclusion mechanism to hide behind, so
+    the honest thing is to say it at the moment the user is standing there.
+
+    Never raises: the deletes have already happened, and a config that cannot
+    be parsed must not turn a completed erasure into a traceback.
+    """
+    try:
+        from core import refresh as refresh_mod
+        entries = pipeline.configured_sources(cfg)
+        if not entries:
+            return
+        by_root: dict[str, int] = {}
+        for path in deleted_paths:
+            # Gone from disk means gone: refresh can only re-ingest what its
+            # walk can enumerate, so warning there would be noise on the
+            # ordinary case (delete the file, then forget it).
+            if not os.path.exists(path):
+                continue
+            owner = refresh_mod.owning_source(entries, path)
+            if owner is not None:
+                by_root[str(owner)] = by_root.get(str(owner), 0) + 1
+        if not by_root:
+            return
+        total = sum(by_root.values())
+        click.echo("", err=True)
+        click.echo(
+            f"warning: {total} of the file(s) you just forgot are still on disk "
+            "under a configured source:", err=True,
+        )
+        for root, n in sorted(by_root.items()):
+            click.echo(f"  {root}  ({n} file(s))", err=True)
+        click.echo(
+            "the next `rag refresh` will see them as new and will index them "
+            "again. To make this stick, remove that path from `sources:` in "
+            "config.yaml, or delete/move the files themselves.", err=True,
+        )
+    except Exception as e:  # pragma: no cover — defensive
+        log = logging.getLogger(__name__)
+        log.debug("forget: could not check the configured sources: %s", e)
+
+
 def _print_refresh_summary(plan, *, prune: bool, dry_run: bool) -> None:
     """One block per source: what moved, and anything that needs a human.
 
@@ -588,6 +636,7 @@ def forget(ctx, source_path, topic, yes):
         metadata.close()
 
     click.echo(f"forgot {len(targets)} source(s); removed {removed} chunk(s).")
+    _warn_if_refresh_will_undo_it(cfg, targets)
 
 
 # -----------------------------------------------------------------------------
