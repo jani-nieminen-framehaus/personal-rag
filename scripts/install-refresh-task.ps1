@@ -61,20 +61,31 @@ try {
 # empty, so check before promising the user a working schedule. Advisory only
 # — a probe that fails must not block the install.
 $SourceCount = $null
-$ProbeError  = $null
+$ProbeFailed = $false
+$PrevEap     = $ErrorActionPreference
 try {
+    # Advisory means advisory: nothing here may terminate the install, and
+    # nothing here may cry wolf over a config that is fine. Both were possible
+    # while stderr was merged in with 2>&1 — on Windows PowerShell 5.1 a native
+    # command writing to stderr under EAP=Stop raises NativeCommandError, and
+    # even on pwsh 7 a warning printed after the number becomes the "last line"
+    # parsed below. Stdout only, and EAP relaxed across the call.
+    $ErrorActionPreference = 'Continue'
     Push-Location $RepoRoot
     $probe = 'from core.pipeline import load_config, configured_sources; print(len(configured_sources(load_config())))'
-    $out = & $PythonExe -c $probe 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $SourceCount = [int](($out | Select-Object -Last 1) -as [string]).Trim()
+    $out  = & $PythonExe -c $probe 2>$null
+    $last = ($out | Select-Object -Last 1 | Out-String).Trim()
+    # A count, or nothing at all — never a guess at what other output meant.
+    if ($LASTEXITCODE -eq 0 -and $last -match '^\d+$') {
+        $SourceCount = [int]$last
     } else {
-        $ProbeError = ($out | Out-String).Trim()
+        $ProbeFailed = $true
     }
 } catch {
-    $ProbeError = $_.Exception.Message
+    $ProbeFailed = $true
 } finally {
     Pop-Location
+    $ErrorActionPreference = $PrevEap
 }
 
 # The action. Same shape as install-service.ps1: the venv interpreter, run
@@ -116,12 +127,13 @@ $Principal = New-ScheduledTaskPrincipal `
     -LogonType Interactive `
     -RunLevel Limited
 
-# Idempotence: remove any existing task of this name first, so a re-run is a
-# clean re-register rather than an update of whatever was there before.
+# Idempotence via -Force, exactly as install-service.ps1 does it: one atomic
+# replace. Unregistering first and then registering would open a window where
+# a failure between the two leaves the user with NO task instead of the one
+# they already had.
 $existing = Get-ScheduledTask -TaskName $RefreshTaskName -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "  replacing the existing '$RefreshTaskName' task" -ForegroundColor Gray
-    Unregister-ScheduledTask -TaskName $RefreshTaskName -Confirm:$false
 }
 
 try {
@@ -131,7 +143,8 @@ try {
         -Trigger $Trigger `
         -Settings $Settings `
         -Principal $Principal `
-        -Description $Description | Out-Null
+        -Description $Description `
+        -Force | Out-Null
 } catch {
     Write-Host "ERROR: failed to register scheduled task: $_" -ForegroundColor Red
     exit 1
@@ -160,10 +173,10 @@ if ($null -ne $SourceCount -and $SourceCount -eq 0) {
 } elseif ($null -ne $SourceCount) {
     Write-Host "  tracking $SourceCount configured source(s) from config.yaml" -ForegroundColor Gray
     Write-Host ""
-} elseif ($ProbeError) {
-    Write-Host "  WARNING: could not read the 'sources:' list from config.yaml —" -ForegroundColor Yellow
-    Write-Host "  the task will hit the same error. Fix it and check with 'rag refresh --dry-run':" -ForegroundColor Yellow
-    Write-Host "      $ProbeError" -ForegroundColor Gray
+} elseif ($ProbeFailed) {
+    Write-Host "  NOTE: could not read the 'sources:' list from config.yaml." -ForegroundColor Yellow
+    Write-Host "  If that is a real error the task will hit it too — check with:" -ForegroundColor Yellow
+    Write-Host "      rag refresh --dry-run" -ForegroundColor Gray
     Write-Host ""
 }
 
