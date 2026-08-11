@@ -8,9 +8,11 @@ Run from the repo root:
     python cli.py forget --topic photography      # drop it from the index
     python cli.py eval
 
-`refresh --prune` and `forget` are the only commands here that DELETE
-anything; both confirm first. Everything else adds or overwrites. Refresh
-works from the `sources:` list in config.yaml, not from its arguments.
+`refresh --prune` and `forget` are the only commands here that delete PART
+of the index. `ingest --recreate` deletes ALL of it — it drops the whole
+collection before re-ingesting. All three confirm first; nothing else
+deletes. Refresh works from the `sources:` list in config.yaml, not from
+its arguments.
 
 Also: `serve` / `start` / `status` / `url` / `open` / `tray` (the GUI),
 `stats` / `sources` / `citations` / `eval-runs` / `sessions` (the metadata

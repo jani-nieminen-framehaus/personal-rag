@@ -331,10 +331,14 @@ of ~50,000 pages moved.
 
 ### What deletes, and what doesn't
 
-**`rag refresh --prune` and `rag forget` are the only two commands in
-this system that delete anything.** Everything else only ever adds or
-overwrites. Both ask for confirmation first (`-y` skips it, for
-scripts).
+**`rag refresh --prune` and `rag forget` are the only two commands that
+delete *part* of the index** — selected rows, chosen deliberately. Both
+ask for confirmation first (`-y` skips it, for scripts).
+
+The one command that deletes *all* of it is **`rag ingest --recreate`**,
+which drops the whole collection before re-ingesting. It asks first too,
+naming the collection it is about to drop, and nothing in this README
+tells you to run it. Everything else only ever adds or overwrites.
 
 ```powershell
 rag refresh --dry-run --prune   # the paths it would remove, before you agree
@@ -342,8 +346,10 @@ rag forget --source D:\notes\old.md    # one file, by the path `rag sources` sho
 rag forget --topic photography         # everything filed under a topic
 ```
 
-`--dry-run` is the honest preview: it's the same code path as a real run
-with the last step removed, so what it prints is what would happen.
+`--dry-run` is the honest preview: the same code path as a real run with
+the last step removed. Read it as an upper bound — a real run deletes no
+more than it listed, and possibly fewer, because a source whose ingest
+fails that run is skipped by the prune.
 
 ### Why an unplugged drive can't wipe your index
 
