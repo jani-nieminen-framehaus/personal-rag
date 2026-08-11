@@ -86,6 +86,10 @@ def configured_sources(cfg: dict[str, Any]) -> list[dict[str, Any]]:
             raise ValueError(f"sources[{i}]: each entry must be a mapping of type + path")
         if "type" not in entry or "path" not in entry:
             raise ValueError(f"sources[{i}]: needs both 'type' and 'path'")
+        if not isinstance(entry["path"], str) or not entry["path"].strip():
+            raise ValueError(
+                f"sources[{i}]: 'path' must be a non-empty string; got {entry['path']!r}"
+            )
         if entry["type"] not in SOURCE_TYPES:
             raise ValueError(
                 f"sources[{i}]: unknown type {entry['type']!r}; "
