@@ -216,10 +216,11 @@ class MetadataStore:
         """Upsert a source row. Idempotent - re-ingesting the same file just
         refreshes chunk_count, content_hash, file_hash, and ingested_at.
 
-        `file_hash` is the exception: passing None leaves whatever is already
-        stored alone. It is the input `rag refresh` uses to decide whether a
-        file needs re-ingesting at all, so a caller that simply doesn't know
-        it must not be able to destroy it."""
+        `file_hash` is the exception: passing None - or "", which is what
+        `hash_file` returns for a file it could not read - leaves whatever is
+        already stored alone. It is the input `rag refresh` uses to decide
+        whether a file needs re-ingesting at all, so a caller that simply
+        doesn't know it must not be able to destroy it."""
         with self._lock:
             self._conn.execute(
                 """
@@ -231,12 +232,17 @@ class MetadataStore:
                     ingested_at  = excluded.ingested_at,
                     chunk_count  = excluded.chunk_count,
                     content_hash = excluded.content_hash,
-                    -- COALESCE, not `excluded.file_hash`: omitting the
-                    -- argument must PRESERVE a stored hash, not erase it.
-                    -- Otherwise any caller that doesn't hash (a plain
-                    -- `rag ingest`) nulls the hash `rag refresh` relies on,
-                    -- and the next refresh sees the file as changed again.
-                    file_hash    = COALESCE(excluded.file_hash, sources.file_hash)
+                    -- Not `excluded.file_hash`: omitting the argument must
+                    -- PRESERVE a stored hash, not erase it. Otherwise any
+                    -- caller that doesn't hash (a plain `rag ingest`) nulls
+                    -- the hash `rag refresh` relies on, and the next refresh
+                    -- sees the file as changed again.
+                    -- NULLIF as well as COALESCE, because hash_file returns
+                    -- "" for a file it cannot read and "" is not NULL: a
+                    -- transient read failure would otherwise overwrite a good
+                    -- hash with empty, and that file would then re-ingest on
+                    -- every single run.
+                    file_hash    = COALESCE(NULLIF(excluded.file_hash, ''), sources.file_hash)
                 """,
                 (source_path, doc_type, topic, _now_iso(), int(chunk_count), content_hash, file_hash),
             )
