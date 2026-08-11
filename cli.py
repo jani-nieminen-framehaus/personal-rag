@@ -1,9 +1,20 @@
-"""CLI: `rag ask` / `rag ingest` / `rag eval`.
+"""CLI: `rag ask` / `rag ingest` / `rag refresh` / `rag eval`.
 
 Run from the repo root:
     python cli.py ask "What is exposure compensation?"
-    python cli.py ingest --markdown ./samples
+    python cli.py ingest --markdown ./samples     # one-off ingest
+    python cli.py refresh                         # re-ingest only what changed
+    python cli.py refresh --dry-run               # ...or just say what would
+    python cli.py forget --topic photography      # drop it from the index
     python cli.py eval
+
+`refresh --prune` and `forget` are the only commands here that DELETE
+anything; both confirm first. Everything else adds or overwrites. Refresh
+works from the `sources:` list in config.yaml, not from its arguments.
+
+Also: `serve` / `start` / `status` / `url` / `open` / `tray` (the GUI),
+`stats` / `sources` / `citations` / `eval-runs` / `sessions` (the metadata
+catalog), and the `golden` group (generate / review / stats) for the eval set.
 
 Click is the only third-party dep. No TUI, no GUI — terminal-first per spec.
 """
