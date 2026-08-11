@@ -193,17 +193,16 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
         )
 
     if zeal_path:
-        # Resolved through refresh's own constant and its `or`-style fallback,
-        # not a second copy of the default. `.get(key, default)` returns None
-        # for a key that is PRESENT BUT NULL — `sqlite_filename:` with nothing
-        # after it — where refresh's `or` returns the default. The two spellings
-        # therefore disagreed on which file a docset is identified by: the
-        # ingest crashed on `Path / None` before it could write the marker,
-        # while refresh went on hashing docSet.dsidx. One resolution, one
-        # answer, and the marker below is keyed by the file refresh hashes.
+        # Resolved through refresh's own helpers, not a second copy of the
+        # fallback. `.get(key, default)` returns None for a key that is PRESENT
+        # BUT NULL — `sqlite_filename:` with nothing after it — where the
+        # helper's `or` returns the default. The two spellings therefore
+        # disagreed on which file a docset is identified by: the ingest crashed
+        # on `Path / None` before it could write the marker, while refresh went
+        # on hashing docSet.dsidx. One resolution, one answer, and the marker
+        # below is keyed by the file refresh hashes.
         from core import refresh as refresh_mod
-        zeal_cfg = ing.get("zeal") or {}
-        zeal_index_name = zeal_cfg.get("sqlite_filename") or refresh_mod.DEFAULT_ZEAL_INDEX
+        zeal_index_name = refresh_mod.zeal_index_name(cfg)
         zi = ZealIngester(
             docset_path=zeal_path,
             target_tokens=cp["target_tokens"],
@@ -211,7 +210,7 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
             min_chunk_tokens=cp["min_chunk_tokens"],
             default_topic=cp["default_topic"],
             sqlite_filename=zeal_index_name,
-            pages_dirname=zeal_cfg.get("pages_dirname", "Contents/Resources/Documents"),
+            pages_dirname=refresh_mod.zeal_pages_dirname(cfg),
         )
         click.echo(f"ingesting zeal docset at {zeal_path} …")
         # For Zeal we don't recreate on the second source — only the first call

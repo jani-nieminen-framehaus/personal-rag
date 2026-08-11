@@ -455,6 +455,29 @@ def test_zeal_marker_survives_a_present_but_null_sqlite_filename(tmp_path, monke
     assert idx in recorded, recorded
 
 
+def test_zeal_ingest_survives_a_present_but_null_pages_dirname(tmp_path, monkeypatch):
+    """The sibling hazard to the one above, one line further down in cli.py: a
+    present-but-null `pages_dirname:` reached `ZealIngester` as None and blew up
+    on `docset_root / None` before a single page was read. Both keys now resolve
+    through the same helpers refresh uses."""
+    docset = tmp_path / "Test.docset"
+    docset.mkdir()
+    _make_fake_docset(docset)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "chunking:\n  target_tokens: 768\n  overlap_pct: 12\n  min_chunk_tokens: 8\n"
+        "ingest:\n  default_topic: t\n  zeal:\n    sqlite_filename:\n    pages_dirname:\n",
+        encoding="utf-8",
+    )
+
+    cli_mod = _patch(monkeypatch, metadata=MagicMock())
+    monkeypatch.setattr(cli_mod, "ingest_pipeline", lambda *a, **k: 4)
+
+    res = CliRunner().invoke(
+        cli_mod.cli, ["-c", str(cfg), "ingest", "--zeal", str(docset)])
+    assert res.exit_code == 0, res.output
+
+
 def test_zeal_marker_is_not_written_when_the_ingest_fails(tmp_path, monkeypatch):
     """A marker over a half-written docset would make the next refresh call it
     unchanged."""

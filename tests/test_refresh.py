@@ -374,6 +374,32 @@ def test_zeal_page_rows_are_never_reported_vanished(tmp_path):
     assert plan.sources[0].vanished == []
 
 
+def test_present_but_null_zeal_keys_resolve_to_the_defaults(tmp_path):
+    """`sqlite_filename:` with nothing after it is a PRESENT key whose value is
+    None, not a missing key — so `.get(key, default)` hands None straight to the
+    ingester, which does `Path / None` and raises TypeError.
+
+    The planner resolved it fine (`... or DEFAULT`) while the engine's own
+    re-ingest path crashed on the same config. One resolution, one answer."""
+    docset = tmp_path / "Test.docset"
+    docset.mkdir()
+    _make_fake_docset(docset)
+    cfg = _cfg(docset, stype="zeal")
+    cfg["ingest"]["zeal"] = {"sqlite_filename": None, "pages_dirname": None}
+
+    assert refresh.zeal_index_name(cfg) == refresh.DEFAULT_ZEAL_INDEX
+    assert refresh.zeal_pages_dirname(cfg) == refresh.DEFAULT_ZEAL_PAGES
+
+    plan = refresh.plan_refresh(cfg, _meta({}))
+    assert plan.sources[0].root_missing is False
+    # The re-ingest path — where the crash was.
+    ingester = refresh._make_ingester(plan.sources[0], cfg, set())
+    assert ingester.sqlite_path == (
+        Path(docset).resolve() / "Contents" / "Resources" / refresh.DEFAULT_ZEAL_INDEX
+    )
+    assert ingester.pages_root == Path(docset).resolve() / refresh.DEFAULT_ZEAL_PAGES
+
+
 def test_a_missing_docset_is_a_missing_root(tmp_path):
     cfg = {"sources": [{"type": "zeal", "path": str(tmp_path / "Gone.docset")}]}
     plan = refresh.plan_refresh(cfg, _meta({str(tmp_path / "Gone.docset" / "p.html"): "abc"}))

@@ -77,6 +77,7 @@ SUFFIXES: dict[str, set[str]] = {
 }
 
 DEFAULT_ZEAL_INDEX = "docSet.dsidx"
+DEFAULT_ZEAL_PAGES = "Contents/Resources/Documents"
 
 # doc_type of the marker row a refreshed docset leaves behind. See
 # `record_zeal_marker` for why the marker has to exist at all.
@@ -210,11 +211,35 @@ def _zeal_index(docset_root: Path, sqlite_filename: str = DEFAULT_ZEAL_INDEX) ->
     return Path(docset_root) / "Contents" / "Resources" / sqlite_filename
 
 
-def _zeal_index_name(cfg: dict[str, Any]) -> str:
+def _zeal_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The `ingest.zeal` block, or an empty one. Every level uses `or`, not
+    `.get(k, {})`: a section written as `zeal:` with nothing under it is a
+    PRESENT key holding None, and `.get` hands that straight back."""
+    return (cfg.get("ingest") or {}).get("zeal") or {}
+
+
+def zeal_index_name(cfg: dict[str, Any]) -> str:
     """`ingest.zeal.sqlite_filename`, so the plan hashes the same file the
-    ingester will open."""
-    zeal_cfg = ((cfg.get("ingest") or {}).get("zeal") or {})
-    return zeal_cfg.get("sqlite_filename") or DEFAULT_ZEAL_INDEX
+    ingester will open.
+
+    Public, and the ONLY place this key is resolved — `cli.py` calls it too.
+    A second spelling of the same fallback is not a duplicate constant, it is a
+    second opinion: `.get(key, DEFAULT)` returns None for `sqlite_filename:`
+    written with nothing after it, where this returns the default. The two
+    disagreed on which file a docset is identified by, so the ingest crashed on
+    `Path / None` while the planner beside it went on hashing docSet.dsidx.
+    """
+    return _zeal_cfg(cfg).get("sqlite_filename") or DEFAULT_ZEAL_INDEX
+
+
+def zeal_pages_dirname(cfg: dict[str, Any]) -> str:
+    """`ingest.zeal.pages_dirname` — where a docset keeps its HTML.
+
+    Same null-safety as `zeal_index_name`, for the same reason: this value is
+    joined onto the docset root, and None makes that a TypeError rather than a
+    fallback.
+    """
+    return _zeal_cfg(cfg).get("pages_dirname") or DEFAULT_ZEAL_PAGES
 
 
 def _docset_topic(docset_root: Path) -> str:
@@ -287,7 +312,7 @@ def _plan_one(
     entry: dict[str, Any],
     indexed: dict[str, tuple[str, str | None]],
     owned: dict[str, tuple[str, str | None]],
-    zeal_index_name: str = DEFAULT_ZEAL_INDEX,
+    index_name: str = DEFAULT_ZEAL_INDEX,
 ) -> SourcePlan:
     """Classify one configured source. Reads only; never writes.
 
@@ -301,7 +326,7 @@ def _plan_one(
     plan = SourcePlan(type=stype, path=root)
 
     if stype == "zeal":
-        index_file = _zeal_index(root, zeal_index_name)
+        index_file = _zeal_index(root, index_name)
         # A docset without its index is as unusable as one that is not there:
         # treat both as "unknown", so neither ingests nor prunes.
         if not root.is_dir() or not index_file.is_file():
@@ -382,10 +407,10 @@ def plan_refresh(cfg: dict[str, Any], metadata: MetadataStore) -> RefreshPlan:
     entries = configured_sources(cfg)
     indexed = _index_recorded(metadata.source_hashes())
     owned = _assign_owners([_norm(e["path"]) for e in entries], indexed)
-    zeal_index_name = _zeal_index_name(cfg)
+    index_name = zeal_index_name(cfg)
     return RefreshPlan(
         sources=[
-            _plan_one(entry, indexed, own, zeal_index_name)
+            _plan_one(entry, indexed, own, index_name)
             for entry, own in zip(entries, owned)
         ]
     )
@@ -445,7 +470,10 @@ def _make_ingester(plan: SourcePlan, cfg: dict[str, Any], only_paths: set[Path])
 
     if plan.type == "zeal":
         from ingest.zeal_docsets import ZealIngester
-        zeal_cfg = ing_cfg.get("zeal") or {}
+        # Through the helpers, like `plan_refresh`. This line used to spell the
+        # fallback itself with `.get(key, DEFAULT)`, so the engine's own
+        # re-ingest path raised TypeError on a present-but-null value that the
+        # planner ten lines away resolved fine.
         # No only_paths: the docset is one unit.
         return ZealIngester(
             docset_path=plan.path,
@@ -453,8 +481,8 @@ def _make_ingester(plan: SourcePlan, cfg: dict[str, Any], only_paths: set[Path])
             overlap_pct=cp["overlap_pct"],
             min_chunk_tokens=cp["min_chunk_tokens"],
             default_topic=cp["default_topic"],
-            sqlite_filename=zeal_cfg.get("sqlite_filename", DEFAULT_ZEAL_INDEX),
-            pages_dirname=zeal_cfg.get("pages_dirname", "Contents/Resources/Documents"),
+            sqlite_filename=zeal_index_name(cfg),
+            pages_dirname=zeal_pages_dirname(cfg),
         )
 
     raise ValueError(f"refresh: no ingester for source type {plan.type!r}")
@@ -466,7 +494,7 @@ def _refresh_one(
     metadata: MetadataStore,
     store: Any,
     embedder: Any,
-    zeal_index_name: str,
+    index_name: str,
 ) -> None:
     """Re-ingest one source's new and changed files. Raises on failure."""
     # A changed file's OLD chunks have to go first. chunk_id is deterministic
@@ -487,7 +515,7 @@ def _refresh_one(
         source.unchanged, written,
     )
     if source.type == "zeal":
-        record_zeal_marker(metadata, source.path, zeal_index_name)
+        record_zeal_marker(metadata, source.path, index_name)
 
 
 def _mark_for_reingest(metadata: MetadataStore, source: SourcePlan) -> None:
@@ -560,7 +588,7 @@ def run_refresh(
         )
         return plan
 
-    zeal_index_name = _zeal_index_name(cfg)
+    index_name = zeal_index_name(cfg)
     embedder = None
     touched = False
 
@@ -575,7 +603,7 @@ def run_refresh(
             # means the corpus moved.
             touched = True
             try:
-                _refresh_one(source, cfg, metadata, store, embedder, zeal_index_name)
+                _refresh_one(source, cfg, metadata, store, embedder, index_name)
             except Exception as e:
                 source.error = f"{type(e).__name__}: {e}"
                 log.error(
