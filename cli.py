@@ -9,10 +9,13 @@ Run from the repo root:
     python cli.py eval
 
 `refresh --prune` and `forget` are the only commands here that delete PART
-of the index. `ingest --recreate` deletes ALL of it — it drops the whole
-collection before re-ingesting. All three confirm first; nothing else
-deletes. Refresh works from the `sources:` list in config.yaml, not from
-its arguments.
+of the index on purpose. `ingest --recreate` deletes ALL of it — it drops
+the whole collection before re-ingesting, and empties the source catalog
+with it. All three confirm first. A plain `refresh` removes exactly one
+thing: a CHANGED file's old chunks, replaced by the re-ingested ones — and
+if that one file's ingest fails it can be left short in the index until the
+next successful run. Refresh works from the `sources:` list in config.yaml,
+not from its arguments.
 
 Also: `serve` / `start` / `status` / `url` / `open` / `tray` (the GUI),
 `stats` / `sources` / `citations` / `eval-runs` / `sessions` (the metadata

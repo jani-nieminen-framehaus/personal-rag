@@ -2,8 +2,9 @@
 # install-refresh-task.ps1 — schedule `rag refresh` so the index keeps itself
 # current without you remembering to do it.
 #
-# Idempotent: any existing task of this name is removed first, so re-running
-# with a different -At just moves the schedule.
+# Idempotent: registering with -Force replaces any existing task of this name
+# in one atomic step, so re-running with a different -At just moves the
+# schedule.
 #
 # What gets scheduled:
 #     <repo>\.venv\Scripts\python.exe -m cli refresh
@@ -13,10 +14,18 @@
 # costs a directory walk and one SHA-256 per file — no embedding model is
 # loaded — so a nightly run over a quiet corpus is milliseconds and no VRAM.
 #
-# IT NEVER DELETES. `--prune` (drop index entries whose file is gone from
-# disk) is deliberately NOT scheduled: it is the one irreversible thing here
-# and it asks for confirmation. Run it by hand when you want it, after
-# `rag refresh --dry-run` has shown you exactly what it would remove.
+# WHAT IT CAN REMOVE, honestly: a CHANGED file's old chunks. Refresh deletes
+# them and replaces them with the re-ingested ones, because chunk ids are
+# positional and the leftovers would otherwise keep answering queries with
+# text you deleted. If that one file's ingest fails, or the run is killed
+# mid-way, that file can be left short in the index until the next successful
+# refresh — which retries it, and says so in the log. No other file is
+# touched: one file failing costs one file.
+#
+# `--prune` (drop index entries whose file is gone from disk) is deliberately
+# NOT scheduled: it is the one irreversible thing here and it asks for
+# confirmation. Run it by hand when you want it, after `rag refresh --dry-run`
+# has shown you exactly what it would remove.
 #
 # Remove the schedule with scripts\uninstall-refresh-task.ps1.
 # =============================================================================
@@ -31,7 +40,7 @@ $ErrorActionPreference = 'Stop'
 # Shared constants ($RefreshTaskName etc.). Python mirror: service_state.py.
 . (Join-Path $PSScriptRoot '_config.ps1')
 
-$Description = 'rag: re-ingest changed files into the index. Never deletes — --prune stays manual.'
+$Description = 'rag: re-ingest changed files into the index, replacing their old chunks. --prune stays manual.'
 $RepoRoot    = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $PythonExe   = Join-Path $RepoRoot '.venv\Scripts\python.exe'
 $VenvDir     = Join-Path $RepoRoot '.venv'
@@ -159,7 +168,8 @@ Write-Host "  working dir : $RepoRoot"
 Write-Host ("  trigger     : daily at {0}" -f $RunAt.ToString('HH:mm'))
 Write-Host "  run level   : Limited (not elevated — it does not need to be)"
 Write-Host ""
-Write-Host "  it re-ingests only what changed. it never deletes:" -ForegroundColor Gray
+Write-Host "  it re-ingests only what changed, replacing that file's old chunks." -ForegroundColor Gray
+Write-Host "  an interrupted run can leave that one file short until the next refresh." -ForegroundColor Gray
 Write-Host "    --prune is NOT scheduled; run it by hand after --dry-run" -ForegroundColor Gray
 Write-Host ""
 

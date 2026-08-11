@@ -338,7 +338,19 @@ ask for confirmation first (`-y` skips it, for scripts).
 The one command that deletes *all* of it is **`rag ingest --recreate`**,
 which drops the whole collection before re-ingesting. It asks first too,
 naming the collection it is about to drop, and nothing in this README
-tells you to run it. Everything else only ever adds or overwrites.
+tells you to run it. Because the collection is gone, it also empties the
+`sources` catalog — those rows would otherwise claim chunks that no
+longer exist, and the next `rag refresh` would believe them and report
+the index up to date. Sources you didn't name on that command line are
+re-ingested by the next refresh.
+
+A plain `rag refresh` removes one thing, and it's worth knowing which: a
+**changed** file's old chunks, deleted and replaced by the re-ingested
+ones (chunk ids are positional, so the leftovers would keep answering
+queries with text you deleted). If that file's ingest fails, or the run
+is killed part-way, that one file can be left short in the index until
+the next successful refresh — which retries it, and names it in the
+summary. One file failing costs one file; its neighbours are untouched.
 
 ```powershell
 rag refresh --dry-run --prune   # the paths it would remove, before you agree

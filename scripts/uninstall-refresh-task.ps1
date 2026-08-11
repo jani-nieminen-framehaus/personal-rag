@@ -2,9 +2,11 @@
 # uninstall-refresh-task.ps1 — remove the nightly `rag refresh` scheduled task.
 #
 # Removes the SCHEDULE only. Nothing is deleted from the index or the metadata
-# DB: `rag refresh` never deleted anything without --prune in the first place,
-# and stopping it just means the index stops keeping itself current. Bring it
-# back with scripts\install-refresh-task.ps1.
+# DB here, and stopping the task just means the index stops keeping itself
+# current. (What a refresh itself removes is one changed file's old chunks,
+# replaced by the re-ingested ones; --prune, which removes entries for files
+# gone from disk, was never scheduled.) Bring it back with
+# scripts\install-refresh-task.ps1.
 # =============================================================================
 
 $ErrorActionPreference = 'Stop'
