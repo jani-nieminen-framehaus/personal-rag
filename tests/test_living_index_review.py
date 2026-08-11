@@ -192,3 +192,91 @@ def test_recreate_naming_one_source_leaves_work_for_the_others(tmp_path, meta_st
     plan = refresh.plan_refresh(cfg, meta_store, store)
     assert plan.has_work is True, "refresh called a stranded index up to date"
     assert plan.sources[1].new == [b]
+
+
+# -----------------------------------------------------------------------------
+# IMPORTANT — poison-file amplification, on the unattended path
+#
+# `_refresh_one` deleted every changed file's chunks before ingesting any of
+# them, so one repeatably-failing file deleted every OTHER changed file in the
+# source and did not restore them. `_mark_for_reingest` then cleared their
+# hashes, so the next nightly run deleted them again. A permanently poisoned
+# file made the hole permanent.
+# -----------------------------------------------------------------------------
+
+class _PoisonStore(_MemStore):
+    """A store that refuses any upsert carrying chunks from a named file.
+
+    Stands in for an outsized document that OOMs the embedder or a write the
+    backend rejects: the file fails the same way on every single run, which is
+    what turns a one-run hole into a permanent one.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.poison: set[str] = set()
+
+    def upsert_chunks(self, chunks, vectors):
+        if any(c.source_path in self.poison for c in chunks):
+            raise RuntimeError("that file OOMs the embedder")
+        return super().upsert_chunks(chunks, vectors)
+
+
+def _poisoned(tmp_path, meta_store):
+    """Two indexed markdown files, then one of them turns poisonous and both
+    are edited — the state a nightly refresh walks into."""
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    good = _md(notes, "good.md", "gamma " * 60)
+    bad = _md(notes, "bad.md", "delta " * 60)
+    cfg = _cfg(notes)
+    store = _PoisonStore()
+
+    refresh.run_refresh(cfg, meta_store, store=store, embedder_factory=_TinyEmbedder)
+    assert any(c.source_path == str(good) for c in store.points.values())
+
+    store.poison = {str(bad)}
+    good.write_text("# good.md\n\n" + "epsilon " * 60 + "\n", encoding="utf-8")
+    bad.write_text("# bad.md\n\n" + "zeta " * 60 + "\n", encoding="utf-8")
+    return cfg, store, good, bad
+
+
+def test_one_poison_file_does_not_take_its_siblings_with_it(tmp_path, meta_store):
+    cfg, store, good, bad = _poisoned(tmp_path, meta_store)
+
+    plan = refresh.run_refresh(cfg, meta_store, store=store,
+                               embedder_factory=_TinyEmbedder)
+
+    assert plan.sources[0].error, "the run still has to report the failure"
+    surviving = {c.source_path for c in store.points.values()}
+    assert str(good) in surviving, "the healthy sibling was deleted and not restored"
+    assert any("epsilon" in c.text for c in store.points.values()), \
+        "and it holds the NEW content, not a stale copy"
+
+
+def test_a_poison_file_does_not_clear_a_healthy_siblings_hash(tmp_path, meta_store):
+    """Otherwise the next run deletes and re-embeds the sibling all over
+    again — every night, forever, for a file that is perfectly fine."""
+    cfg, store, good, bad = _poisoned(tmp_path, meta_store)
+
+    refresh.run_refresh(cfg, meta_store, store=store, embedder_factory=_TinyEmbedder)
+
+    hashes = meta_store.source_hashes()
+    assert hashes[str(good)] == hash_file(good), "the healthy file's hash was cleared"
+    replan = refresh.plan_refresh(cfg, meta_store, store)
+    assert replan.sources[0].changed == [bad]
+    assert replan.sources[0].unchanged == 1
+
+
+def test_the_failure_is_still_reported_against_the_source(tmp_path, meta_store):
+    """Per-file isolation must not quietly swallow the failure: the scheduled
+    task's exit code is the only thing the operator sees."""
+    cfg, store, good, bad = _poisoned(tmp_path, meta_store)
+
+    plan = refresh.run_refresh(cfg, meta_store, store=store,
+                               embedder_factory=_TinyEmbedder)
+
+    assert plan.has_errors is True
+    assert "OOMs the embedder" in (plan.sources[0].error or "")
+    assert str(bad) in (plan.sources[0].error or ""), \
+        "and it names the file, which is the whole point of isolating them"

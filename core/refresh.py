@@ -536,6 +536,29 @@ def _make_ingester(plan: SourcePlan, cfg: dict[str, Any], only_paths: set[Path])
     raise ValueError(f"refresh: no ingester for source type {plan.type!r}")
 
 
+class SourceRefreshError(Exception):
+    """One or more of a source's files failed to re-ingest.
+
+    Carries the paths that actually failed, so the hash-clearing that follows
+    forgets only those. Clearing a healthy sibling's hash would make the next
+    run delete and re-embed a perfectly good file — every night, for as long
+    as the poison file sits beside it.
+    """
+
+    def __init__(self, message: str, failed_paths: list[Path]):
+        super().__init__(message)
+        self.failed_paths = list(failed_paths)
+
+
+def _describe_failures(failures: list[tuple[Path, Exception]]) -> str:
+    """One line an operator can act on: what broke, and on which file."""
+    path, error = failures[0]
+    text = f"{type(error).__name__}: {error} ({path})"
+    if len(failures) > 1:
+        text += f" — and {len(failures) - 1} more file(s) failed"
+    return text
+
+
 def _refresh_one(
     source: SourcePlan,
     cfg: dict[str, Any],
@@ -544,29 +567,91 @@ def _refresh_one(
     embedder: Any,
     index_name: str,
 ) -> None:
-    """Re-ingest one source's new and changed files. Raises on failure."""
-    # A changed file's OLD chunks have to go first. chunk_id is deterministic
-    # on position, so re-ingesting overwrites same-position chunks but orphans
-    # every chunk whose heading was renamed or whose index no longer exists
-    # once the file shrank — and nothing ever prunes those, so deleted text
-    # stays queryable and keeps coming back in citations. Only `changed` needs
-    # this; a `new` path has nothing to delete.
-    if source.type != "zeal":
-        for path in source.changed:
-            store.delete_by_source(str(path))
+    """Re-ingest one source's new and changed files.
 
-    ingester = _make_ingester(source, cfg, set(source.new) | set(source.changed))
-    written = ingest_pipeline(ingester, embedder, store, metadata=metadata)
-    log.info(
-        "refresh: %s %s — %d new, %d changed, %d unchanged, %s chunks written",
-        source.type, source.path, len(source.new), len(source.changed),
-        source.unchanged, written,
-    )
+    Raises `SourceRefreshError` if any file failed, naming them.
+    """
     if source.type == "zeal":
+        # A docset is one unit — there is nothing to isolate, and its pages are
+        # not tracked individually.
+        written = ingest_pipeline(
+            _make_ingester(source, cfg, set()), embedder, store, metadata=metadata,
+        )
+        log.info(
+            "refresh: zeal %s — %d chunks written", source.path, written,
+        )
         record_zeal_marker(metadata, source.path, index_name)
+        return
+
+    written = 0
+    failures: list[tuple[Path, Exception]] = []
+
+    # One delete+ingest PER CHANGED FILE, not one delete of everything followed
+    # by one ingest of everything.
+    #
+    # A changed file's OLD chunks have to go first: chunk_id is deterministic on
+    # position, so re-ingesting overwrites same-position chunks but orphans
+    # every chunk whose heading was renamed or whose index no longer exists once
+    # the file shrank, and nothing ever prunes those. But deleting the whole
+    # batch up front meant one repeatably-failing file — an outsized document
+    # that OOMs the embedder, a write the backend rejects — deleted every OTHER
+    # changed file in the source and never put them back. The next run cleared
+    # their hashes, deleted them again, failed again. Nightly, unattended, with
+    # no flag and no confirmation: a permanently poisoned file made the hole
+    # permanent and spread it.
+    #
+    # Per file, a failure costs that file and nothing else. The loop continues
+    # past a failure so a poison file cannot shadow the files listed after it
+    # either. (The fuller remedy — a generation tag in the payload, or
+    # delete-after-success — is a follow-up; this is the containment.)
+    for path in source.changed:
+        try:
+            store.delete_by_source(str(path))
+            written += ingest_pipeline(
+                _make_ingester(source, cfg, {path}), embedder, store,
+                metadata=metadata,
+            )
+        except Exception as e:
+            failures.append((path, e))
+            log.error(
+                "refresh: %s failed — %s: %s (the other files under %s are "
+                "unaffected)", path, type(e).__name__, e, source.path,
+            )
+
+    # `new` files stay in ONE batch. They have nothing to delete, so a failure
+    # there can only cost the ingest itself — never chunks that were already
+    # in the index — and splitting them would cost a first full ingest of a
+    # library its embed batching and a store round trip per file.
+    if source.new:
+        try:
+            written += ingest_pipeline(
+                _make_ingester(source, cfg, set(source.new)), embedder, store,
+                metadata=metadata,
+            )
+        except Exception as e:
+            failures.extend((p, e) for p in source.new)
+            log.error(
+                "refresh: the new files under %s failed — %s: %s",
+                source.path, type(e).__name__, e,
+            )
+
+    log.info(
+        "refresh: %s %s — %d new, %d changed, %d unchanged, %d failed, "
+        "%s chunks written",
+        source.type, source.path, len(source.new), len(source.changed),
+        source.unchanged, len(failures), written,
+    )
+    if failures:
+        raise SourceRefreshError(
+            _describe_failures(failures), [p for p, _e in failures],
+        )
 
 
-def _mark_for_reingest(metadata: MetadataStore, source: SourcePlan) -> None:
+def _mark_for_reingest(
+    metadata: MetadataStore,
+    source: SourcePlan,
+    failed_paths: list[Path] | None = None,
+) -> None:
     """After a failed ingest, forget the hashes of every file it touched.
 
     `pipeline.ingest` appends to its `sources` accumulator only once a batch
@@ -585,10 +670,19 @@ def _mark_for_reingest(metadata: MetadataStore, source: SourcePlan) -> None:
     Both `changed` and `new` need it: a new file has no row until the ingest
     writes one, and a partial ingest writes exactly the same bad row.
 
+    `failed_paths` narrows it to the files that actually failed, which is what
+    per-file isolation makes knowable: a sibling that re-ingested cleanly keeps
+    its hash, or the next run would delete and re-embed a healthy file for as
+    long as the poison file sits beside it. None means "the whole source" — the
+    honest answer when the failure was not attributable to one file (a docset,
+    an ingester that could not be constructed at all).
+
     Never raises — it runs inside an except handler and must not mask the
     original failure.
     """
-    paths = [str(p) for p in source.new + source.changed]
+    if failed_paths is None:
+        failed_paths = source.new + source.changed
+    paths = [str(p) for p in failed_paths]
     if not paths:
         return
     try:
@@ -653,7 +747,10 @@ def run_refresh(
             try:
                 _refresh_one(source, cfg, metadata, store, embedder, index_name)
             except Exception as e:
-                source.error = f"{type(e).__name__}: {e}"
+                source.error = (
+                    str(e) if isinstance(e, SourceRefreshError)
+                    else f"{type(e).__name__}: {e}"
+                )
                 log.error(
                     "refresh: %s %s failed — %s (continuing with the "
                     "remaining sources)", source.type, source.path, source.error,
@@ -661,8 +758,11 @@ def run_refresh(
                 # The ingest may have written a row claiming the new hash for
                 # content that is only partly indexed — and whose old chunks
                 # this run already deleted. Forget the hash so the next run
-                # rebuilds these files instead of calling them unchanged.
-                _mark_for_reingest(metadata, source)
+                # rebuilds these files instead of calling them unchanged. Only
+                # the files that actually failed: see `_mark_for_reingest`.
+                _mark_for_reingest(
+                    metadata, source, getattr(e, "failed_paths", None),
+                )
 
         if prune:
             for source in plan.sources:
