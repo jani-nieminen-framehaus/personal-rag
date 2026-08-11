@@ -490,6 +490,46 @@ def _refresh_one(
         record_zeal_marker(metadata, source.path, zeal_index_name)
 
 
+def _mark_for_reingest(metadata: MetadataStore, source: SourcePlan) -> None:
+    """After a failed ingest, forget the hashes of every file it touched.
+
+    `pipeline.ingest` appends to its `sources` accumulator only once a batch
+    has been upserted, and its abort path records those sources before
+    re-raising — with `hash_file` of the WHOLE file. So a file large enough to
+    span more than one embed batch ends up with a row claiming the new hash
+    while only the first batch is in the index. Every later refresh then reads
+    it as unchanged and never revisits it.
+
+    That non-convergence predates delete-before-reingest; what that ordering
+    changed is the consequence. The file's old chunks are already gone by then,
+    so the un-indexed tail is not stale, it is missing. The run does say so at
+    the time via `SourcePlan.error`, but nothing would ever go back and fix it.
+
+    Clearing the hash makes the next refresh treat these files as changed.
+    Both `changed` and `new` need it: a new file has no row until the ingest
+    writes one, and a partial ingest writes exactly the same bad row.
+
+    Never raises — it runs inside an except handler and must not mask the
+    original failure.
+    """
+    paths = [str(p) for p in source.new + source.changed]
+    if not paths:
+        return
+    try:
+        cleared = metadata.clear_file_hashes(paths)
+    except Exception as e:  # pragma: no cover — defensive
+        log.error(
+            "refresh: could not clear file hashes under %s (%s) — those files "
+            "may read as unchanged next run", source.path, e,
+        )
+        return
+    if cleared:
+        log.warning(
+            "refresh: cleared %d file hash(es) under %s so the next run "
+            "re-ingests them from scratch", cleared, source.path,
+        )
+
+
 def run_refresh(
     cfg: dict[str, Any],
     metadata: MetadataStore,
@@ -542,6 +582,11 @@ def run_refresh(
                     "refresh: %s %s failed — %s (continuing with the "
                     "remaining sources)", source.type, source.path, source.error,
                 )
+                # The ingest may have written a row claiming the new hash for
+                # content that is only partly indexed — and whose old chunks
+                # this run already deleted. Forget the hash so the next run
+                # rebuilds these files instead of calling them unchanged.
+                _mark_for_reingest(metadata, source)
 
         if prune:
             for source in plan.sources:

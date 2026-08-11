@@ -247,6 +247,41 @@ class MetadataStore:
                 (source_path, doc_type, topic, _now_iso(), int(chunk_count), content_hash, file_hash),
             )
 
+    # SQLite's parameter limit is 999 on builds older than 3.32. A refresh of
+    # a large source can exceed that, so the IN clause is batched.
+    _CLEAR_BATCH = 500
+
+    def clear_file_hashes(self, source_paths: Iterable[str]) -> int:
+        """Set file_hash back to NULL for these rows, so the next refresh
+        treats them as changed. Returns the number of rows updated.
+
+        Used when an ingest fails part-way. `pipeline.ingest` records every
+        source it managed to write before aborting, with the hash of the WHOLE
+        file - so a file big enough to span more than one embed batch ends up
+        with a row claiming the new hash while only the first batch is
+        indexed. Left alone, every later refresh calls that file unchanged and
+        never revisits it, and the un-indexed tail is silently lost.
+
+        `record_source(file_hash="")` cannot do this: the upsert deliberately
+        PRESERVES a stored hash when the caller passes None or "", so that a
+        transient read failure cannot erase a good one. Clearing has to be an
+        explicit, separate act.
+        """
+        paths = [str(p) for p in source_paths]
+        if not paths:
+            return 0
+        total = 0
+        with self._lock:
+            for i in range(0, len(paths), self._CLEAR_BATCH):
+                batch = paths[i:i + self._CLEAR_BATCH]
+                cur = self._conn.execute(
+                    "UPDATE sources SET file_hash = NULL WHERE source_path IN "
+                    f"({','.join('?' * len(batch))})",
+                    batch,
+                )
+                total += cur.rowcount
+        return total
+
     def record_citations(
         self,
         query: str,

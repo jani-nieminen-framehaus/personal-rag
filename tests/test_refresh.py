@@ -624,3 +624,149 @@ def test_record_zeal_marker_is_public_for_task_6(tmp_path, meta_store):
     rows = {r["source_path"]: r for r in meta_store.get_sources()}
     assert rows[str(idx)]["file_hash"] == hash_file(idx)
     assert rows[str(idx)]["doc_type"] == refresh.ZEAL_MARKER_DOC_TYPE
+
+
+# -- review round 2: a failed ingest must not leave a file "unchanged" ---------
+#
+# pipeline.ingest appends to its `sources` accumulator only after a batch is
+# upserted, and its abort path records those sources before re-raising - with
+# the hash of the WHOLE file. So a file spanning more than one embed batch can
+# end up with a row claiming the new hash while only the first batch is
+# indexed. Every later refresh then reads it as unchanged. Since refresh now
+# deletes a changed file's old chunks first, the un-indexed tail is not stale,
+# it is gone.
+
+
+class _SmallBatchEmbedder(_TinyEmbedder):
+    """Flushes every 2 chunks, so a handful of chunks spans several batches."""
+    batch_size = 2
+
+
+class _FlakyStore(_MemStore):
+    """Fails the (fail_after + 1)-th upsert, i.e. part-way through a source."""
+
+    def __init__(self):
+        super().__init__()
+        self.upserts = 0
+        self.fail_after: int | None = None
+
+    def arm(self, fail_after: int) -> None:
+        self.upserts = 0
+        self.fail_after = fail_after
+
+    def upsert_chunks(self, chunks, vectors):
+        self.upserts += 1
+        if self.fail_after is not None and self.upserts > self.fail_after:
+            raise RuntimeError("qdrant went away mid-ingest")
+        return super().upsert_chunks(chunks, vectors)
+
+
+def _many_sections(name, marker):
+    body = " ".join([marker] * 60)
+    return ("# Top\n\n" + body + "\n\n"
+            + "\n\n".join(f"## Sec {i}\n\n{body}" for i in range(6)) + "\n")
+
+
+def test_a_failed_ingest_forgets_the_hash_of_what_it_touched(tmp_path, meta_store):
+    """The row would otherwise claim the new full-file hash over a partly
+    indexed file whose old chunks this run already deleted - permanently, and
+    silently, because every later refresh calls it unchanged."""
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    f = notes / "a.md"
+    f.write_text(_many_sections("a.md", "alpha"), encoding="utf-8")
+    cfg = _cfg(notes)
+    store = _FlakyStore()
+
+    # A clean run first, so there is a good row with a real hash.
+    refresh.run_refresh(cfg, meta_store, store=store, embedder_factory=_TinyEmbedder)
+    assert meta_store.get_sources()[0]["file_hash"]
+    assert refresh.plan_refresh(cfg, meta_store).has_work is False
+    full = len(store.points)
+    assert full >= 4, "the file must span several embed batches for this to bite"
+
+    # Now edit it, and die part-way through the re-ingest.
+    f.write_text(_many_sections("a.md", "beta"), encoding="utf-8")
+    store.arm(fail_after=1)
+    plan = refresh.run_refresh(cfg, meta_store, store=store,
+                               embedder_factory=_SmallBatchEmbedder)
+
+    assert plan.sources[0].error                      # the run did say so
+    assert len(store.points) < full                   # and the tail really is gone
+
+    row = meta_store.get_sources()[0]
+    assert row["source_path"] == str(f)
+    assert row["file_hash"] is None                   # forgotten, not claimed
+
+    # The property that actually matters: the next refresh rebuilds it.
+    replan = refresh.plan_refresh(cfg, meta_store)
+    assert replan.sources[0].changed == [f]
+    assert replan.sources[0].unchanged == 0
+    assert replan.has_work is True
+
+
+def test_a_failing_source_does_not_clear_a_healthy_one(tmp_path, meta_store):
+    """Only the failed source's own paths are forgotten."""
+    good = tmp_path / "good"
+    good.mkdir()
+    gf = good / "g.md"
+    gf.write_text(_many_sections("g.md", "gamma"), encoding="utf-8")
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    bf = bad / "b.md"
+    bf.write_text(_many_sections("b.md", "delta"), encoding="utf-8")
+
+    cfg = _multi_cfg([{"type": "markdown", "path": str(bad)},
+                      {"type": "markdown", "path": str(good)}])
+
+    class _OneSourceFails(_MemStore):
+        def upsert_chunks(self, chunks, vectors):
+            if any(c.source_path == str(bf) for c in chunks):
+                raise RuntimeError("that one file is cursed")
+            return super().upsert_chunks(chunks, vectors)
+
+    # Clean run: both sources land, both rows get hashes.
+    refresh.run_refresh(cfg, meta_store, store=_MemStore(),
+                        embedder_factory=_TinyEmbedder)
+    before = {r["source_path"]: r["file_hash"] for r in meta_store.get_sources()}
+    assert before[str(bf)] and before[str(gf)]
+
+    # Edit both; the bad source fails, the good one still runs.
+    bf.write_text(_many_sections("b.md", "epsilon"), encoding="utf-8")
+    gf.write_text(_many_sections("g.md", "zeta"), encoding="utf-8")
+    plan = refresh.run_refresh(cfg, meta_store, store=_OneSourceFails(),
+                               embedder_factory=_SmallBatchEmbedder)
+
+    assert plan.sources[0].error
+    assert plan.sources[1].error is None
+
+    after = {r["source_path"]: r["file_hash"] for r in meta_store.get_sources()}
+    assert after[str(bf)] is None                     # forgotten
+    assert after[str(gf)]                             # untouched, and refreshed
+    assert after[str(gf)] != before[str(gf)]
+
+    replan = refresh.plan_refresh(cfg, meta_store)
+    assert replan.sources[0].changed == [bf]          # rebuilt next run
+    assert replan.sources[1].unchanged == 1           # left alone
+
+
+def test_clear_file_hashes_only_touches_the_named_rows(meta_store):
+    meta_store.record_source("/a.md", "markdown", "t", 1, "c", file_hash="aaaaaaaaaaaaaaaa")
+    meta_store.record_source("/b.md", "markdown", "t", 1, "c", file_hash="bbbbbbbbbbbbbbbb")
+
+    assert meta_store.clear_file_hashes(["/a.md", "/nonexistent.md"]) == 1
+    assert meta_store.clear_file_hashes([]) == 0
+
+    rows = {r["source_path"]: r["file_hash"] for r in meta_store.get_sources()}
+    assert rows["/a.md"] is None
+    assert rows["/b.md"] == "bbbbbbbbbbbbbbbb"
+
+
+def test_clear_file_hashes_handles_more_paths_than_sqlite_allows_variables(meta_store):
+    """SQLite's parameter limit is 999 on older builds; the IN clause batches."""
+    paths = [f"/bulk/{i}.md" for i in range(1200)]
+    for p in paths:
+        meta_store.record_source(p, "markdown", "t", 1, "c", file_hash="cccccccccccccccc")
+
+    assert meta_store.clear_file_hashes(paths) == 1200
+    assert all(h is None for h in meta_store.source_hashes().values())
