@@ -116,6 +116,22 @@ def faithfulness_proxy(answer: str, retrieved_texts: list[str]) -> float:
 # Runner
 # -----------------------------------------------------------------------------
 
+def _index_points(store: Any) -> int | None:
+    """How many points the index holds, or None if the store won't say.
+
+    Deliberately swallows everything: this is context recorded alongside the
+    metrics, never a precondition for computing them. An eval run that has
+    already spent minutes of GPU time must not be thrown away because the
+    store's count endpoint was unreachable — None reads as "unknown", which is
+    the truth, and every other number in the row is still good.
+    """
+    try:
+        return store.count()
+    except Exception as e:
+        log.warning("eval: could not read the index size: %s", e)
+        return None
+
+
 def run(
     golden_path: Path,
     embedder: Embedder,
@@ -270,6 +286,14 @@ def run(
         "hybrid": hybrid,
         "dense_weight": dense_weight,
         "match_mode": match_mode,
+        # How big the index was when this was measured. Recall gets harder as
+        # the corpus grows — more near-duplicates competing for the same few
+        # slots — so without this a row from a 40k-point index and one from a
+        # 4k-point index look directly comparable, and `rag refresh` running
+        # nightly means the index now moves between eval runs by itself. The
+        # README already warns not to read recall as a trend line; this is what
+        # lets a reader check whether a drop was the settings or the corpus.
+        "index_points": _index_points(store),
     }
     if extra_params:
         run_params.update(extra_params)

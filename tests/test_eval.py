@@ -4,10 +4,15 @@ Currently covers:
 - `print_report` doesn't crash on Windows consoles with a non-UTF-8
   code page (the `✓` / `✗` glyphs are unicode). Regression test
   for the cp1252 crash we hit in the live smoke pass.
+- `run` records the size of the index each run was measured against,
+  so a recall trend across months can tell a real regression from a
+  corpus that simply grew.
 """
 from __future__ import annotations
 
+import json
 import sys
+from unittest.mock import MagicMock
 
 from eval import run_ragas
 
@@ -72,3 +77,51 @@ def test_print_report_handles_optional_faithfulness(capsys):
     out = capsys.readouterr().out
     assert "faithfulness" in out.lower()
     assert "0.420" in out
+
+
+# -- recorded run params ------------------------------------------------------
+
+def _one_question_run(tmp_path, monkeypatch, store):
+    """Drive `run` over a single golden row with the pipeline stubbed out.
+
+    Returns the MagicMock metadata store so the caller can read what was
+    recorded. Nothing here touches Ollama, Qdrant or the network.
+    """
+    golden = tmp_path / "g.jsonl"
+    golden.write_text(
+        json.dumps({"question": "q", "relevant_chunk_ids": ["c1"]}) + "\n",
+        encoding="utf-8",
+    )
+
+    result = MagicMock()
+    result.answer = "a"
+    result.citations = [{"chunk_id": "c1", "text": "t",
+                         "source_path": "/a.md", "section": "S"}]
+    result.dense_hits = list(result.citations)
+    monkeypatch.setattr(run_ragas, "ask_pipeline", lambda *a, **k: result)
+
+    metadata = MagicMock()
+    run_ragas.run(golden, embedder=MagicMock(), store=store,
+                  reranker=MagicMock(), generator=None, metadata=metadata)
+    return metadata
+
+
+def test_eval_records_the_index_size(monkeypatch, tmp_path):
+    """Without this, a recall trend across months reads as degradation when
+    it is really just a growing corpus — retrieval gets harder as more
+    near-duplicates compete for the same few slots. The README already warns
+    about the trap; the recorded row is what lets you check it after the fact."""
+    store = MagicMock()
+    store.count.return_value = 4242
+    metadata = _one_question_run(tmp_path, monkeypatch, store)
+    assert metadata.record_eval_run.call_args.kwargs["params"]["index_points"] == 4242
+
+
+def test_index_size_of_a_store_that_cannot_count_is_unknown_not_fatal(monkeypatch, tmp_path):
+    """A store that cannot report a count must not break an eval run: the
+    metrics are the point, the corpus size is context. Recorded as None so a
+    later reader can tell "nobody asked" apart from "the index was empty"."""
+    store = MagicMock()
+    store.count.side_effect = RuntimeError("qdrant said no")
+    metadata = _one_question_run(tmp_path, monkeypatch, store)
+    assert metadata.record_eval_run.call_args.kwargs["params"]["index_points"] is None

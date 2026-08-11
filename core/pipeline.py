@@ -15,6 +15,7 @@ import importlib
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -22,7 +23,7 @@ from typing import Any, Callable
 import yaml
 
 from core.interfaces import Chunk, Embedder, Reranker, Generator, Ingester, VectorStore
-from core.metadata import MetadataStore, hash_text
+from core.metadata import MetadataStore, hash_file, hash_text
 
 
 log = logging.getLogger(__name__)
@@ -34,6 +35,12 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
+# Where the loaded config came from, stashed in the config dict itself so any
+# factory can anchor a relative path to the config file's directory rather than
+# to whatever directory the process happens to be sitting in. Underscored: it
+# is not a user-facing key, and nothing writes the config back out.
+CONFIG_PATH_KEY = "_config_path"
+
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
     """Load the YAML config. Path is overridable via RAG_CONFIG env var."""
@@ -44,6 +51,7 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
         raise ValueError(f"config root must be a mapping; got {type(cfg).__name__}")
+    cfg[CONFIG_PATH_KEY] = str(p.resolve())
     return cfg
 
 
@@ -64,6 +72,39 @@ def chunking_params(cfg: dict[str, Any]) -> dict[str, Any]:
         "default_topic": ing.get("default_topic", "default"),
         "max_chunks_per_doc": ch.get("max_chunks_per_doc", 2000),
     }
+
+
+SOURCE_TYPES = ("markdown", "pdf", "epub", "zeal")
+
+
+def configured_sources(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """The `sources:` list from config.yaml, validated and normalised.
+
+    This is the record of what the index is SUPPOSED to contain. `rag ingest`
+    stays invocation-driven for one-offs; `rag refresh` works from here and
+    never guesses.
+
+    Raises ValueError on a malformed entry rather than skipping it — a typo in
+    a source type must not silently mean "that corpus is no longer indexed".
+    """
+    raw = cfg.get("sources") or []
+    out: list[dict[str, Any]] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(f"sources[{i}]: each entry must be a mapping of type + path")
+        if "type" not in entry or "path" not in entry:
+            raise ValueError(f"sources[{i}]: needs both 'type' and 'path'")
+        if not isinstance(entry["path"], str) or not entry["path"].strip():
+            raise ValueError(
+                f"sources[{i}]: 'path' must be a non-empty string; got {entry['path']!r}"
+            )
+        if entry["type"] not in SOURCE_TYPES:
+            raise ValueError(
+                f"sources[{i}]: unknown type {entry['type']!r}; "
+                f"expected one of {', '.join(SOURCE_TYPES)}"
+            )
+        out.append({"type": entry["type"], "path": Path(entry["path"]).resolve()})
+    return out
 
 
 def _import_class(dotted: str):
@@ -127,18 +168,52 @@ def make_store(cfg: dict[str, Any]) -> VectorStore:
     return cls(**kwargs)
 
 
+DEFAULT_METADATA_PATH = "./metadata.sqlite3"
+
+
+def resolve_metadata_path(cfg: dict[str, Any]) -> Path:
+    """Where the metadata DB lives. One resolution, for every caller.
+
+    A RELATIVE `metadata.path` is anchored to the config file's directory, not
+    to the process's current directory. `rag.ps1` tells the user to put `rag` on
+    PATH and run it from anywhere, and config resolution has always been
+    repo-anchored — so a cwd-relative DB path meant that running `rag refresh`
+    from any other directory opened, or silently CREATED, an empty database
+    there. Nothing errored: refresh read an empty catalog, called the entire
+    corpus new, and started a full re-embed, reporting success the whole way.
+    The one promise of this feature — that an unchanged corpus costs nothing —
+    inverted into hours of GPU time, quietly.
+
+    An absolute path is used exactly as written.
+    """
+    section = cfg.get("metadata", {}) or {}
+    raw = section.get("path") or DEFAULT_METADATA_PATH
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    # No config file behind this dict (a hand-built config, an embedded
+    # caller): fall back to the repo root, where config.yaml lives. Still not
+    # the cwd — the whole point is that the cwd is not where the data is.
+    anchor = Path(cfg.get(CONFIG_PATH_KEY) or DEFAULT_CONFIG_PATH)
+    return (anchor.resolve().parent / p).resolve()
+
+
 def make_metadata(cfg: dict[str, Any]) -> MetadataStore | None:
     """Build a MetadataStore from the `metadata:` config block, or None if disabled.
 
     Config shape:
         metadata:
           enabled: true            # default true
-          path: ./metadata.sqlite3 # default ./metadata.sqlite3
+          path: ./metadata.sqlite3 # relative -> next to config.yaml
     """
     section = cfg.get("metadata", {}) or {}
     if not section.get("enabled", True):
         return None
-    path = section.get("path", "./metadata.sqlite3")
+    path = resolve_metadata_path(cfg)
+    # Every process that opens the catalog registers the same corpus stamp
+    # location, which is how a long-lived `rag serve` learns that a refresh in
+    # another process moved the corpus under it.
+    set_corpus_stamp_path(path)
     return MetadataStore(path)
 
 
@@ -188,6 +263,40 @@ def ingest(
     # the embedder's actual dim was never checked.
     store.ensure_collection(recreate=recreate, expected_dense_dim=embedder.dim())
 
+    # The drop and the catalog move together, or they diverge.
+    #
+    # `recreate` drops the WHOLE collection and then re-ingests only what this
+    # invocation was pointed at. Every OTHER recorded source keeps a row
+    # claiming a valid file_hash for chunks that no longer exist — and `rag
+    # refresh` reads exactly that column, matches file to hash, and reports
+    # "index is up to date". The one mechanism that could rebuild the corpus is
+    # the one that refuses to, silently and forever.
+    #
+    # Not theoretical: `QdrantStore.ensure_collection` tells the user to run
+    # `rag ingest --recreate` when the embedder's dim stops matching the
+    # collection. Following that advice used to lose every source not named on
+    # that command line.
+    #
+    # After ensure_collection, not before: if the drop itself fails there is
+    # nothing to reconcile and the catalog is still true.
+    if recreate and metadata is not None:
+        try:
+            dropped = metadata.delete_all_sources()
+        except Exception as e:  # pragma: no cover — defensive
+            log.error(
+                "ingest: collection %s was dropped but the source catalog could "
+                "not be cleared (%s) — run `rag refresh` and expect it to under-"
+                "report; the stale rows claim chunks that no longer exist",
+                store.collection, e,
+            )
+        else:
+            if dropped:
+                log.warning(
+                    "ingest: recreate dropped %s, so %d catalog row(s) went with "
+                    "it — sources not re-ingested now will be picked up by the "
+                    "next `rag refresh`", store.collection, dropped,
+                )
+
     # Buffer chunks for batched embedding. We pick the embedder's batch size
     # unless the caller overrides.
     bs = batch_size or getattr(embedder, "batch_size", 32) or 32
@@ -219,6 +328,13 @@ def ingest(
         # P1 metadata: one row per unique source file. Cheap (one
         # row per file, not per chunk) and idempotent — re-ingest
         # just refreshes chunk_count + content_hash.
+        #
+        # file_hash is what makes `rag refresh` converge. Refresh re-ingests
+        # THROUGH this function, so if the hash were not written here the
+        # column would stay NULL, the next refresh would see the file as
+        # changed again, and the whole feature would degrade into a permanent
+        # full re-ingest. It is the raw-bytes hash, not hash_text of the
+        # chunks: refresh has to decide whether to parse a file at all.
         if metadata is None or not sources:
             return
         for source_path, (doc_type, topic, texts) in sources.items():
@@ -228,6 +344,7 @@ def ingest(
                 topic=topic,
                 chunk_count=len(texts),
                 content_hash=hash_text("\n\n".join(texts)),
+                file_hash=hash_file(source_path),
             )
         log.info("metadata: recorded %d source rows", len(sources))
 
@@ -301,8 +418,75 @@ def _build_query_sparse_vector(query: str, vocab: dict[str, int] | None, idf: di
 # Cached corpus stats for hybrid search — built lazily on first hybrid query,
 # guarded by _hybrid_lock so two FastAPI threadpool workers can't both scroll
 # the corpus on a cold start. Invalidated after every ingest.
-_hybrid_cache: dict = {"vocab": None, "idf": None, "built": False}
+#
+# `stamp` is what the cache was built against, for the cross-process case
+# below: the in-process flags say nothing to a `rag serve` running in another
+# process.
+_hybrid_cache: dict = {"vocab": None, "idf": None, "built": False, "stamp": None}
 _hybrid_lock = threading.Lock()
+
+
+# -----------------------------------------------------------------------------
+# The cross-process corpus signal
+#
+# `invalidate_hybrid_cache()` drops a module global, which reaches exactly one
+# process. But `rag serve` is kept alive by the `rag-gui` scheduled task with
+# its own copy, while `rag refresh` runs nightly as a SEPARATE process. So
+# after every refresh the server's vocabulary was missing every term the new
+# documents introduced — and `_build_query_sparse_vector` DROPS a term that is
+# not in the vocab rather than down-weighting it, so those documents were
+# simply unreachable via the sparse half of every hybrid query. Nothing failed;
+# retrieval quality just decayed in the GUI until someone restarted it.
+#
+# The signal is a small file beside the metadata DB, rewritten by whichever
+# process moved the corpus and compared before the cache is reused. Not the
+# DB's own mtime: the connection runs in WAL mode, so a write lands in the -wal
+# file and the main file's mtime need not move at all.
+#
+# Everything here fails OPEN. An unreadable stamp means "no news" — reusing a
+# possibly-stale IDF map degrades a ranking, while raising here would fail a
+# query the user asked.
+# -----------------------------------------------------------------------------
+
+CORPUS_STAMP_SUFFIX = ".corpus-stamp"
+
+_corpus_stamp_path: Path | None = None
+
+
+def set_corpus_stamp_path(metadata_path: str | Path | None) -> None:
+    """Point the cross-process corpus signal beside the metadata database.
+
+    Called from `make_metadata`, so every process that opens the catalog — the
+    CLI running a refresh, the long-lived server answering queries — agrees on
+    the same file without anyone passing it around.
+    """
+    global _corpus_stamp_path
+    _corpus_stamp_path = (
+        None if metadata_path is None
+        else Path(f"{Path(metadata_path)}{CORPUS_STAMP_SUFFIX}")
+    )
+
+
+def _read_corpus_stamp() -> str | None:
+    """The corpus stamp, or None if there isn't one we can read."""
+    path = _corpus_stamp_path
+    if path is None:
+        return None
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except Exception:
+        return None
+
+
+def _write_corpus_stamp() -> None:
+    """Mark the corpus as moved, for every other process."""
+    path = _corpus_stamp_path
+    if path is None:
+        return
+    try:
+        path.write_text(str(time.time_ns()), encoding="utf-8")
+    except OSError as e:
+        log.debug("hybrid: could not write the corpus stamp at %s (%s)", path, e)
 
 
 # How much wider than top_k the hybrid branch retrieves when a topic filter
@@ -330,11 +514,19 @@ def invalidate_hybrid_cache() -> None:
     """Drop the cached corpus IDF map so the next hybrid query rebuilds it.
 
     Must be called after anything that changes the corpus (ingest, delete):
-    a stale IDF map silently shifts hybrid scores against the new corpus."""
+    a stale IDF map silently shifts hybrid scores against the new corpus.
+
+    Also rewrites the corpus stamp, which is how a `rag serve` in ANOTHER
+    process finds out. Every corpus-moving path already funnels through here,
+    so this is the one place the signal belongs."""
     with _hybrid_lock:
         _hybrid_cache["vocab"] = None
         _hybrid_cache["idf"] = None
         _hybrid_cache["built"] = False
+        _hybrid_cache["stamp"] = None
+    # Outside the lock: a file write must not block a query that is only
+    # waiting to read a dict.
+    _write_corpus_stamp()
 
 
 def _retrieve_hybrid(
@@ -362,6 +554,19 @@ def _retrieve_hybrid(
     # worker arriving mid-build blocks here instead of scrolling the corpus
     # a second time.
     with _hybrid_lock:
+        # Read BEFORE the build, so a corpus that moves while we are scrolling
+        # leaves the cache marked against the older stamp and rebuilds next
+        # time, rather than claiming to be current.
+        stamp = _read_corpus_stamp()
+        if (
+            _hybrid_cache["built"]
+            and stamp is not None
+            and stamp != _hybrid_cache.get("stamp")
+        ):
+            # Another process moved the corpus — a nightly `rag refresh`, a
+            # `rag forget`, a manual ingest. This one's vocabulary predates it.
+            log.info("hybrid: the corpus moved elsewhere — rebuilding the IDF map")
+            _hybrid_cache["built"] = False
         if not _hybrid_cache["built"]:
             log.info("hybrid: building corpus IDF map...")
             _TOKEN_RE = re.compile(r"\w{2,}")
@@ -382,6 +587,7 @@ def _retrieve_hybrid(
                 for t, df in doc_freq.items()
             }
             _hybrid_cache["vocab"] = {t: i for i, t in enumerate(sorted(_hybrid_cache["idf"]))}
+            _hybrid_cache["stamp"] = stamp
             _hybrid_cache["built"] = True
             log.info("hybrid: IDF map ready — vocab=%d terms", len(_hybrid_cache["vocab"]))
 

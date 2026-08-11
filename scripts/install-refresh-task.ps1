@@ -1,0 +1,228 @@
+# =============================================================================
+# install-refresh-task.ps1 — schedule `rag refresh` so the index keeps itself
+# current without you remembering to do it.
+#
+# Idempotent: registering with -Force replaces any existing task of this name
+# in one atomic step, so re-running with a different -At just moves the
+# schedule.
+#
+# What gets scheduled:
+#     <repo>\.venv\Scripts\python.exe -m cli refresh
+#         >> %USERPROFILE%\.rag\refresh.log 2>&1
+#
+# (via cmd.exe, which is only there to do the redirect: a task with nowhere to
+# write leaves you a bare LastTaskResult and no idea which source failed.)
+#
+# `refresh` re-ingests only the files whose CONTENT changed since the last
+# run, working from the `sources:` list in config.yaml. An unchanged corpus
+# costs a directory walk and one SHA-256 per file — no embedding model is
+# loaded — so a nightly run over a quiet corpus is milliseconds and no VRAM.
+#
+# WHAT IT CAN REMOVE, honestly: a CHANGED file's old chunks. Refresh deletes
+# them and replaces them with the re-ingested ones, because chunk ids are
+# positional and the leftovers would otherwise keep answering queries with
+# text you deleted. If that one file's ingest fails, or the run is killed
+# mid-way, that file can be left short in the index until the next successful
+# refresh — which retries it, and says so in the log. No other file is
+# touched: one file failing costs one file.
+#
+# `--prune` (drop index entries whose file is gone from disk) is deliberately
+# NOT scheduled: it is the one irreversible thing here and it asks for
+# confirmation. Run it by hand when you want it, after `rag refresh --dry-run`
+# has shown you exactly what it would remove.
+#
+# Remove the schedule with scripts\uninstall-refresh-task.ps1.
+# =============================================================================
+param(
+    # Time of day to run, local time. Anything Get-Date parses: '03:00',
+    # '3am', '23:30'. Only the time part is used; the recurrence is daily.
+    [string]$At = '03:00'
+)
+
+$ErrorActionPreference = 'Stop'
+
+# Shared constants ($RefreshTaskName etc.). Python mirror: service_state.py.
+. (Join-Path $PSScriptRoot '_config.ps1')
+
+$Description = 'rag: re-ingest changed files into the index, replacing their old chunks. --prune stays manual.'
+$RepoRoot    = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$PythonExe   = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+$VenvDir     = Join-Path $RepoRoot '.venv'
+
+# Sanity: venv must exist (created by rag.ps1 / rag.bat on first run).
+# Checked here, at install time, rather than letting the task discover it at
+# 03:00 — and the task runs python directly rather than through rag.ps1 so a
+# missing venv fails loudly instead of quietly starting a multi-GB pip install
+# in the middle of the night.
+if (-not (Test-Path $PythonExe)) {
+    Write-Host "ERROR: venv not found at $VenvDir" -ForegroundColor Red
+    Write-Host "Run rag.ps1 once (or: python -m venv .venv && pip install -r requirements.txt)" -ForegroundColor Yellow
+    exit 1
+}
+
+# Parse -At up front so a typo is an error here and not a task that silently
+# runs at midnight.
+try {
+    $RunAt = Get-Date $At
+} catch {
+    Write-Host "ERROR: -At '$At' is not a time I can parse. Try '03:00' or '3am'." -ForegroundColor Red
+    exit 1
+}
+
+# A task that can never do anything is worse than no task at all: it looks
+# installed. `refresh` works exclusively from the `sources:` list, which ships
+# empty, so check before promising the user a working schedule. Advisory only
+# — a probe that fails must not block the install.
+$SourceCount = $null
+$ProbeFailed = $false
+$PrevEap     = $ErrorActionPreference
+try {
+    # Advisory means advisory: nothing here may terminate the install, and
+    # nothing here may cry wolf over a config that is fine. Both were possible
+    # while stderr was merged in with 2>&1 — on Windows PowerShell 5.1 a native
+    # command writing to stderr under EAP=Stop raises NativeCommandError, and
+    # even on pwsh 7 a warning printed after the number becomes the "last line"
+    # parsed below. Stdout only, and EAP relaxed across the call.
+    $ErrorActionPreference = 'Continue'
+    Push-Location $RepoRoot
+    $probe = 'from core.pipeline import load_config, configured_sources; print(len(configured_sources(load_config())))'
+    $out  = & $PythonExe -c $probe 2>$null
+    $last = ($out | Select-Object -Last 1 | Out-String).Trim()
+    # A count, or nothing at all — never a guess at what other output meant.
+    if ($LASTEXITCODE -eq 0 -and $last -match '^\d+$') {
+        $SourceCount = [int]$last
+    } else {
+        $ProbeFailed = $true
+    }
+} catch {
+    $ProbeFailed = $true
+} finally {
+    Pop-Location
+    $ErrorActionPreference = $PrevEap
+}
+
+# The action: the venv interpreter, run from the repo root so config.yaml and
+# the metadata DB resolve — via cmd.exe, purely so the output has somewhere to
+# go.
+#
+# Task Scheduler starts a process, not a shell, so an unredirected task writes
+# stdout and stderr into nothing. All that survived was LastTaskResult: a bare
+# 1, with no way to tell WHICH source failed or which files were left
+# half-indexed — while `rag refresh` builds that summary for, in its own
+# words, "an operator reading a scheduled task's log". cmd.exe is the smallest
+# thing that can redirect, and it exits with python's own code, so
+# LastTaskResult still means what it meant.
+#
+# Appended, not truncated: a nightly incremental run prints a handful of lines,
+# and losing last night's log to tonight's run is exactly the wrong trade when
+# the interesting case is "it has been failing for a while".
+$LogDir     = Split-Path -Parent $RefreshLogFile
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$CmdExe     = Join-Path $env:SystemRoot 'System32\cmd.exe'
+# cmd's own quoting rule: when the string after /c starts with a quote and
+# holds more than two, it strips the outer pair and runs the rest — which is
+# what lets both the interpreter path and the log path contain spaces.
+$ActionArgs = '/c ""{0}" -m cli refresh >> "{1}" 2>&1"' -f $PythonExe, $RefreshLogFile
+$Action     = New-ScheduledTaskAction `
+    -Execute $CmdExe `
+    -Argument $ActionArgs `
+    -WorkingDirectory $RepoRoot
+
+$Trigger = New-ScheduledTaskTrigger -Daily -At $RunAt
+
+# StartWhenAvailable: if the machine was off at 03:00, run once it is back
+# rather than skipping the day entirely.
+#
+# Battery settings mirror install-service.ps1. A desktop behind a UPS reads as
+# "on battery" during a mains blip, and being stopped mid-ingest is worse than
+# the power draw: it leaves files half-indexed.
+#
+# ExecutionTimeLimit is deliberately NOT unlimited. Task Scheduler will not
+# start a second instance while one is running, so a single wedged run would
+# silently cancel every future refresh. Four hours is far beyond any real
+# incremental run; after that, being killed is the correct outcome.
+$Settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+
+# Principal: the current user, interactive, UNELEVATED.
+#
+# -RunLevel Limited, not Highest. The P2 audit found the existing GUI task
+# asking for elevation it does not need, and a scheduled task that inherits an
+# elevated token hands that token to everything it spawns — here, an ingest
+# pipeline that parses arbitrary PDFs, EPUBs and HTML from disk. Reading your
+# own notes and writing to your own Qdrant needs nothing an admin has.
+$Principal = New-ScheduledTaskPrincipal `
+    -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().User) `
+    -LogonType Interactive `
+    -RunLevel Limited
+
+# Idempotence via -Force, exactly as install-service.ps1 does it: one atomic
+# replace. Unregistering first and then registering would open a window where
+# a failure between the two leaves the user with NO task instead of the one
+# they already had.
+$existing = Get-ScheduledTask -TaskName $RefreshTaskName -ErrorAction SilentlyContinue
+if ($existing) {
+    Write-Host "  replacing the existing '$RefreshTaskName' task" -ForegroundColor Gray
+}
+
+try {
+    Register-ScheduledTask `
+        -TaskName $RefreshTaskName `
+        -Action $Action `
+        -Trigger $Trigger `
+        -Settings $Settings `
+        -Principal $Principal `
+        -Description $Description `
+        -Force | Out-Null
+} catch {
+    Write-Host "ERROR: failed to register scheduled task: $_" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host ""
+Write-Host "  rag refresh scheduled task installed" -ForegroundColor Green
+Write-Host "  name        : $RefreshTaskName"
+Write-Host "  python      : $PythonExe"
+Write-Host "  args        : $ActionArgs"
+Write-Host "  working dir : $RepoRoot"
+Write-Host "  log         : $RefreshLogFile  (appended, every run)"
+Write-Host ("  trigger     : daily at {0}" -f $RunAt.ToString('HH:mm'))
+Write-Host "  run level   : Limited (not elevated — it does not need to be)"
+Write-Host ""
+Write-Host "  it re-ingests only what changed, replacing that file's old chunks." -ForegroundColor Gray
+Write-Host "  an interrupted run can leave that one file short until the next refresh." -ForegroundColor Gray
+Write-Host "    --prune is NOT scheduled; run it by hand after --dry-run" -ForegroundColor Gray
+Write-Host ""
+
+if ($null -ne $SourceCount -and $SourceCount -eq 0) {
+    Write-Host "  WARNING: config.yaml has no sources, so this task will do nothing." -ForegroundColor Yellow
+    Write-Host "  Add entries under the 'sources:' key, e.g.:" -ForegroundColor Yellow
+    Write-Host "      sources:" -ForegroundColor Gray
+    Write-Host "        - type: markdown" -ForegroundColor Gray
+    Write-Host "          path: D:/notes" -ForegroundColor Gray
+    Write-Host ""
+} elseif ($null -ne $SourceCount) {
+    Write-Host "  tracking $SourceCount configured source(s) from config.yaml" -ForegroundColor Gray
+    Write-Host ""
+} elseif ($ProbeFailed) {
+    Write-Host "  NOTE: could not read the 'sources:' list from config.yaml." -ForegroundColor Yellow
+    Write-Host "  If that is a real error the task will hit it too — check with:" -ForegroundColor Yellow
+    Write-Host "      rag refresh --dry-run" -ForegroundColor Gray
+    Write-Host ""
+}
+
+Write-Host "  next steps:" -ForegroundColor Cyan
+Write-Host "    1. See what it WOULD do, without writing anything:" -ForegroundColor Gray
+Write-Host "         rag refresh --dry-run" -ForegroundColor Gray
+Write-Host "    2. Run it now instead of waiting for tonight:" -ForegroundColor Gray
+Write-Host "         Start-ScheduledTask -TaskName $RefreshTaskName" -ForegroundColor Gray
+Write-Host "    3. Check how the last run went (0 = clean):" -ForegroundColor Gray
+Write-Host "         Get-ScheduledTaskInfo -TaskName $RefreshTaskName" -ForegroundColor Gray
+Write-Host "    4. Read what it actually said — which source, which files:" -ForegroundColor Gray
+Write-Host "         Get-Content '$RefreshLogFile' -Tail 40" -ForegroundColor Gray
+Write-Host "    5. To remove the schedule later:" -ForegroundColor Gray
+Write-Host "         scripts\uninstall-refresh-task.ps1" -ForegroundColor Gray
+Write-Host ""

@@ -296,6 +296,134 @@ python cli.py ingest --markdown D:\path\to\your\notes
 The ingest is **idempotent** — re-running updates chunks in place thanks
 to deterministic UUID5 ids. No duplicates, no manual cleanup.
 
+## Keeping the index current
+
+`rag ingest` is for one-offs. `rag refresh` is for "the index should
+match what's on disk, and I don't want to think about it."
+
+**Tell it what the index is supposed to contain.** Nothing is tracked
+until it's listed under `sources:` in `config.yaml` (it ships empty):
+
+```yaml
+sources:
+  - type: markdown          # markdown | pdf | epub | zeal
+    path: D:/notes
+  - type: pdf
+    path: D:/Library
+  - type: zeal
+    path: C:/Users/you/AppData/Local/Zeal/Zeal/docsets/Python.docset
+```
+
+Then:
+
+```powershell
+rag refresh              # re-ingest only what changed
+rag refresh --dry-run    # say what you WOULD do, write nothing
+rag refresh --prune      # ...and drop index entries whose file is gone
+```
+
+Refresh hashes every file and compares it to what it ingested last time,
+so an unchanged corpus costs a directory walk and one SHA-256 per file —
+**no embedding model is loaded at all**. Editing three notes re-embeds
+three notes, not the library. A Zeal docset is all-or-nothing (its
+`.dsidx` index is the hash), because there's no cheap way to tell which
+of ~50,000 pages moved.
+
+### What deletes, and what doesn't
+
+**`rag refresh --prune` and `rag forget` are the only two commands that
+delete *part* of the index** — selected rows, chosen deliberately. Both
+ask for confirmation first (`-y` skips it, for scripts).
+
+The one command that deletes *all* of it is **`rag ingest --recreate`**,
+which drops the whole collection before re-ingesting. It asks first too,
+naming the collection it is about to drop, and nothing in this README
+tells you to run it. Because the collection is gone, it also empties the
+`sources` catalog — those rows would otherwise claim chunks that no
+longer exist, and the next `rag refresh` would believe them and report
+the index up to date. Sources you didn't name on that command line are
+re-ingested by the next refresh.
+
+A plain `rag refresh` removes one thing, and it's worth knowing which: a
+**changed** file's old chunks, deleted and replaced by the re-ingested
+ones (chunk ids are positional, so the leftovers would keep answering
+queries with text you deleted). If that file's ingest fails, or the run
+is killed part-way, that one file can be left short in the index until
+the next successful refresh — which retries it, and names it in the
+summary. One file failing costs one file; its neighbours are untouched.
+
+```powershell
+rag refresh --dry-run --prune   # the paths it would remove, before you agree
+rag forget --source D:\notes\old.md    # one file, by the path `rag sources` shows
+rag forget --topic photography         # everything filed under a topic
+```
+
+`--dry-run` is the honest preview: the same code path as a real run with
+the last step removed. Read it as an upper bound — a real run deletes no
+more than it listed, and possibly fewer, because a source whose ingest
+fails that run is skipped by the prune.
+
+**`rag forget` erases the index entry, not the file.** If the file is
+still on disk under something listed in `sources:`, the next `rag
+refresh` finds it missing from the catalog, calls it *new*, and indexes
+it again — a nightly task quietly undoing your deletion. `forget` warns
+when that applies and names the source. To make an erasure stick, take
+that path out of `sources:` in `config.yaml` (or delete/move the files
+themselves) as well.
+
+### Why an unplugged drive can't wipe your index
+
+This runs unattended, which means it will eventually fire while a USB
+disk is unplugged or a network share is unmounted. A naive
+implementation enumerates zero files, concludes the corpus was deleted,
+and `--prune` takes it out.
+
+So **a source root that isn't there is treated as "unknown", never as
+"empty"** — planned, reported, and skipped, with nothing under it
+ingested or pruned. Same for a root that's present but enumerates zero
+files while the index holds rows for it, and same for an unreachable
+subtree below a healthy root.
+
+A **missing root** also makes `rag refresh` exit non-zero, so a scheduled
+run flags it rather than passing silently. A **refusal to prune** is the
+safety property working as designed, not a failure: it exits 0 and prints
+the reason it wouldn't. If you emptied a folder *on purpose*, that's what
+`rag forget` is for — refusing to guess is the point.
+
+### Doing it on a schedule
+
+```powershell
+.\scripts\install-refresh-task.ps1              # daily at 03:00
+.\scripts\install-refresh-task.ps1 -At '23:30'  # or whenever
+# remove it again:
+.\scripts\uninstall-refresh-task.ps1
+```
+
+Registers a Task Scheduler task (`rag-refresh`) that runs plain
+`rag refresh` — **never `--prune`**; unattended is the wrong mode for
+the only irreversible command here. Re-running the installer just
+re-registers, so changing `-At` is safe. It runs unelevated, when you're
+logged in; a run missed because the machine was off happens once it's
+back.
+
+Since it never prunes, files you delete from disk stay in the index
+until you run `rag refresh --prune` by hand. Refresh tells you the count
+each time it notices.
+
+A refresh that fires while the GUI server is up is picked up without a
+restart: the refresh leaves a stamp beside the metadata DB, and the
+server rebuilds its BM25 vocabulary on the next hybrid query rather than
+answering out of one that predates your new documents.
+
+Everything the run printed goes to `%USERPROFILE%\.rag\refresh.log`
+(appended). That is where to look when `LastTaskResult` isn't 0 — which
+source failed, and which files it left for the next run. Check on the
+task with:
+
+```powershell
+Get-ScheduledTaskInfo -TaskName rag-refresh   # LastTaskResult 0 = clean run
+```
+
 ## Ingesting books (PDF)
 
 Drop a single PDF or a folder of PDFs at the CLI:
@@ -329,7 +457,11 @@ Mechanics (see `ingest/pdf_dir.py`):
 
 Every ingest and every `rag ask` writes a small side-channel to a
 SQLite file at `metadata.sqlite3` (override via `metadata.path` in
-`config.yaml`). Three tables:
+`config.yaml`). A relative path is resolved against `config.yaml`'s own
+directory, so `rag` finds the same database from whatever directory you
+run it in — a cwd-relative one would create an empty database next to
+you, and `rag refresh` would then call your whole corpus new. Three
+tables:
 
 ```sql
 CREATE TABLE sources (
@@ -427,6 +559,8 @@ rag/
 │   ├── interfaces.py        # ABCs: Embedder, Reranker, Generator, Ingester
 │   ├── chunker.py           # heading-aware (md) + AST (py) + whole-file fallback
 │   ├── pipeline.py          # config loader, factories, ingest/ask drivers
+│   ├── walk.py              # the one directory walk every ingester shares
+│   ├── refresh.py           # `rag refresh`: plan what changed, then apply it
 │   └── metadata.py          # SQLite side-channel: sources / citations / eval_runs
 ├── providers/
 │   ├── embed_qwen3.py       # real, Q4 via bitsandbytes
@@ -443,8 +577,10 @@ rag/
 │   ├── golden_set.jsonl     # 9 hand-written Q->chunk_id pairs
 │   └── run_ragas.py         # recall@5, MRR, faithfulness proxy
 ├── scripts/
-│   ├── install-service.ps1    # Task Scheduler setup (auto-launch at logon)
-│   └── uninstall-service.ps1  # Task Scheduler removal
+│   ├── install-service.ps1         # Task Scheduler setup (auto-launch at logon)
+│   ├── uninstall-service.ps1       # Task Scheduler removal
+│   ├── install-refresh-task.ps1    # Task Scheduler setup (nightly `rag refresh`)
+│   └── uninstall-refresh-task.ps1  # Task Scheduler removal
 ├── static/                  # the GUI (vanilla HTML + CSS + JS, no framework)
 └── samples/
     └── notes/               # 5 demo notes (photography, ml, code, operations)

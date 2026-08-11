@@ -23,6 +23,7 @@ from typing import Iterator
 
 from core.chunker import chunk_file
 from core.interfaces import Chunk, Ingester
+from core.walk import iter_source_files
 
 
 log = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ class MarkdownDirIngester(Ingester):
         frontmatter_topic_key: str = "topic",
         max_chunks_per_doc: int = 2000,
         skip_hidden: bool = True,
+        only_paths: set[Path] | None = None,
     ):
         self.root = Path(root).resolve()
         if not self.root.exists():
@@ -52,6 +54,7 @@ class MarkdownDirIngester(Ingester):
         self.frontmatter_topic_key = frontmatter_topic_key
         self.max_chunks_per_doc = max_chunks_per_doc
         self.skip_hidden = skip_hidden
+        self.only_paths = only_paths
 
     @property
     def name(self) -> str:
@@ -103,16 +106,10 @@ class MarkdownDirIngester(Ingester):
     # -- helpers --------------------------------------------------------------
 
     def _walk(self) -> list[Path]:
-        out: list[Path] = []
-        for p in self.root.rglob("*"):
-            if not p.is_file():
-                continue
-            if self.skip_hidden and any(part.startswith(".") for part in p.relative_to(self.root).parts):
-                continue
-            if p.suffix.lower() not in {".md", ".markdown", ".py"}:
-                continue
-            out.append(p)
-        return out
+        return iter_source_files(
+            self.root, {".md", ".markdown", ".py"},
+            skip_hidden=self.skip_hidden, only_paths=self.only_paths,
+        )
 
     def _resolve_topic(self, path: Path, frontmatter: dict) -> str:
         # 1. Frontmatter wins.

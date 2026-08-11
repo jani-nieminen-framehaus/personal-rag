@@ -123,8 +123,14 @@ pipeline:
 
 # ---- Metadata ----------------------------------------------------------------
 # SQLite store for the side-channel: which files are indexed, what you've
-# cited recently, eval-run history. Defaults to ./metadata.sqlite3 (one file,
-# trivial to back up). Set enabled: false to disable.
+# cited recently, eval-run history. One file, trivial to back up. Set
+# enabled: false to disable.
+#
+# A RELATIVE path is resolved against THIS FILE's directory, not against
+# whatever directory you ran `rag` from. Otherwise running it from anywhere
+# else would open — or create — an empty database there, and `rag refresh`
+# would call the whole corpus new and re-embed it. Absolute paths are used
+# exactly as written.
 metadata:
   enabled: true
   path: ./metadata.sqlite3
@@ -141,3 +147,14 @@ eval:
     top_k_dense: [20, 40]
     top_k_final: [5]
     reranker: [passthrough, bge]
+
+# ---- Sources -----------------------------------------------------------------
+# What the index is supposed to contain. `rag refresh` re-ingests only the
+# files here whose content changed; `rag ingest --markdown X` still works for
+# one-offs. Leave empty until you know what you want tracked.
+sources: []
+# To track sources, REPLACE the [] above with entries like:
+#  - type: markdown          # markdown | pdf | epub | zeal
+#    path: D:/notes
+#  - type: pdf
+#    path: D:/papers

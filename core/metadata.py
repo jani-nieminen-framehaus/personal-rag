@@ -41,7 +41,7 @@ log = logging.getLogger(__name__)
 # Schema & Migrations
 # -----------------------------------------------------------------------------
 
-_LATEST_SCHEMA_VERSION = 1
+_LATEST_SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -134,22 +134,38 @@ class MetadataStore:
         with self._lock:
             self._conn.executescript(_SCHEMA)
 
+    # Every additive migration to date, as (table, column, type) triples.
+    # v0 -> v1: eval_runs gains params (JSON) + faithfulness_method.
+    # v1 -> v2: sources gains file_hash (raw-file hash for change detection).
+    # _SCHEMA stays at the v0 shape so fresh and existing DBs take the exact
+    # same path through here: a fresh DB applies all three triples in one
+    # open (0 -> 2); a DB already at v1 applies only the third (1 -> 2).
+    _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+        ("eval_runs", "params", "TEXT"),
+        ("eval_runs", "faithfulness_method", "TEXT"),
+        ("sources", "file_hash", "TEXT"),
+    )
+
     def _migrate(self) -> None:
         """Additive migrations, versioned via PRAGMA user_version.
 
-        v0 -> v1: eval_runs gains params (JSON) + faithfulness_method.
-        _SCHEMA stays at the v0 shape so fresh and existing DBs take the
-        exact same path through here.
+        One declarative list of (table, column, type) triples covers every
+        migration to date, applied idempotently in a single loop, with
+        user_version set to _LATEST_SCHEMA_VERSION afterwards. That keeps
+        exactly one code path for a fresh database (0 -> 2, adding all
+        three columns) and an existing v1 database (1 -> 2, adding only
+        the third) — the property the original v1 migration was careful
+        to preserve.
 
         The migration is deliberately TOLERANT rather than transactional.
         The connection autocommits (`isolation_level=None`) and `self._lock`
         is a threading.Lock, which does nothing across processes — and this
         deployment runs the FastAPI server as a scheduled task alongside CLI
         commands against the same metadata.sqlite3. So two concurrent opens
-        of a v0 DB, or a crash between the ALTERs and the PRAGMA, can leave
-        a column present with user_version still 0. Checking table_info
+        of a stale DB, or a crash between the ALTERs and the PRAGMA, can leave
+        a column present with user_version still behind. Checking table_info
         before each ADD COLUMN makes that state self-repairing on the next
-        open instead of a permanent `duplicate column name: params` out of
+        open instead of a permanent `duplicate column name: ...` out of
         __init__ that needs manual sqlite surgery. (A BEGIN IMMEDIATE
         transaction would close the race but could NOT repair a database
         that is already half-migrated.)
@@ -158,21 +174,28 @@ class MetadataStore:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version >= _LATEST_SCHEMA_VERSION:
                 return
-            existing = {row[1] for row in self._conn.execute("PRAGMA table_info(eval_runs)")}
-            for column, decl in (("params", "TEXT"), ("faithfulness_method", "TEXT")):
-                if column in existing:
+            existing_by_table: dict[str, set[str]] = {}
+            for table, column, decl in self._MIGRATIONS:
+                if table not in existing_by_table:
+                    existing_by_table[table] = {
+                        row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")
+                    }
+                if column in existing_by_table[table]:
                     continue
                 try:
-                    self._conn.execute(f"ALTER TABLE eval_runs ADD COLUMN {column} {decl}")
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
                 except sqlite3.OperationalError as e:
                     # Another process won the race between our table_info
                     # read and this ALTER. The column exists either way,
                     # which is all we need — anything else re-raises.
                     if "duplicate column" not in str(e).lower():
                         raise
-                    log.debug("metadata: %s already added concurrently", column)
+                    log.debug("metadata: %s.%s already added concurrently", table, column)
+                else:
+                    existing_by_table[table].add(column)
             # Set the version regardless of which ALTERs we actually ran, so
-            # a half-migrated database converges to v1 on this open.
+            # a half-migrated database converges to _LATEST_SCHEMA_VERSION
+            # on this open.
             self._conn.execute(f"PRAGMA user_version = {_LATEST_SCHEMA_VERSION}")
 
     def close(self) -> None:
@@ -188,23 +211,76 @@ class MetadataStore:
         topic: str,
         chunk_count: int,
         content_hash: str = "",
+        file_hash: str | None = None,
     ) -> None:
         """Upsert a source row. Idempotent - re-ingesting the same file just
-        refreshes chunk_count, content_hash, and ingested_at."""
+        refreshes chunk_count, content_hash, file_hash, and ingested_at.
+
+        `file_hash` is the exception: passing None - or "", which is what
+        `hash_file` returns for a file it could not read - leaves whatever is
+        already stored alone. It is the input `rag refresh` uses to decide
+        whether a file needs re-ingesting at all, so a caller that simply
+        doesn't know it must not be able to destroy it."""
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO sources (source_path, doc_type, topic, ingested_at, chunk_count, content_hash)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO sources (source_path, doc_type, topic, ingested_at, chunk_count, content_hash, file_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_path) DO UPDATE SET
                     doc_type     = excluded.doc_type,
                     topic        = excluded.topic,
                     ingested_at  = excluded.ingested_at,
                     chunk_count  = excluded.chunk_count,
-                    content_hash = excluded.content_hash
+                    content_hash = excluded.content_hash,
+                    -- Not `excluded.file_hash`: omitting the argument must
+                    -- PRESERVE a stored hash, not erase it. Otherwise any
+                    -- caller that doesn't hash (a plain `rag ingest`) nulls
+                    -- the hash `rag refresh` relies on, and the next refresh
+                    -- sees the file as changed again.
+                    -- NULLIF as well as COALESCE, because hash_file returns
+                    -- "" for a file it cannot read and "" is not NULL: a
+                    -- transient read failure would otherwise overwrite a good
+                    -- hash with empty, and that file would then re-ingest on
+                    -- every single run.
+                    file_hash    = COALESCE(NULLIF(excluded.file_hash, ''), sources.file_hash)
                 """,
-                (source_path, doc_type, topic, _now_iso(), int(chunk_count), content_hash),
+                (source_path, doc_type, topic, _now_iso(), int(chunk_count), content_hash, file_hash),
             )
+
+    # SQLite's parameter limit is 999 on builds older than 3.32. A refresh of
+    # a large source can exceed that, so the IN clause is batched.
+    _CLEAR_BATCH = 500
+
+    def clear_file_hashes(self, source_paths: Iterable[str]) -> int:
+        """Set file_hash back to NULL for these rows, so the next refresh
+        treats them as changed. Returns the number of rows updated.
+
+        Used when an ingest fails part-way. `pipeline.ingest` records every
+        source it managed to write before aborting, with the hash of the WHOLE
+        file - so a file big enough to span more than one embed batch ends up
+        with a row claiming the new hash while only the first batch is
+        indexed. Left alone, every later refresh calls that file unchanged and
+        never revisits it, and the un-indexed tail is silently lost.
+
+        `record_source(file_hash="")` cannot do this: the upsert deliberately
+        PRESERVES a stored hash when the caller passes None or "", so that a
+        transient read failure cannot erase a good one. Clearing has to be an
+        explicit, separate act.
+        """
+        paths = [str(p) for p in source_paths]
+        if not paths:
+            return 0
+        total = 0
+        with self._lock:
+            for i in range(0, len(paths), self._CLEAR_BATCH):
+                batch = paths[i:i + self._CLEAR_BATCH]
+                cur = self._conn.execute(
+                    "UPDATE sources SET file_hash = NULL WHERE source_path IN "
+                    f"({','.join('?' * len(batch))})",
+                    batch,
+                )
+                total += cur.rowcount
+        return total
 
     def record_citations(
         self,
@@ -269,12 +345,44 @@ class MetadataStore:
     def get_sources(self, limit: int = 50) -> list[dict[str, Any]]:
         """All sources, most recent first. Capped by `limit`."""
         cur = self._conn.execute(
-            "SELECT source_path, doc_type, topic, ingested_at, chunk_count, content_hash "
+            "SELECT source_path, doc_type, topic, ingested_at, chunk_count, content_hash, file_hash "
             "FROM sources ORDER BY ingested_at DESC LIMIT ?",
             (int(limit),),
         )
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def source_hashes(self) -> dict[str, str | None]:
+        """Every recorded source_path mapped to its file_hash. Refresh's
+        change-detection input — one query, no limit."""
+        cur = self._conn.execute("SELECT source_path, file_hash FROM sources")
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+    def delete_all_sources(self) -> int:
+        """Empty the `sources` table. Returns the number of rows removed.
+
+        Exists for exactly one caller: an ingest that DROPPED the collection.
+        Every row is a claim that a file's chunks are in the index, so once the
+        collection is gone every row is false — and the falsehood is not inert.
+        `rag refresh` compares a file against its recorded hash, matches, and
+        reports the index up to date, which makes the one command that could
+        restore the corpus the one command that refuses to.
+
+        Deleting rather than clearing the hashes: the chunks are gone, not
+        stale, and a row that survives would also keep the file listed by
+        `rag sources` as indexed when it is not.
+        """
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM sources")
+            return int(cur.rowcount or 0)
+
+    def delete_source(self, source_path: str) -> bool:
+        """Remove one source row. Returns True if a row was deleted."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM sources WHERE source_path = ?", (source_path,)
+            )
+            return cur.rowcount > 0
 
     def get_citations(
         self, limit: int = 50, source_path: str | None = None
@@ -423,3 +531,20 @@ def hash_text(text: str) -> str:
     if not text:
         return ""
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def hash_file(path: str | Path) -> str:
+    """Hash a file's raw bytes. Returns "" when the file cannot be read.
+
+    Raw bytes, not chunked text: the point is to decide whether to parse a
+    file at all, so this must not require parsing it. Read in blocks so a
+    500 MB PDF does not land in memory.
+    """
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(block)
+    except OSError:
+        return ""
+    return h.hexdigest()[:16]

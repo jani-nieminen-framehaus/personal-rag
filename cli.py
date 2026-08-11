@@ -1,9 +1,25 @@
-"""CLI: `rag ask` / `rag ingest` / `rag eval`.
+"""CLI: `rag ask` / `rag ingest` / `rag refresh` / `rag eval`.
 
 Run from the repo root:
     python cli.py ask "What is exposure compensation?"
-    python cli.py ingest --markdown ./samples
+    python cli.py ingest --markdown ./samples     # one-off ingest
+    python cli.py refresh                         # re-ingest only what changed
+    python cli.py refresh --dry-run               # ...or just say what would
+    python cli.py forget --topic photography      # drop it from the index
     python cli.py eval
+
+`refresh --prune` and `forget` are the only commands here that delete PART
+of the index on purpose. `ingest --recreate` deletes ALL of it — it drops
+the whole collection before re-ingesting, and empties the source catalog
+with it. All three confirm first. A plain `refresh` removes exactly one
+thing: a CHANGED file's old chunks, replaced by the re-ingested ones — and
+if that one file's ingest fails it can be left short in the index until the
+next successful run. Refresh works from the `sources:` list in config.yaml,
+not from its arguments.
+
+Also: `serve` / `start` / `status` / `url` / `open` / `tray` (the GUI),
+`stats` / `sources` / `citations` / `eval-runs` / `sessions` (the metadata
+catalog), and the `golden` group (generate / review / stats) for the eval set.
 
 Click is the only third-party dep. No TUI, no GUI — terminal-first per spec.
 """
@@ -193,14 +209,24 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
         )
 
     if zeal_path:
+        # Resolved through refresh's own helpers, not a second copy of the
+        # fallback. `.get(key, default)` returns None for a key that is PRESENT
+        # BUT NULL — `sqlite_filename:` with nothing after it — where the
+        # helper's `or` returns the default. The two spellings therefore
+        # disagreed on which file a docset is identified by: the ingest crashed
+        # on `Path / None` before it could write the marker, while refresh went
+        # on hashing docSet.dsidx. One resolution, one answer, and the marker
+        # below is keyed by the file refresh hashes.
+        from core import refresh as refresh_mod
+        zeal_index_name = refresh_mod.zeal_index_name(cfg)
         zi = ZealIngester(
             docset_path=zeal_path,
             target_tokens=cp["target_tokens"],
             overlap_pct=cp["overlap_pct"],
             min_chunk_tokens=cp["min_chunk_tokens"],
             default_topic=cp["default_topic"],
-            sqlite_filename=ing.get("zeal", {}).get("sqlite_filename", "docSet.dsidx"),
-            pages_dirname=ing.get("zeal", {}).get("pages_dirname", "Contents/Resources/Documents"),
+            sqlite_filename=zeal_index_name,
+            pages_dirname=refresh_mod.zeal_pages_dirname(cfg),
         )
         click.echo(f"ingesting zeal docset at {zeal_path} …")
         # For Zeal we don't recreate on the second source — only the first call
@@ -209,6 +235,20 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
             zi, embedder, store,
             recreate=False, batch_size=batch_size, metadata=metadata,
         )
+        if metadata is not None:
+            # Ingest writes one `sources` row per PAGE, so nothing here is keyed
+            # by the `.dsidx` that `rag refresh` hashes to decide whether the
+            # docset moved. Without this marker the natural sequence — ingest a
+            # docset by hand, then let the scheduled refresh take over — leaves
+            # the first refresh calling the docset "new" and re-embedding every
+            # page, which on a real docset is ~50,000 pages of wasted GPU time.
+            # After the ingest, never before: a marker over a half-written
+            # docset would make the next refresh call it unchanged.
+            # `.resolve()` matches the form `configured_sources` produces, so
+            # refresh's path comparison finds the row.
+            refresh_mod.record_zeal_marker(
+                metadata, Path(zeal_path).resolve(), zeal_index_name,
+            )
 
     if pdf_path:
         pi = PdfDirIngester(
@@ -265,6 +305,338 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
             sys.exit(1)
 
     click.echo(f"done. wrote {total} chunks into {store.collection}.")
+
+
+# -----------------------------------------------------------------------------
+# rag refresh / rag forget
+# -----------------------------------------------------------------------------
+#
+# `refresh` is the scheduled-task face of core/refresh.py: re-ingest what
+# changed, report what it found, and never delete anything unless asked twice.
+# `forget` is the deliberate-removal counterpart — the thing refresh points at
+# when it refuses to prune.
+
+# `get_sources()` defaults to limit=50. Taking that default in `forget` would
+# delete the first fifty rows and report success, having silently left the rest
+# of the topic indexed.
+FORGET_SOURCE_LIMIT = 1_000_000
+
+# How many vanished paths a refresh summary spells out per source before it
+# says "… and N more". Matches the preview `forget` prints before its prompt.
+VANISHED_PREVIEW = 10
+
+
+def _warn_if_refresh_will_undo_it(cfg: dict, deleted_paths: list[str]) -> None:
+    """After a forget, say so if the next refresh will simply put it back.
+
+    `forget` erases the chunks and the catalog row, but not the file. If that
+    file is still on disk under a configured source, the next `rag refresh`
+    finds it missing from `source_hashes()`, calls it NEW, and re-ingests it —
+    so a nightly task quietly reverses the one command the spec calls the
+    GDPR-shaped capability. There is no exclusion mechanism to hide behind, so
+    the honest thing is to say it at the moment the user is standing there.
+
+    Never raises: the deletes have already happened, and a config that cannot
+    be parsed must not turn a completed erasure into a traceback.
+    """
+    try:
+        from core import refresh as refresh_mod
+        entries = pipeline.configured_sources(cfg)
+        if not entries:
+            return
+        by_root: dict[str, int] = {}
+        for path in deleted_paths:
+            # Gone from disk means gone: refresh can only re-ingest what its
+            # walk can enumerate, so warning there would be noise on the
+            # ordinary case (delete the file, then forget it).
+            if not os.path.exists(path):
+                continue
+            owner = refresh_mod.owning_source(entries, path)
+            if owner is not None:
+                by_root[str(owner)] = by_root.get(str(owner), 0) + 1
+        if not by_root:
+            return
+        total = sum(by_root.values())
+        click.echo("", err=True)
+        click.echo(
+            f"warning: {total} of the file(s) you just forgot are still on disk "
+            "under a configured source:", err=True,
+        )
+        for root, n in sorted(by_root.items()):
+            click.echo(f"  {root}  ({n} file(s))", err=True)
+        click.echo(
+            "the next `rag refresh` will see them as new and will index them "
+            "again. To make this stick, remove that path from `sources:` in "
+            "config.yaml, or delete/move the files themselves.", err=True,
+        )
+    except Exception as e:  # pragma: no cover — defensive
+        log = logging.getLogger(__name__)
+        log.debug("forget: could not check the configured sources: %s", e)
+
+
+def _print_refresh_summary(plan, *, prune: bool, dry_run: bool) -> None:
+    """One block per source: what moved, and anything that needs a human.
+
+    Everything a source can report has to be visible here — an operator reading
+    a scheduled task's log has nothing else to go on.
+    """
+    for s in plan.sources:
+        # `vanished` is what the plan FOUND; on a real --prune run those rows
+        # are already gone by the time this prints, and calling them "vanished"
+        # would leave the operator unsure whether anything was removed. A
+        # blocked or failed source is skipped by the prune, so it keeps the
+        # planning word.
+        pruned = prune and not dry_run and not s.prune_blocked and not s.error
+        click.echo(f"  {s.type:<9} {s.path}")
+        click.echo(
+            f"      new {len(s.new)}  changed {len(s.changed)}  "
+            f"unchanged {s.unchanged}  "
+            f"{'pruned' if pruned else 'vanished'} {len(s.vanished)}"
+        )
+        if s.vanished:
+            # The count alone is not enough to consent to a delete: `vanished
+            # 40` from a renamed folder and `vanished 40` from forty files you
+            # meant to delete read identically, and --prune's own prompt tells
+            # the operator to come here and look. Capped so a corpus-wide prune
+            # cannot bury the summary under thousands of lines.
+            click.echo(f"      {'removed' if pruned else 'gone from disk, still indexed'}:")
+            for path in s.vanished[:VANISHED_PREVIEW]:
+                click.echo(f"        {path}")
+            if len(s.vanished) > VANISHED_PREVIEW:
+                click.echo(f"        … and {len(s.vanished) - VANISHED_PREVIEW} more")
+        if s.unreadable:
+            click.echo(
+                f"      unreadable {len(s.unreadable)} — left exactly as they "
+                f"are, not re-ingested (e.g. {s.unreadable[0]})"
+            )
+        if s.root_missing:
+            click.echo("      root not present — nothing under it was read or removed")
+        if s.prune_blocked:
+            # Printed verbatim: the engine's wording explains WHY, and second-
+            # guessing it here would drift from what actually happened.
+            click.echo(f"      not pruning: {s.prune_blocked}")
+        if s.error:
+            click.echo(f"      FAILED: {s.error}")
+
+    if plan.has_work:
+        # Only the sources that did not raise. A failed source indexed some,
+        # all, or none of its files — counting them here would make the headline
+        # claim work the stderr block below is simultaneously calling a failure.
+        clean = [s for s in plan.sources if not s.error]
+        did = "would re-ingest" if dry_run else "re-ingested"
+        line = (
+            f"{did} {sum(len(s.new) for s in clean)} new and "
+            f"{sum(len(s.changed) for s in clean)} changed file(s)"
+        )
+        attempted = sum(
+            len(s.new) + len(s.changed) for s in plan.sources if s.error
+        )
+        if attempted:
+            line += f"; {attempted} more were attempted by source(s) that failed"
+        click.echo(line + ".")
+    else:
+        click.echo("index is up to date — nothing to re-ingest.")
+
+    vanished = sum(len(s.vanished) for s in plan.sources)
+    if not vanished:
+        return
+    if not prune:
+        click.echo(
+            f"{vanished} recorded file(s) are gone from disk and are still in "
+            "the index. Re-run with --prune to remove them."
+        )
+        return
+    removed = sum(
+        len(s.vanished) for s in plan.sources if not s.prune_blocked and not s.error
+    )
+    verb = "would remove" if dry_run else "removed"
+    click.echo(f"{verb} {removed} vanished file(s) from the index.")
+
+
+@cli.command("refresh")
+@click.option("--prune", is_flag=True,
+              help="Also remove index entries whose file has vanished from disk.")
+@click.option("--dry-run", is_flag=True,
+              help="Plan only: report what would change and write nothing.")
+@click.option("--yes", "-y", is_flag=True,
+              help="Skip the confirmation prompt when using --prune.")
+@click.pass_context
+def refresh_cmd(ctx, prune, dry_run, yes):
+    """Re-ingest only the files that changed since the last run.
+
+    Reads the `sources:` list in config.yaml. An unchanged corpus costs a
+    directory walk and one hash per file — no embedding model is loaded.
+    """
+    # Lazy, like the other heavy imports: core.refresh pulls in the ingest
+    # stack. Imported as a module so the engine stays click-free.
+    from core import refresh as refresh_mod
+
+    cfg = ctx.obj["config"]
+
+    # Before anything is opened or read. --dry-run writes nothing by
+    # construction (run_refresh returns the plan before applying it), so there
+    # is nothing there to confirm.
+    if prune and not dry_run and not yes:
+        click.confirm(
+            "--prune will permanently DELETE the indexed chunks and catalog "
+            "rows of every recorded file that is no longer on disk. "
+            "Run with --dry-run to see what it would remove first. Continue?",
+            abort=True,
+        )
+
+    store = make_store(cfg)
+    metadata = make_metadata(cfg)
+    if metadata is None:
+        click.echo(
+            "error: refresh needs the metadata store — it is the only record of "
+            "what was ingested, and without it every file looks new. Set "
+            "`metadata.enabled: true` in config.yaml.",
+            err=True,
+        )
+        sys.exit(1)
+
+    try:
+        plan = refresh_mod.run_refresh(
+            cfg, metadata, store,
+            # A factory, NOT make_embedder(cfg): run_refresh calls it only if
+            # the plan has work, which is what keeps a no-op refresh from
+            # loading several GB of model.
+            lambda: make_embedder(cfg),
+            prune=prune,
+            dry_run=dry_run,
+        )
+    finally:
+        metadata.close()
+
+    if dry_run:
+        click.echo("dry run — nothing was written.")
+    _print_refresh_summary(plan, prune=prune, dry_run=dry_run)
+
+    # Task 5 made refresh resilient: a source that raises is recorded and the
+    # run continues, which is right for an unattended task but means a partly
+    # failed refresh would otherwise exit 0 and read exactly like a clean one.
+    # The exit contract reads the ENGINE'S property, so a failure the engine
+    # learns to report some other way still exits 1 here; the comprehension
+    # below is only the detail line, never the gate.
+    if plan.has_errors:
+        failed = [s for s in plan.sources if s.error]
+        click.echo(
+            f"error: the refresh did not complete cleanly — {len(failed)} "
+            "source(s) failed:", err=True,
+        )
+        for s in failed:
+            click.echo(f"  {s.type} {s.path}: {s.error}", err=True)
+        if failed:
+            click.echo(
+                "their files were left un-indexed or half-indexed; the next run "
+                "will retry them.", err=True,
+            )
+        else:
+            click.echo(
+                "  (the failure is not attached to any one source — see the log)",
+                err=True,
+            )
+    if plan.has_missing_roots:
+        click.echo(
+            "error: one or more source roots were not present — an unplugged "
+            "drive or an unmounted share, not an emptied corpus. Nothing under "
+            "them was ingested or pruned:", err=True,
+        )
+        for s in plan.sources:
+            if s.root_missing:
+                click.echo(f"  {s.type} {s.path}", err=True)
+    if plan.has_errors or plan.has_missing_roots:
+        sys.exit(1)
+
+
+@cli.command("forget")
+@click.option("--source", "source_path", default=None,
+              help="Delete one indexed file, by the path `rag sources` shows.")
+@click.option("--topic", default=None, help="Delete every indexed file with this topic.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+@click.pass_context
+def forget(ctx, source_path, topic, yes):
+    """Delete a source (or a whole topic) from the index and the catalog.
+
+    This is the deliberate counterpart to `rag refresh --prune`, which refuses
+    to delete anything it is not certain about.
+    """
+    if bool(source_path) == bool(topic):
+        raise click.UsageError("pass exactly one of --source or --topic")
+
+    cfg = ctx.obj["config"]
+    store = make_store(cfg)
+    metadata = make_metadata(cfg)
+    if metadata is None:
+        click.echo(
+            "error: forget needs the metadata store to know what is indexed. "
+            "Set `metadata.enabled: true` in config.yaml.", err=True,
+        )
+        sys.exit(1)
+
+    removed = 0
+    deleted_any = False
+    try:
+        rows = metadata.get_sources(limit=FORGET_SOURCE_LIMIT)
+        if topic:
+            targets = [r["source_path"] for r in rows if r["topic"] == topic]
+            what = f"topic {topic!r}"
+        else:
+            targets = [r["source_path"] for r in rows if r["source_path"] == source_path]
+            if not targets:
+                # The catalog stores whatever path the ingest was given. A user
+                # typing a relative one at a different prompt means the same
+                # file, so compare canonical forms before giving up.
+                wanted = os.path.normcase(os.path.abspath(source_path))
+                targets = [
+                    r["source_path"] for r in rows
+                    if os.path.normcase(os.path.abspath(r["source_path"])) == wanted
+                ]
+            what = f"source {source_path!r}"
+
+        if not targets:
+            click.echo(
+                f"error: nothing indexed matches {what}. "
+                "Run `rag sources` to see what is there.", err=True,
+            )
+            sys.exit(1)
+
+        click.echo(f"{len(targets)} indexed source(s) match {what}:")
+        for t in targets[:10]:
+            click.echo(f"  {t}")
+        if len(targets) > 10:
+            click.echo(f"  … and {len(targets) - 10} more")
+
+        if not yes:
+            click.confirm(
+                "permanently delete their chunks from the index and their rows "
+                "from the catalog?",
+                abort=True,
+            )
+
+        for path in targets:
+            n = store.delete_by_source(path)
+            # Guarded, not `+= n`: a store returning None would raise here,
+            # AFTER the deletes had already happened — losing the summary and
+            # the cache invalidation over a cosmetic count.
+            removed += n if isinstance(n, int) else 0
+            metadata.delete_source(path)
+            deleted_any = True
+    finally:
+        # Invalidation FIRST. The corpus shrank; a cached IDF map built over the
+        # old one silently skews the next hybrid query. In a finally, like the
+        # engine's prune loop: a store that dies halfway through has still moved
+        # the corpus, and that is exactly when a stale map would go unnoticed.
+        # Ahead of close() because this is an in-process dict mutation that
+        # cannot meaningfully fail, while sqlite3.close() can — and a raising
+        # close would otherwise skip it. Called through the module so the live
+        # function runs.
+        if deleted_any:
+            pipeline.invalidate_hybrid_cache()
+        metadata.close()
+
+    click.echo(f"forgot {len(targets)} source(s); removed {removed} chunk(s).")
+    _warn_if_refresh_will_undo_it(cfg, targets)
 
 
 # -----------------------------------------------------------------------------
@@ -687,7 +1059,10 @@ def _open_metadata(cfg: dict) -> MetadataStore:
         raise click.UsageError(
             "metadata is disabled in config.yaml. Set `metadata.enabled: true` to use this command."
         )
-    return MetadataStore(meta_cfg.get("path", "./metadata.sqlite3"))
+    # Through the same resolver make_metadata uses. A second spelling of the
+    # default is a second answer: these commands would report on an empty
+    # database in whatever directory the user happened to be standing in.
+    return MetadataStore(pipeline.resolve_metadata_path(cfg))
 
 
 @cli.command("citations")

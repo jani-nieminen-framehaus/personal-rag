@@ -32,6 +32,7 @@ from typing import Iterator
 
 from core.chunker import _split_by_tokens, count_tokens
 from core.interfaces import Chunk, Ingester, make_chunk_id, make_parent_id
+from core.walk import iter_source_files
 
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ class PdfDirIngester(Ingester):
         default_topic: str,
         max_chunks_per_doc: int = 5000,
         skip_hidden: bool = True,
+        only_paths: set[Path] | None = None,
     ):
         self.path = Path(path).resolve()
         if not self.path.exists():
@@ -79,6 +81,7 @@ class PdfDirIngester(Ingester):
         self.default_topic = default_topic
         self.max_chunks_per_doc = max_chunks_per_doc
         self.skip_hidden = skip_hidden
+        self.only_paths = only_paths
 
     @property
     def name(self) -> str:
@@ -97,20 +100,10 @@ class PdfDirIngester(Ingester):
     # -- helpers --------------------------------------------------------------
 
     def _collect_files(self) -> list[Path]:
-        if self.is_file:
-            return [self.path]
-        out: list[Path] = []
-        for p in self.path.rglob("*"):
-            if not p.is_file():
-                continue
-            if p.suffix.lower() != ".pdf":
-                continue
-            if self.skip_hidden and any(
-                part.startswith(".") for part in p.relative_to(self.path).parts
-            ):
-                continue
-            out.append(p)
-        return sorted(out)
+        return iter_source_files(
+            self.path, {".pdf"},
+            skip_hidden=self.skip_hidden, only_paths=self.only_paths,
+        )
 
     def _iter_one_pdf(self, file: Path) -> Iterator[Chunk]:
         # pymupdf is imported lazily so the rest of the system can
