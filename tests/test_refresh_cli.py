@@ -1,6 +1,7 @@
 """CLI surface for refresh and forget. Deleting paths must be opt-in."""
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -8,6 +9,11 @@ from unittest.mock import MagicMock
 from click.testing import CliRunner
 
 
+# Every MagicMock plan below states all four flags. An unset attribute on a
+# MagicMock is an auto-created child mock, which is TRUTHY — so a plan that did
+# not mention `has_errors` would silently claim a failed refresh, and the CLI
+# would have to derive errors from `sources` to work around the mock instead of
+# reading the engine's own property. State the plan you mean.
 def _patch(monkeypatch, store=None, metadata=None):
     import cli as cli_mod
     monkeypatch.setattr(cli_mod, "make_embedder", lambda cfg: MagicMock())
@@ -18,7 +24,8 @@ def _patch(monkeypatch, store=None, metadata=None):
 
 def test_refresh_reports_when_nothing_changed(monkeypatch):
     cli_mod = _patch(monkeypatch)
-    plan = MagicMock(has_work=False, has_missing_roots=False, sources=[])
+    plan = MagicMock(has_work=False, has_missing_roots=False,
+                     has_errors=False, has_blocked_prunes=False, sources=[])
     monkeypatch.setattr("core.refresh.run_refresh", lambda *a, **k: plan)
     res = CliRunner().invoke(cli_mod.cli, ["refresh"])
     assert res.exit_code == 0
@@ -28,7 +35,8 @@ def test_refresh_reports_when_nothing_changed(monkeypatch):
 def test_refresh_exits_nonzero_when_a_root_is_missing(monkeypatch):
     """A source that vanished from disk is an operational problem, not a no-op."""
     cli_mod = _patch(monkeypatch)
-    plan = MagicMock(has_work=False, has_missing_roots=True, sources=[])
+    plan = MagicMock(has_work=False, has_missing_roots=True,
+                     has_errors=False, has_blocked_prunes=False, sources=[])
     monkeypatch.setattr("core.refresh.run_refresh", lambda *a, **k: plan)
     res = CliRunner().invoke(cli_mod.cli, ["refresh"])
     assert res.exit_code == 1
@@ -39,7 +47,8 @@ def test_refresh_prune_requires_confirmation(monkeypatch):
     called = {}
     def fake(*a, **k):
         called.update(k)
-        return MagicMock(has_work=False, has_missing_roots=False, sources=[])
+        return MagicMock(has_work=False, has_missing_roots=False,
+                         has_errors=False, has_blocked_prunes=False, sources=[])
     monkeypatch.setattr("core.refresh.run_refresh", fake)
     res = CliRunner().invoke(cli_mod.cli, ["refresh", "--prune"], input="n\n")
     assert res.exit_code != 0
@@ -51,7 +60,8 @@ def test_refresh_prune_with_yes_skips_the_prompt(monkeypatch):
     seen = {}
     def fake(*a, **k):
         seen.update(k)
-        return MagicMock(has_work=False, has_missing_roots=False, sources=[])
+        return MagicMock(has_work=False, has_missing_roots=False,
+                         has_errors=False, has_blocked_prunes=False, sources=[])
     monkeypatch.setattr("core.refresh.run_refresh", fake)
     res = CliRunner().invoke(cli_mod.cli, ["refresh", "--prune", "--yes"])
     assert res.exit_code == 0
@@ -126,7 +136,8 @@ def test_refresh_exits_nonzero_when_a_source_failed(monkeypatch):
     reads exactly like a clean one."""
     cli_mod = _patch(monkeypatch)
     bad = _source(path=Path("D:/papers"), type="pdf", error="RuntimeError: bad xref")
-    plan = MagicMock(has_work=True, has_missing_roots=False, sources=[bad])
+    plan = MagicMock(has_work=True, has_missing_roots=False,
+                     has_errors=True, has_blocked_prunes=False, sources=[bad])
     monkeypatch.setattr("core.refresh.run_refresh", lambda *a, **k: plan)
     res = CliRunner().invoke(cli_mod.cli, ["refresh"])
     assert res.exit_code == 1
@@ -134,12 +145,44 @@ def test_refresh_exits_nonzero_when_a_source_failed(monkeypatch):
     assert "papers" in res.output
 
 
+def test_refresh_exit_is_wired_to_the_engines_has_errors(monkeypatch):
+    """The gate reads `plan.has_errors`, not a comprehension over `sources`.
+    If RefreshPlan ever reports a failure that is not attached to a source — a
+    plan_refresh partial failure, a source that could not be constructed —
+    exit 1 has to follow the property, with nothing silently opting out."""
+    cli_mod = _patch(monkeypatch)
+    plan = MagicMock(has_work=False, has_missing_roots=False,
+                     has_errors=True, has_blocked_prunes=False, sources=[])
+    monkeypatch.setattr("core.refresh.run_refresh", lambda *a, **k: plan)
+    res = CliRunner().invoke(cli_mod.cli, ["refresh"])
+    assert res.exit_code == 1
+    assert "did not complete cleanly" in res.output
+    assert "not attached to any one source" in res.output
+
+
+def test_refresh_headline_does_not_count_a_failed_sources_files_as_done(monkeypatch):
+    """The stderr block calls the source a failure; the headline must not
+    simultaneously count its files as re-ingested."""
+    cli_mod = _patch(monkeypatch)
+    ok = _source(new=[Path("a.md")])
+    bad = _source(path=Path("D:/papers"), type="pdf",
+                  new=[Path("b.pdf"), Path("c.pdf")], error="RuntimeError: bad xref")
+    plan = MagicMock(has_work=True, has_missing_roots=False,
+                     has_errors=True, has_blocked_prunes=False, sources=[ok, bad])
+    monkeypatch.setattr("core.refresh.run_refresh", lambda *a, **k: plan)
+    res = CliRunner().invoke(cli_mod.cli, ["refresh"])
+    assert res.exit_code == 1
+    assert "re-ingested 1 new and 0 changed file(s)" in res.output
+    assert "2 more were attempted by source(s) that failed" in res.output
+
+
 def test_refresh_blocked_prune_is_reported_but_is_not_a_failure(monkeypatch):
     """A blocked prune is the safety property doing its job — say so verbatim,
     exit 0."""
     cli_mod = _patch(monkeypatch)
     blocked = _source(prune_blocked="the root is present but enumerated no files")
-    plan = MagicMock(has_work=False, has_missing_roots=False, sources=[blocked])
+    plan = MagicMock(has_work=False, has_missing_roots=False,
+                     has_errors=False, has_blocked_prunes=True, sources=[blocked])
     monkeypatch.setattr("core.refresh.run_refresh", lambda *a, **k: plan)
     res = CliRunner().invoke(cli_mod.cli, ["refresh", "--prune", "--yes"])
     assert res.exit_code == 0
@@ -150,7 +193,8 @@ def test_refresh_summary_shows_the_per_source_counts(monkeypatch):
     cli_mod = _patch(monkeypatch)
     s = _source(new=[Path("a.md")], changed=[Path("b.md"), Path("c.md")],
                 unchanged=41, vanished=["d.md"], unreadable=[Path("e.md")])
-    plan = MagicMock(has_work=True, has_missing_roots=False, sources=[s])
+    plan = MagicMock(has_work=True, has_missing_roots=False,
+                     has_errors=False, has_blocked_prunes=False, sources=[s])
     monkeypatch.setattr("core.refresh.run_refresh", lambda *a, **k: plan)
     res = CliRunner().invoke(cli_mod.cli, ["refresh"])
     assert res.exit_code == 0
@@ -165,7 +209,8 @@ def test_refresh_says_pruned_once_the_rows_are_actually_gone(monkeypatch):
     operator wondering whether anything happened."""
     cli_mod = _patch(monkeypatch)
     s = _source(unchanged=9, vanished=["d.md", "e.md"])
-    plan = MagicMock(has_work=False, has_missing_roots=False, sources=[s])
+    plan = MagicMock(has_work=False, has_missing_roots=False,
+                     has_errors=False, has_blocked_prunes=False, sources=[s])
     monkeypatch.setattr("core.refresh.run_refresh", lambda *a, **k: plan)
 
     done = CliRunner().invoke(cli_mod.cli, ["refresh", "--prune", "--yes"])
@@ -183,7 +228,8 @@ def test_refresh_does_not_claim_to_have_pruned_a_blocked_source(monkeypatch):
     there — the planning word is the honest one."""
     cli_mod = _patch(monkeypatch)
     s = _source(vanished=["d.md"], prune_blocked="the source root is not present")
-    plan = MagicMock(has_work=False, has_missing_roots=False, sources=[s])
+    plan = MagicMock(has_work=False, has_missing_roots=False,
+                     has_errors=False, has_blocked_prunes=True, sources=[s])
     monkeypatch.setattr("core.refresh.run_refresh", lambda *a, **k: plan)
     res = CliRunner().invoke(cli_mod.cli, ["refresh", "--prune", "--yes"])
     assert "vanished 1" in res.output
@@ -201,7 +247,8 @@ def test_refresh_does_not_build_an_embedder_when_there_is_no_work(monkeypatch):
 
     def fake(cfg, metadata, store, embedder_factory, **k):
         assert callable(embedder_factory)
-        return MagicMock(has_work=False, has_missing_roots=False, sources=[])
+        return MagicMock(has_work=False, has_missing_roots=False,
+                         has_errors=False, has_blocked_prunes=False, sources=[])
 
     monkeypatch.setattr("core.refresh.run_refresh", fake)
     res = CliRunner().invoke(cli_mod.cli, ["refresh"])
@@ -214,12 +261,35 @@ def test_refresh_dry_run_passes_dry_run_through(monkeypatch):
     seen = {}
     def fake(*a, **k):
         seen.update(k)
-        return MagicMock(has_work=True, has_missing_roots=False, sources=[])
+        return MagicMock(has_work=True, has_missing_roots=False,
+                         has_errors=False, has_blocked_prunes=False, sources=[])
     monkeypatch.setattr("core.refresh.run_refresh", fake)
     res = CliRunner().invoke(cli_mod.cli, ["refresh", "--dry-run"])
     assert res.exit_code == 0
     assert seen["dry_run"] is True
     assert "dry run" in res.output.lower()
+
+
+def test_forget_matches_an_equivalent_spelling_of_the_same_path(tmp_path, monkeypatch):
+    """Branch logic deciding what a destructive command deletes. The catalog
+    stores whatever path the ingest was given; a user typing an equivalent form
+    means the same file — and the row must still be deleted by its RECORDED
+    key, which is what the store and the catalog need back."""
+    recorded = str(tmp_path / "a.md")
+    equivalent = f"{tmp_path}{os.sep}.{os.sep}a.md"   # same file, different spelling
+    assert equivalent != recorded
+
+    store, meta = MagicMock(), MagicMock()
+    store.delete_by_source.return_value = 5
+    meta.get_sources.return_value = [
+        {"source_path": recorded, "topic": "t"},
+        {"source_path": str(tmp_path / "b.md"), "topic": "t"},
+    ]
+    cli_mod = _patch(monkeypatch, store=store, metadata=meta)
+    res = CliRunner().invoke(cli_mod.cli, ["forget", "--source", equivalent, "--yes"])
+    assert res.exit_code == 0, res.output
+    store.delete_by_source.assert_called_once_with(recorded)
+    meta.delete_source.assert_called_once_with(recorded)
 
 
 def test_forget_invalidates_the_hybrid_cache(monkeypatch):
@@ -251,6 +321,21 @@ def test_forget_invalidates_the_cache_even_if_a_delete_blows_up_halfway(monkeypa
     assert res.exit_code != 0
     assert calls == [1]
     meta.close.assert_called_once()
+
+
+def test_forget_invalidates_the_cache_even_if_closing_metadata_raises(monkeypatch):
+    """Same failure mode one line over: the invalidation cannot sit behind
+    anything that can fail. `sqlite3.close()` can; a dict mutation cannot."""
+    store, meta = MagicMock(), MagicMock()
+    store.delete_by_source.return_value = 1
+    meta.get_sources.return_value = [{"source_path": "/a.md", "topic": "t"}]
+    meta.close.side_effect = RuntimeError("sqlite handle already gone")
+    cli_mod = _patch(monkeypatch, store=store, metadata=meta)
+    calls = []
+    monkeypatch.setattr("core.pipeline.invalidate_hybrid_cache", lambda: calls.append(1))
+    res = CliRunner().invoke(cli_mod.cli, ["forget", "--source", "/a.md", "--yes"])
+    assert res.exit_code != 0
+    assert calls == [1]
 
 
 def test_forget_does_not_invalidate_the_cache_when_it_deleted_nothing(monkeypatch):
@@ -333,6 +418,41 @@ def test_zeal_ingest_records_the_dsidx_marker(tmp_path, monkeypatch):
     assert marker.kwargs["file_hash"]
     # Written before the store is closed, or it is not written at all.
     assert meta.close.called
+
+
+def test_zeal_marker_survives_a_present_but_null_sqlite_filename(tmp_path, monkeypatch):
+    """`.get(key, default)` returns None for a key that is present-but-null,
+    while refresh resolves the same key with `or`. Two spellings would key the
+    marker by a different file than plan_refresh hashes — silently restoring
+    the re-ingest the marker exists to prevent."""
+    import yaml
+
+    from core import refresh
+
+    docset = tmp_path / "Test.docset"
+    docset.mkdir()
+    _make_fake_docset(docset)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "chunking:\n  target_tokens: 768\n  overlap_pct: 12\n  min_chunk_tokens: 8\n"
+        "ingest:\n  default_topic: t\n  zeal:\n    sqlite_filename:\n",
+        encoding="utf-8",
+    )
+    # The premise: YAML reads a bare key as None, not as a missing key.
+    loaded = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+    assert loaded["ingest"]["zeal"] == {"sqlite_filename": None}
+
+    meta = MagicMock()
+    cli_mod = _patch(monkeypatch, metadata=meta)
+    monkeypatch.setattr(cli_mod, "ingest_pipeline", lambda *a, **k: 4)
+
+    res = CliRunner().invoke(
+        cli_mod.cli, ["-c", str(cfg), "ingest", "--zeal", str(docset)])
+    assert res.exit_code == 0, res.output
+
+    idx = str((docset / "Contents" / "Resources" / refresh.DEFAULT_ZEAL_INDEX).resolve())
+    recorded = {c.kwargs.get("source_path") for c in meta.record_source.call_args_list}
+    assert idx in recorded, recorded
 
 
 def test_zeal_marker_is_not_written_when_the_ingest_fails(tmp_path, monkeypatch):

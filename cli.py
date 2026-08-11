@@ -193,7 +193,17 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
         )
 
     if zeal_path:
-        zeal_index_name = ing.get("zeal", {}).get("sqlite_filename", "docSet.dsidx")
+        # Resolved through refresh's own constant and its `or`-style fallback,
+        # not a second copy of the default. `.get(key, default)` returns None
+        # for a key that is PRESENT BUT NULL — `sqlite_filename:` with nothing
+        # after it — where refresh's `or` returns the default. The two spellings
+        # therefore disagreed on which file a docset is identified by: the
+        # ingest crashed on `Path / None` before it could write the marker,
+        # while refresh went on hashing docSet.dsidx. One resolution, one
+        # answer, and the marker below is keyed by the file refresh hashes.
+        from core import refresh as refresh_mod
+        zeal_cfg = ing.get("zeal") or {}
+        zeal_index_name = zeal_cfg.get("sqlite_filename") or refresh_mod.DEFAULT_ZEAL_INDEX
         zi = ZealIngester(
             docset_path=zeal_path,
             target_tokens=cp["target_tokens"],
@@ -201,7 +211,7 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
             min_chunk_tokens=cp["min_chunk_tokens"],
             default_topic=cp["default_topic"],
             sqlite_filename=zeal_index_name,
-            pages_dirname=ing.get("zeal", {}).get("pages_dirname", "Contents/Resources/Documents"),
+            pages_dirname=zeal_cfg.get("pages_dirname", "Contents/Resources/Documents"),
         )
         click.echo(f"ingesting zeal docset at {zeal_path} …")
         # For Zeal we don't recreate on the second source — only the first call
@@ -221,7 +231,6 @@ def ingest(ctx, markdown_path, zeal_path, pdf_path, epub_path, recreate, batch_s
             # docset would make the next refresh call it unchanged.
             # `.resolve()` matches the form `configured_sources` produces, so
             # refresh's path comparison finds the row.
-            from core import refresh as refresh_mod
             refresh_mod.record_zeal_marker(
                 metadata, Path(zeal_path).resolve(), zeal_index_name,
             )
@@ -332,11 +341,21 @@ def _print_refresh_summary(plan, *, prune: bool, dry_run: bool) -> None:
             click.echo(f"      FAILED: {s.error}")
 
     if plan.has_work:
+        # Only the sources that did not raise. A failed source indexed some,
+        # all, or none of its files — counting them here would make the headline
+        # claim work the stderr block below is simultaneously calling a failure.
+        clean = [s for s in plan.sources if not s.error]
         did = "would re-ingest" if dry_run else "re-ingested"
-        click.echo(
-            f"{did} {sum(len(s.new) for s in plan.sources)} new and "
-            f"{sum(len(s.changed) for s in plan.sources)} changed file(s)."
+        line = (
+            f"{did} {sum(len(s.new) for s in clean)} new and "
+            f"{sum(len(s.changed) for s in clean)} changed file(s)"
         )
+        attempted = sum(
+            len(s.new) + len(s.changed) for s in plan.sources if s.error
+        )
+        if attempted:
+            line += f"; {attempted} more were attempted by source(s) that failed"
+        click.echo(line + ".")
     else:
         click.echo("index is up to date — nothing to re-ingest.")
 
@@ -382,7 +401,8 @@ def refresh_cmd(ctx, prune, dry_run, yes):
     if prune and not dry_run and not yes:
         click.confirm(
             "--prune will permanently DELETE the indexed chunks and catalog "
-            "rows of every recorded file that is no longer on disk. Continue?",
+            "rows of every recorded file that is no longer on disk. "
+            "Run with --dry-run to see the exact list first. Continue?",
             abort=True,
         )
 
@@ -417,17 +437,27 @@ def refresh_cmd(ctx, prune, dry_run, yes):
     # Task 5 made refresh resilient: a source that raises is recorded and the
     # run continues, which is right for an unattended task but means a partly
     # failed refresh would otherwise exit 0 and read exactly like a clean one.
-    # This is `plan.has_errors`, spelled out — the list is needed anyway to say
-    # which source failed and why.
-    failed = [s for s in plan.sources if s.error]
-    if failed:
-        click.echo(f"error: {len(failed)} source(s) failed to refresh:", err=True)
+    # The exit contract reads the ENGINE'S property, so a failure the engine
+    # learns to report some other way still exits 1 here; the comprehension
+    # below is only the detail line, never the gate.
+    if plan.has_errors:
+        failed = [s for s in plan.sources if s.error]
+        click.echo(
+            f"error: the refresh did not complete cleanly — {len(failed)} "
+            "source(s) failed:", err=True,
+        )
         for s in failed:
             click.echo(f"  {s.type} {s.path}: {s.error}", err=True)
-        click.echo(
-            "their files were left un-indexed or half-indexed; the next run "
-            "will retry them.", err=True,
-        )
+        if failed:
+            click.echo(
+                "their files were left un-indexed or half-indexed; the next run "
+                "will retry them.", err=True,
+            )
+        else:
+            click.echo(
+                "  (the failure is not attached to any one source — see the log)",
+                err=True,
+            )
     if plan.has_missing_roots:
         click.echo(
             "error: one or more source roots were not present — an unplugged "
@@ -437,7 +467,7 @@ def refresh_cmd(ctx, prune, dry_run, yes):
         for s in plan.sources:
             if s.root_missing:
                 click.echo(f"  {s.type} {s.path}", err=True)
-    if failed or plan.has_missing_roots:
+    if plan.has_errors or plan.has_missing_roots:
         sys.exit(1)
 
 
@@ -515,14 +545,17 @@ def forget(ctx, source_path, topic, yes):
             metadata.delete_source(path)
             deleted_any = True
     finally:
-        metadata.close()
+        # Invalidation FIRST. The corpus shrank; a cached IDF map built over the
+        # old one silently skews the next hybrid query. In a finally, like the
+        # engine's prune loop: a store that dies halfway through has still moved
+        # the corpus, and that is exactly when a stale map would go unnoticed.
+        # Ahead of close() because this is an in-process dict mutation that
+        # cannot meaningfully fail, while sqlite3.close() can — and a raising
+        # close would otherwise skip it. Called through the module so the live
+        # function runs.
         if deleted_any:
-            # The corpus shrank; a cached IDF map built over the old one
-            # silently skews the next hybrid query. In a finally, like the
-            # engine's prune loop: a store that dies halfway through has still
-            # moved the corpus, and that is exactly when a stale map would go
-            # unnoticed. Called through the module so the live function runs.
             pipeline.invalidate_hybrid_cache()
+        metadata.close()
 
     click.echo(f"forgot {len(targets)} source(s); removed {removed} chunk(s).")
 
