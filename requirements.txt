@@ -1,5 +1,4 @@
-# RAG Walking Skeleton — P0
-# Tested with Python 3.12 on Windows 11.
+# RAG — Python 3.11+ on Linux.
 # Pinned to known-good major versions; bump one at a time if you hit issues.
 
 # --- Core runtime ---
@@ -18,9 +17,8 @@ fastapi>=0.110.0,<1
 uvicorn[standard]>=0.27.0,<1
 python-multipart>=0.0.9,<1
 
-# --- Tray icon (P1) ---
-pystray>=0.19.5,<1
-Pillow>=10.0.0,<11
+# --- Desktop window ---
+PySide6>=6.6,<7
 
 # --- PDF ingester (P1) ---
 pymupdf>=1.24.0,<2
@@ -33,9 +31,8 @@ qdrant-client>=1.10.0,<2
 
 # --- Embeddings (Qwen3-Embedding-8B, Q4 via bitsandbytes) ---
 # sentence-transformers pulls in transformers, tokenizers, etc.
-# NOTE: PyPI's Windows torch wheel is CPU-only. For the 48 GB GPU, install
-# torch from the CUDA index instead (then set embedder.device: cuda and
-# quant: q4 in config.yaml):
+# The default PyPI torch wheel may be CPU-only. For an NVIDIA GPU, install
+# the CUDA wheel first (then set embedder.device: cuda and quant: q4):
 #   pip install torch --index-url https://download.pytorch.org/whl/cu126
 sentence-transformers>=3.0.0,<4
 transformers>=4.43.0,<5

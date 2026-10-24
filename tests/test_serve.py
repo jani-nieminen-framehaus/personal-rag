@@ -157,33 +157,8 @@ def test_open_invokes_webbrowser_when_running(tmp_path, monkeypatch):
     assert captured.get("url") == "http://localhost:8420"
 
 
-def test_start_dispatches_to_powershell_on_windows(monkeypatch):
-    """On Windows, `rag start --no-browser` invokes start_all.ps1 with the
-    -NoBrowser flag. subprocess.call is mocked; the real script exists in
-    this repo, so the dispatch actually fires and we assert the call shape."""
-    from click.testing import CliRunner
-    from cli import cli as cli_group
-
-    captured: dict = {}
-
-    def fake_call(cmd, *args, **kwargs):
-        captured["cmd"] = list(cmd)
-        return 0
-
-    monkeypatch.setattr("cli.subprocess.call", fake_call)
-    monkeypatch.setattr("cli.sys.platform", "win32")
-    res = CliRunner().invoke(cli_group, ["start", "--no-browser"])
-
-    assert res.exit_code == 0, res.output
-    cmd = captured.get("cmd")
-    assert cmd, "subprocess.call was never invoked"
-    assert cmd[0] == "powershell.exe"
-    assert any(str(a).endswith("start_all.ps1") for a in cmd)
-    assert "-NoBrowser" in cmd
-
-
-def test_start_dispatches_to_shell_off_windows(monkeypatch):
-    """Off Windows, `rag start --no-browser` invokes start_all.sh.
+def test_start_dispatches_to_shell(monkeypatch):
+    """`rag start --no-browser` invokes start_all.sh.
     subprocess.call is mocked; the real script is not executed."""
     from click.testing import CliRunner
     from cli import cli as cli_group
@@ -206,13 +181,6 @@ def test_start_dispatches_to_shell_off_windows(monkeypatch):
     assert "--no-browser" in cmd
 
 
-def test_start_script_file_exists():
-    """The PowerShell orchestrator script must be present on disk."""
-    from pathlib import Path
-    p = Path(__file__).resolve().parent.parent / "scripts" / "start_all.ps1"
-    assert p.is_file(), f"missing: {p}"
-
-
 def test_start_shell_script_file_exists():
     """The Linux/macOS orchestrator script must be present on disk."""
     from pathlib import Path
@@ -220,39 +188,36 @@ def test_start_shell_script_file_exists():
     assert p.is_file(), f"missing: {p}"
 
 
-def test_create_desktop_shortcut_script_exists():
-    """The desktop-shortcut script must be present on disk."""
+def test_start_shell_opens_desktop_window():
+    """Linux `./rag` opens the desktop window and does not open a browser."""
     from pathlib import Path
-    p = Path(__file__).resolve().parent.parent / "scripts" / "create-desktop-shortcut.ps1"
-    assert p.is_file(), f"missing: {p}"
+    p = Path(__file__).resolve().parent.parent / "scripts" / "start_all.sh"
+    content = p.read_text(encoding="utf-8")
+    assert "-m cli gui" in content
+    assert "xdg-open" not in content
+
+
+def test_gui_help_does_not_import_pyside():
+    """`rag gui --help` must work without importing PySide6."""
+    import sys
+    from click.testing import CliRunner
+    from cli import cli as cli_group
+
+    before = set(sys.modules)
+    res = CliRunner().invoke(cli_group, ["gui", "--help"])
+    assert res.exit_code == 0, res.output
+    assert "Ask" in res.output
+    added = set(sys.modules) - before
+    assert not any(name == "PySide6" or name.startswith("PySide6.") for name in added)
 
 
 def test_library_endpoints_registered():
-    """The four P2 library endpoints must be present on the FastAPI app."""
+    """The four library endpoints must be present on the FastAPI app."""
     import serve
     app = serve.app
     paths = {getattr(r, "path", "") for r in app.routes}
     for p in ("/api/sources", "/api/citations", "/api/eval-runs", "/api/stats"):
         assert p in paths, f"{p} missing; routes: {sorted(paths)}"
-
-
-def test_rag_bat_defaults_to_start_when_no_args():
-    """`rag.bat` with no args should call `python cli.py start` (desktop-shortcut UX)."""
-    from pathlib import Path
-    p = Path(__file__).resolve().parent.parent / "rag.bat"
-    content = p.read_text(encoding="utf-8")
-    # The no-args branch should invoke `start` so the desktop shortcut
-    # brings up the whole stack.
-    assert "cli.py\" start" in content
-    assert "if \"%*\"==\"\"" in content
-
-
-def test_rag_ps1_defaults_to_start_when_no_args():
-    """`rag.ps1` with no args should also default to `start`."""
-    from pathlib import Path
-    p = Path(__file__).resolve().parent.parent / "rag.ps1"
-    content = p.read_text(encoding="utf-8")
-    assert "cli.py') start" in content
 
 
 def test_rag_shell_defaults_to_start_when_no_args():

@@ -66,9 +66,9 @@ generator:
     Never invent citations. Prefer concrete, terse answers.
 
 # ---- Store -------------------------------------------------------------------
-# Qdrant runs on Windows (binary or Docker) or anywhere reachable.
-# NOTE: this machine uses :7333 — IPv4 :6333 is squatted by a leaked socket
-# held by another local agent process (see README troubleshooting).
+# Qdrant is a separate process. The URL is whatever this machine runs.
+# The committed value is port 7333; Qdrant's own default is 6333.
+# Set store.url to the port you actually use.
 store:
   class: store.qdrant_store.QdrantStore
   url: http://localhost:7333

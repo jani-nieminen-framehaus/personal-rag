@@ -1,13 +1,12 @@
 """FastAPI server for the RAG GUI.
 
-Run via:
+The desktop window is `rag gui`. This server is the browser page:
+
     python cli.py serve             # binds 127.0.0.1:8420 by default
     RAG_PORT=9000 python cli.py serve
     RAG_HOST=0.0.0.0 python cli.py serve  # expose to LAN
 
-Auto-launched on user logon via the Task Scheduler entry created by
-scripts/install-service.ps1. The state file at
-%USERPROFILE%\\.rag\\state.json records the port, PID, and URL so
+The state file at `~/.rag/state.json` records the port, PID, and URL so
 `rag status` / `rag url` can find the running server.
 """
 from __future__ import annotations
@@ -45,8 +44,7 @@ from core.pipeline import (
 
 log = logging.getLogger("rag.serve")
 
-# Persistent state: constants live in service_state.py (single source of
-# truth, mirrored for PowerShell in scripts/_config.ps1). Module-level
+# Persistent state: constants live in service_state.py. Module-level
 # aliases kept so tests can monkeypatch serve.STATE_FILE.
 DEFAULT_PORT = service_state.DEFAULT_PORT
 DEFAULT_HOST = "127.0.0.1"

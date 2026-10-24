@@ -1,12 +1,9 @@
 """Single source of truth for the GUI service state file.
 
 `~/.rag/state.json` is written by serve.py on startup, read by `rag status`
-/ `rag url` / `rag open` and the tray icon, and cleared on clean shutdown.
+/ `rag url` / `rag open`, and cleared on clean shutdown.
 The PID in the file guards against clearing state that belongs to another
 server instance.
-
-The PowerShell mirror of these constants and helpers lives in
-`scripts/_config.ps1` — keep the two in sync.
 """
 from __future__ import annotations
 

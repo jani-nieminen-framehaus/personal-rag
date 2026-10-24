@@ -1,9 +1,8 @@
 # rag — personal, multi-topic RAG (P0 walking skeleton)
 
-> A terminal-first RAG CLI for your own knowledge base. Plain Python 3.11+,
+> A RAG CLI and desktop window for your own knowledge base. Plain Python 3.11+,
 > no LangChain / LlamaIndex. Every model is swappable from `config.yaml`.
-> Built for Windows 11 + Ollama on a 48 GB VRAM rig. No WSL2, no Docker
-> Desktop, no GUI.
+> Built for Linux + Ollama. `./rag` opens the desktop window.
 
 ```
 $ rag ask "What was YaRN about?"
@@ -23,7 +22,8 @@ fine-tuning [1][2].
 
 ## What's in the box
 
-- `cli.py` — `rag ask`, `rag ingest`, `rag eval` (Click-based, terminal-only)
+- `cli.py` — `rag ask`, `rag ingest`, `rag eval`, `rag gui`
+- `gui.py` — desktop window (Ask, Ingest, Library) over the same pipeline
 - `core/` — interfaces, structure-aware chunker, pipeline orchestrator
 - `providers/` — Qwen3-Embedding-8B embedder, Ollama generator, BGE-reranker stub
 - `ingest/` — Markdown directory + Zeal docset SQLite readers
@@ -38,178 +38,29 @@ Design notes in [`PLAN.md`](./PLAN.md).
 
 ## Quick start (TL;DR)
 
-```powershell
-# 1. Ollama (generator) — install from https://ollama.com/download
-ollama pull qwen3:30b-a3b                       # ~20 GB one-time
+```bash
+# 1. Ollama (generator) — https://ollama.com/download
+ollama pull qwen3:14b
 
-# 2. Qdrant (vector store) — see full setup for the two install options
-#    Quick path: download the Windows binary, run it, leave it on :6333
+# 2. Qdrant on PATH. The committed store.url is http://localhost:7333.
+#    Qdrant's own default port is 6333. Match config.yaml to the port you run.
 
-# 3. The CLI
-cd D:\Tinkering sideprojects\rag
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt                  # ~6 GB on first run (torch + Qwen3)
-python cli.py ingest --markdown .\samples\notes
-python cli.py ask "What was YaRN about?"
-python cli.py eval
+# 3. The CLI and the window
+cd /path/to/personal-rag
+./rag ingest --markdown ./samples/notes
+./rag ask "What was YaRN about?"
+./rag                  # Ollama + Qdrant + the desktop window
 ```
 
 ---
 
-## Full setup — Windows 11
+## Full setup
 
-Three services to install, all native Windows. No WSL2, no Docker Desktop.
-
-### 1. Python 3.11+
-
-If you don't have it already:
-
-```powershell
-# from the Microsoft Store, or winget:
-winget install Python.Python.3.12
-# restart terminal so `python` resolves
-python --version    # → Python 3.11.x or 3.12.x
-```
-
-### 2. Ollama
-
-The Windows installer handles GPU passthrough correctly on your 48 GB rig.
-
-```powershell
-# download from https://ollama.com/download (Windows installer)
-# then in a normal terminal:
-ollama pull qwen3:30b-a3b        # ~20 GB, one-time
-ollama list                       # confirm it's there
-```
-
-The `LocalGenerator` defaults to `http://localhost:11434/v1` — Ollama
-serves the OpenAI-compatible chat completions API on that URL natively.
-
-### 3. Qdrant (vector store)
-
-Two install options. Pick whichever fits your setup.
-
-**Option A — Windows binary (recommended — no Docker at all):**
-
-```powershell
-# download from Qdrant's GitHub releases
-Invoke-WebRequest -Uri "https://github.com/qdrant/qdrant/releases/latest/download/qdrant-x86_64-pc-windows-msvc.zip" -OutFile "$env:TEMP\qdrant.zip"
-Expand-Archive "$env:TEMP\qdrant.zip" -DestinationPath "C:\Tools\qdrant"
-
-# data dir
-New-Item -ItemType Directory -Force -Path "C:\qdrant\storage" | Out-Null
-
-# run it
-& "C:\Tools\qdrant\qdrant.exe" --storage-snapshots-dir C:\qdrant\storage
-
-# verify
-curl http://localhost:6333/collections
-# → {"result":{"collections":[]}}
-```
-
-To make Qdrant start on boot, wrap the above in a scheduled task, a
-NSSM service, or just stick it in your shell startup folder.
-
-**Option B — Docker (only if you already have Docker Desktop or the
-Docker CLI; we don't require it):**
-
-```powershell
-docker run -d --name qdrant -p 6333:6333 `
-  -v C:\qdrant\storage:/qdrant/storage `
-  --restart unless-stopped `
-  qdrant/qdrant
-```
-
-From either option, `http://localhost:6333/collections` should return
-`{"result":{"collections":[]}}`.
-
-> **This machine: port 7333, not 6333.** IPv4 `:6333` is squatted by a
-> bound-but-never-listening ghost socket (held by an unrelated local agent
-> process — netstat-invisible; find it with
-> `Get-NetTCPConnection -LocalPort 6333`). Qdrant here runs with
-> `QDRANT__SERVICE__HTTP_PORT=7333` (see `C:\Tools\qdrant\run-qdrant.cmd`),
-> and `config.yaml → store.url` matches. Substitute 7333 in every
-> `localhost:6333` URL on this page.
-
-### 4. The Python venv (Windows side)
-
-```powershell
-cd D:\Tinkering sideprojects\rag
-python -m venv .venv
-.\.venv\Scripts\activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-First install pulls down PyTorch + CUDA runtime + sentence-transformers +
-Qwen3-Embedding-8B (~5 GB on first `rag ask`). Subsequent runs are instant
-(HF cache + Qdrant state).
-
-> If `bitsandbytes` fails to install on Windows, you can:
-> - swap `embedder.quant: q4` → `none` in `config.yaml` (uses full precision),
-> - or pin `bitsandbytes` to the latest Windows-compatible release.
-
-### 5. The shiv launcher (recommended)
-
-Skip the `python -m venv` + `activate` + `cd` dance. There's a Windows shiv
-at the repo root that does all of it:
-
-- `rag.bat` — cmd.exe compatible, double-clickable
-- `rag.ps1` — PowerShell version with colored output
-
-First run creates the venv + installs `requirements.txt`. After that, every
-run just `exec`s `cli.py`:
-
-```powershell
-# from anywhere on the machine (after adding the repo to PATH or
-# pinning rag.bat to your taskbar):
-rag ask "What was YaRN about?"
-rag ingest --markdown D:\notes
-rag eval
-```
-
-If you want the literal `rag.exe` feel: create a Windows shortcut to
-`rag.bat`, rename the shortcut to `rag.exe`, and pin it. Windows runs
-.bat files transparently when launched via a shortcut.
-
-### 6. First ingest (uses the demo notes)
-
-```powershell
-python cli.py ingest --markdown .\samples\notes
-# → "done. wrote N chunks into kb_p0."
-```
-
-You should see ~20 chunks. Open the Qdrant dashboard at
-`http://localhost:6333/dashboard` to inspect them.
-
-### 7. First query
-
-```powershell
-python cli.py ask "What was YaRN about?"
-```
-
-Expected: an answer with `[1] [2] …` inline citations and a footer
-listing each cited source. First run downloads the embedding model.
-
-### 8. Eval
-
-```powershell
-python cli.py eval
-# → "recall@5 = 0.89  MRR = 0.92" (or close, depending on embedding model)
-```
-
-The harness reads `eval/golden_set.jsonl` and prints per-question
-results so you can see *which* questions failed and fix them by tweaking
-the chunker, the embedding model, or the query.
-
----
-
-## Full setup — Linux
-
-The GUI is the page already in `static/` (Ask, Ingest, Library). `./rag`
-with no arguments runs `rag start`: Ollama, Qdrant, and the server on
-port 8420, then the browser.
+`./rag` with no arguments runs `rag start`: Ollama, Qdrant, then the
+desktop window (Ask, Ingest, Library). The window calls the pipeline
+directly. `rag serve` still serves the page in `static/` on port 8420.
+If `.venv` already exists, install the new dependency once:
+`.venv/bin/pip install -r requirements.txt`.
 
 ### 1. Python 3.11+
 
@@ -241,7 +92,7 @@ If that prints `False`, install the CUDA wheel again after
 Install from https://ollama.com/download, then:
 
 ```bash
-ollama pull qwen3:30b-a3b
+ollama pull qwen3:14b
 ```
 
 `rag start` probes `http://localhost:11434/api/tags` and runs
@@ -251,8 +102,7 @@ ollama pull qwen3:30b-a3b
 
 Put the Linux `qdrant` binary on `PATH` (or set `QDRANT_BIN`). `rag start`
 reads `store.url` from `config.yaml` and probes that URL. The committed
-file points at port **7333** because of a stuck socket on the Windows
-machine; Qdrant's normal port is **6333**. Set `store.url` to the port
+file points at port **7333**. Qdrant's normal port is **6333**. Set `store.url` to the port
 you actually run. When the script starts Qdrant itself, storage is
 `~/.local/share/rag/qdrant` and the HTTP port matches `store.url`.
 
@@ -260,11 +110,12 @@ you actually run. When the script starts Qdrant itself, storage is
 
 ```bash
 ./rag start          # or just ./rag
-# Ask / Ingest / Library at http://127.0.0.1:8420
+# Ask / Ingest / Library in the desktop window
 ```
 
-Running it again is safe: services that are already up are left alone,
-and the browser opens.
+Running it again is safe: Ollama and Qdrant that are already up are
+left alone, and the window opens. `./rag start --no-browser` starts the
+server at http://127.0.0.1:8420 and leaves the window closed.
 
 ---
 
@@ -339,7 +190,7 @@ Full operator sequence: `docs/superpowers/specs/2026-08-10-p3-runbook.md`.
 
 ## Ingesting your own notes
 
-```powershell
+```bash
 # any folder of .md files, with optional YAML frontmatter:
 #
 #   ---
@@ -348,7 +199,7 @@ Full operator sequence: `docs/superpowers/specs/2026-08-10-p3-runbook.md`.
 #   # Heading
 #   ...
 #
-python cli.py ingest --markdown D:\path\to\your\notes
+./rag ingest --markdown ~/notes
 
 # topic resolution order (see ingest/markdown_dir.py):
 #   1. frontmatter `topic:` field
@@ -370,19 +221,19 @@ until it's listed under `sources:` in `config.yaml` (it ships empty):
 ```yaml
 sources:
   - type: markdown          # markdown | pdf | epub | zeal
-    path: D:/notes
+    path: ~/notes
   - type: pdf
-    path: D:/Library
+    path: ~/Library
   - type: zeal
-    path: C:/Users/you/AppData/Local/Zeal/Zeal/docsets/Python.docset
+    path: ~/.local/share/Zeal/Zeal/docsets/Python.docset
 ```
 
 Then:
 
-```powershell
-rag refresh              # re-ingest only what changed
-rag refresh --dry-run    # say what you WOULD do, write nothing
-rag refresh --prune      # ...and drop index entries whose file is gone
+```bash
+./rag refresh              # re-ingest only what changed
+./rag refresh --dry-run    # say what you WOULD do, write nothing
+./rag refresh --prune      # ...and drop index entries whose file is gone
 ```
 
 Refresh hashes every file and compares it to what it ingested last time,
@@ -415,10 +266,10 @@ is killed part-way, that one file can be left short in the index until
 the next successful refresh — which retries it, and names it in the
 summary. One file failing costs one file; its neighbours are untouched.
 
-```powershell
-rag refresh --dry-run --prune   # the paths it would remove, before you agree
-rag forget --source D:\notes\old.md    # one file, by the path `rag sources` shows
-rag forget --topic photography         # everything filed under a topic
+```bash
+./rag refresh --dry-run --prune   # the paths it would remove, before you agree
+./rag forget --source ~/notes/old.md   # one file, by the path `rag sources` shows
+./rag forget --topic photography       # everything filed under a topic
 ```
 
 `--dry-run` is the honest preview: the same code path as a real run with
@@ -455,50 +306,39 @@ the reason it wouldn't. If you emptied a folder *on purpose*, that's what
 
 ### Doing it on a schedule
 
-```powershell
-.\scripts\install-refresh-task.ps1              # daily at 03:00
-.\scripts\install-refresh-task.ps1 -At '23:30'  # or whenever
-# remove it again:
-.\scripts\uninstall-refresh-task.ps1
+```cron
+0 3 * * * /path/to/personal-rag/rag refresh >> ~/.rag/refresh.log 2>&1
 ```
 
-Registers a Task Scheduler task (`rag-refresh`) that runs plain
-`rag refresh` — **never `--prune`**; unattended is the wrong mode for
-the only irreversible command here. Re-running the installer just
-re-registers, so changing `-At` is safe. It runs unelevated, when you're
-logged in; a run missed because the machine was off happens once it's
-back.
+That runs plain `rag refresh` — **never `--prune`**; unattended is the
+wrong mode for the only irreversible command here. A run missed because
+the machine was off waits until the next time the clock matches.
 
 Since it never prunes, files you delete from disk stay in the index
 until you run `rag refresh --prune` by hand. Refresh tells you the count
 each time it notices.
 
-A refresh that fires while the GUI server is up is picked up without a
+A refresh that fires while the server is up is picked up without a
 restart: the refresh leaves a stamp beside the metadata DB, and the
 server rebuilds its BM25 vocabulary on the next hybrid query rather than
 answering out of one that predates your new documents.
 
-Everything the run printed goes to `%USERPROFILE%\.rag\refresh.log`
-(appended). That is where to look when `LastTaskResult` isn't 0 — which
-source failed, and which files it left for the next run. Check on the
-task with:
-
-```powershell
-Get-ScheduledTaskInfo -TaskName rag-refresh   # LastTaskResult 0 = clean run
-```
+Everything the run printed goes to `~/.rag/refresh.log` (appended). That
+is where to look when a nightly run fails — which source failed, and
+which files it left for the next run.
 
 ## Ingesting books (PDF)
 
 Drop a single PDF or a folder of PDFs at the CLI:
 
-```powershell
+```bash
 # One book
-python cli.py ingest --pdf D:\Books\mybook.pdf
+./rag ingest --pdf ~/Books/mybook.pdf
 
 # A whole library, topics from the parent dir
-python cli.py ingest --pdf D:\Library
-#   D:\Library\photography\book.pdf  -> topic = "photography"
-#   D:\Library\code\patterns.pdf     -> topic = "code"
+./rag ingest --pdf ~/Library
+#   ~/Library/photography/book.pdf  -> topic = "photography"
+#   ~/Library/code/patterns.pdf     -> topic = "code"
 ```
 
 Mechanics (see `ingest/pdf_dir.py`):
@@ -558,11 +398,11 @@ CREATE TABLE eval_runs (
 
 Explore it from the CLI:
 
-```powershell
-rag stats                  # counts + most-cited source
-rag sources --limit 20     # catalog of indexed files
-rag citations --limit 20   # recent citations (filter with --source PATH)
-rag eval-runs --limit 10   # recall@5 / MRR over time
+```bash
+./rag stats                  # counts + most-cited source
+./rag sources --limit 20     # catalog of indexed files
+./rag citations --limit 20   # recent citations (filter with --source PATH)
+./rag eval-runs --limit 10   # recall@5 / MRR over time
 ```
 
 Disable the side-channel entirely with `metadata.enabled: false` in
@@ -570,9 +410,9 @@ Disable the side-channel entirely with `metadata.enabled: false` in
 
 ## Ingesting a Zeal docset
 
-```powershell
-# Zeal's docsets live at %LOCALAPPDATA%\Zeal\Zeal\docsets\
-python cli.py ingest --zeal "$env:LOCALAPPDATA\Zeal\Zeal\docsets\Python.docset"
+```bash
+# Zeal docsets typically live under ~/.local/share/Zeal/Zeal/docsets/
+./rag ingest --zeal ~/.local/share/Zeal/Zeal/docsets/Python.docset
 ```
 
 The docset is opened **read-only** (SQLite `?mode=ro` URI). The docset's
@@ -613,12 +453,10 @@ rag/
 ├── README.md                # this file
 ├── config.yaml              # SINGLE source of truth for models
 ├── requirements.txt
-├── cli.py                   # `rag ask` / `rag ingest` / `rag eval` / etc.
-├── serve.py                 # FastAPI server for the GUI (P1)
-├── tray.py                  # Windows tray icon (pystray + Pillow) (P1)
-├── rag                      # Linux/macOS shiv launcher
-├── rag.bat                  # Windows shiv launcher (cmd)
-├── rag.ps1                  # Windows shiv launcher (PowerShell)
+├── cli.py                   # `rag ask` / `rag ingest` / `rag gui` / etc.
+├── gui.py                   # desktop window: Ask, Ingest, Library
+├── serve.py                 # browser page, `rag serve`
+├── rag                      # launcher. No args runs `rag start`
 ├── core/
 │   ├── interfaces.py        # ABCs: Embedder, Reranker, Generator, Ingester
 │   ├── chunker.py           # heading-aware (md) + AST (py) + whole-file fallback
@@ -634,20 +472,16 @@ rag/
 ├── ingest/
 │   ├── markdown_dir.py      # walk a notes dir, respect frontmatter
 │   ├── zeal_docsets.py      # read Dash-compatible docset SQLite (read-only)
-│   └── pdf_dir.py           # pymupdf-based PDF ingester (P1)
+│   ├── pdf_dir.py           # pymupdf-based PDF ingester
+│   └── epub_dir.py          # EPUB ingester
 ├── store/
 │   └── qdrant_store.py      # dense + reserved sparse slot
 ├── eval/
 │   ├── golden_set.jsonl     # 9 hand-written Q->chunk_id pairs
 │   └── run_ragas.py         # recall@5, MRR, faithfulness proxy
 ├── scripts/
-│   ├── start_all.sh                # Linux/macOS boot orchestrator
-│   ├── start_all.ps1               # Windows boot orchestrator
-│   ├── install-service.ps1         # Task Scheduler setup (auto-launch at logon)
-│   ├── uninstall-service.ps1       # Task Scheduler removal
-│   ├── install-refresh-task.ps1    # Task Scheduler setup (nightly `rag refresh`)
-│   └── uninstall-refresh-task.ps1  # Task Scheduler removal
-├── static/                  # the GUI (vanilla HTML + CSS + JS, no framework)
+│   └── start_all.sh         # Ollama + Qdrant, then the desktop window
+├── static/                  # browser page served by `rag serve`
 └── samples/
     └── notes/               # 5 demo notes (photography, ml, code, operations)
 ```
@@ -668,220 +502,64 @@ rag/
 - [x] **SQLite metadata layer** (`core/metadata.py`) — sources,
   citations, eval_runs; CLI commands `rag stats / sources /
   citations / eval-runs`; wired into both the CLI and the GUI server.
-- [x] **Browser-based GUI** (FastAPI + vanilla HTML/CSS/JS) — see
-  the "GUI server" section below; auto-launches at logon via the
-  Task Scheduler task that `scripts/install-service.ps1` installs.
+- [x] **Desktop window** (`gui.py`, `rag gui`) — Ask, Ingest, and
+  Library over the same pipeline. `./rag` opens it.
+- [x] **Browser page** (`serve.py` + `static/`) — `rag serve` on port 8420.
+  `./rag start --no-browser` starts that server and leaves the window closed.
 
-**P2 (no terminal, clear GUI, persistent backends):** done.
-
-- [x] **Boot orchestrator** (`scripts/start_all.ps1`, `rag start`).
-  One command brings up the whole stack: Ollama + Qdrant + the rag
-  GUI server, in that order, with health probes, then opens the
-  browser. Idempotent. Double-click `rag.bat` (no args) to trigger
-  the same path; the desktop shortcut at `scripts/create-desktop-
-  shortcut.ps1` pins it to the desktop.
-- [x] **GUI tab nav**: Ask / Ingest / Library.
-  - **Ask** — chat with `[n]` citations, topic filter dropdown.
-  - **Ingest** — drag-and-drop / file-picker upload of PDFs and
-    Markdown. Posts to `/api/ingest`; server saves to a temp dir
-    and runs the right ingester. No terminal.
-  - **Library** — read-only view of the metadata DB: stats summary,
-    recent sources, recent citations, recent eval runs.
-- [x] **Auto-launch at logon now brings up the full stack** (was
-  just the GUI server before). `install-service.ps1` schedules
-  `rag start --no-browser` so Ollama + Qdrant come up too.
-
-Still P2 (not in this release):
-
-- BM25 sparse vectors + RRF hybrid search — collection schema
-  already reserves the slot, no recreate needed when this lands.
-- EPUB ingester (`ingest/epub_dir.py`) — same shape as PDF.
-- NLI-based faithfulness metric (replace the token-overlap proxy).
-- Conversation memory / streaming responses.
+**Boot:** `scripts/start_all.sh` via `rag start`. Ollama and Qdrant come
+up if they are down, then the desktop window opens. The window loads the
+models itself, so that path does not also start `rag serve`.
 
 ---
 
-## GUI (P1 — not in P0)
+## Desktop window
 
-You use terminal every day, so a simple graphical UI is the natural next
-step. The CLI stays — the GUI is a thin window on top of the same
-pipeline (`ask` / `ingest` / `eval` all work the same way). Tech choice
-is open; see the question at the end of the install.
+`./rag` is the window. Ask, Ingest, and Library call `ask`, `ingest`, and
+`MetadataStore` directly. Ollama and Qdrant stay separate processes.
+
+```bash
+./rag                       # Ollama + Qdrant + the window
+./rag gui                   # window only; backends must already be up
+./rag start --no-browser    # server at http://127.0.0.1:8420, no window
+./rag status                # URL, PID, started_at of the server
+./rag open                  # browser to the running server
+```
+
+The server state file is `~/.rag/state.json` (`port`, `pid`, `started_at`,
+`url`). `rag serve` writes it on startup and clears it on a clean shutdown.
+
+Eval stays a CLI command. The Library view reads past runs.
 
 ---
 
-## GUI server (P1) + P2 polish
+## Verification checklist
 
-A small browser-based UI on top of the same pipeline. Bound to a
-persistent port (8420) so you always know where to find it. The CLI
-commands work exactly the same — the GUI is just another surface
-over the same `ask` / `ingest` / `eval` pipeline.
+Run from the repo.
 
-```powershell
-# Bring up the WHOLE stack (Ollama + Qdrant + rag GUI) and open the browser.
-# This is the one command that maps to the desktop shortcut.
-rag start
+```bash
+# 1. Python
+python3 --version                          # 3.11+
 
-# Or in another shell, query the running server
-rag status                 # URL, PID, started_at
-rag url                    # just the URL (for piping)
-rag open                   # just open the browser to the running GUI
-```
+# 2. Ollama has the generator
+ollama list                                # qwen3:14b
+curl http://localhost:11434/api/tags
 
-### Three tabs, no terminal
+# 3. Qdrant. Use the port in config.yaml (committed value is 7333).
+curl http://localhost:7333/collections
 
-- **Ask** — chat input + topic filter. Answers come back with inline
-  `[n]` citation markers; click a marker to scroll to its chunk.
-- **Ingest** — drag PDFs or Markdown files onto the page, or click
-  to pick. The server saves them to a temp dir, runs the right
-  ingester, reports the chunk count. No terminal, no `rag ingest`.
-- **Library** — read-only view of the metadata DB: stats summary,
-  recent sources, recent citations, recent eval runs.
+# 4. CLI
+./rag ask --help
+./rag ingest --markdown ./samples/notes
+./rag ask "What was YaRN about?"
+./rag eval
 
-### One-click bring-up (the whole point)
+# 5. Desktop window
+./rag
 
-Three ways to get to a running stack, pick whichever is closest:
-
-```powershell
-# 1. Desktop shortcut (one-time setup)
-powershell -ExecutionPolicy Bypass -File D:\Tinkering sideprojects\rag\scripts\create-desktop-shortcut.ps1
-# -> puts a `rag` shortcut on your desktop. Double-click -> stack up + browser opens.
-
-# 2. Bare command (or `rag.bat` with no args from any shell)
-rag start
-
-# 3. Auto-launch at logon (one-time setup, then forget about it)
-.\scripts\install-service.ps1
-# After this, every logon brings up Ollama + Qdrant + rag GUI
-# (15s delay so the desktop + services have time to settle).
-# To remove: .\scripts\uninstall-service.ps1
-```
-
-All three paths are idempotent: if everything is already up, the
-orchestrator just opens the browser. The Task Scheduler task
-restarts on failure up to 3 times.
-
-### What the UI looks like
-
-- **Chat input + topic filter** at the bottom; type a question, hit `ask`.
-- **Answer** appears with `[1] [2]` clickable markers that scroll to the
-  citation in the list below.
-- **Citation list** per answer: source path, section, score, and the
-  full chunk text (click to expand).
-- **run eval** button (top right) opens a side panel with the current
-  recall@5 / MRR / per-question breakdown.
-- **No framework** — vanilla HTML + CSS + a small JS file. ~250 lines total.
-
-### Files
-
-```
-serve.py                       FastAPI app: /api/ask, /api/eval, /api/health, /api/topics
-tray.py                        Windows tray icon (pystray + Pillow)
-static/index.html              the chat UI
-static/style.css               dark theme, terminal-adjacent
-static/app.js                  vanilla JS, minimal markdown renderer
-scripts/install-service.ps1    Task Scheduler setup
-scripts/uninstall-service.ps1  Task Scheduler removal
-```
-
-### Tray icon (one-click GUI access)
-
-Once the server is auto-launching at logon, the easiest way to reach
-it is a click on the tray icon. After `rag tray` (and you can add
-that to the same Task Scheduler task if you want it always on):
-
-```powershell
-rag tray                      # runs forever; left-click opens the GUI
-```
-
-Right-click menu: **Open rag GUI** / **Run eval** / **Status** /
-**Quit**. The icon is generated programmatically (no binary asset
-to ship) so it works on a fresh clone with no extra files.
-
-The service state lives at `%USERPROFILE%\.rag\state.json` (port, pid,
-started_at, url). The server writes it on startup and clears it on
-clean shutdown, so `rag status` and `rag url` can find the running
-server from any shell.
-
----
-
-## Verification checklist (line by line)
-
-Run from `D:\Tinkering sideprojects\rag` with the venv active.
-
-```powershell
-# 1. Python version
-python --version                           # → Python 3.11.x or 3.12.x
-
-# 2. Heavy deps loaded (no model download yet)
-python -c "import torch, transformers, sentence_transformers, qdrant_client, openai, yaml; print('deps ok')"
-
-# 3. Ollama is running with the generator model
-ollama list                                 # → qwen3:30b-a3b  present
-curl http://localhost:11434/api/tags        # → JSON listing qwen3:30b-a3b
-
-# 4. Qdrant is up and reachable
-curl http://localhost:6333/collections      # → {"result":{"collections":[]}}
-
-# 5. CLI help works
-python cli.py --help
-python cli.py ask --help
-python cli.py ingest --help
-python cli.py eval --help
-
-# 6. Ingest the sample notes (idempotent)
-python cli.py ingest --markdown .\samples\notes
-# expected: "done. wrote 20 chunks into kb_p0."   (14 markdown + 6 Python AST)
-
-# 7. Verify the Qdrant collection
-curl http://localhost:6333/collections/kb_p0
-# expected: vectors_count > 0, points_count > 0
-
-# 8. Ask a question, see inline [n] citations and footer
-python cli.py ask "What was YaRN about?"
-python cli.py ask "When should I use spot metering?" --topic photography
-python cli.py ask "What's the morning routine for a solo photographer?"
-
-# 9. JSON output for piping
-python cli.py ask "What is QLoRA?" --json
-
-# 10. Run the eval harness
-python cli.py eval
-# expected: recall@5 ~0.7+ (depends on Qwen3-Embedding quality), MRR ~0.8+
-python cli.py eval --json
-
-# 11. Idempotent re-ingest (re-running shouldn't grow the count)
-python cli.py ingest --markdown .\samples\notes
-# expected: "done. wrote 0 chunks" (or same as before; UUID5 dedupes)
-
-# 12. Swap the embedder in config.yaml to a different model, re-ingest, re-eval
-#     → confirms model swap is config-only
-
-# 13. GUI server (P1)
-python cli.py serve                     # foreground; visit http://localhost:8420
-# in another shell:
-rag status                             # → running, url=http://localhost:8420
-rag url                                # → http://localhost:8420
-# Auto-launch on logon (one-time):
-.\scripts\install-service.ps1
-# After logging out + back in: rag status should still show running
-# To remove: .\scripts\uninstall-service.ps1
-
-# 14. Tray icon (one-click GUI)
-rag tray                               # left-click opens the GUI
-# Or add it to the install-service.ps1 task so it auto-starts at logon.
-
-# 15. PDF ingest
-python cli.py ingest --pdf D:\path\to\some.pdf
-python cli.py ingest --pdf D:\Library  # recursive; topic = parent dir
-#   → one chunk per page (or many, if the page is long)
-
-# 16. Metadata DB (SQLite, side-channel)
-rag stats                              # counts + most-cited source
-rag sources --limit 20                 # catalog of indexed files
-rag citations --limit 20               # recent citations from `rag ask`
-rag eval-runs --limit 10               # recall@5 / MRR over time
-# Add --json to any of the four for machine-readable output.
+# 6. Browser page, if you want it
+./rag serve                                # http://127.0.0.1:8420
+./rag status
 ```
 
 ---
@@ -890,14 +568,13 @@ rag eval-runs --limit 10               # recall@5 / MRR over time
 
 | Symptom | Fix |
 | --- | --- |
-| `bitsandbytes` install fails on Windows | Set `embedder.quant: none` in `config.yaml` (uses fp16 — adds ~10 GB VRAM but no bitsandbytes dep). |
-| `OSError: libcudart.so not found` | CUDA toolkit missing. Install CUDA 12.x runtime, or set `embedder.device: cpu` (slow but works). |
-| `qwen3:30b-a3b` not found by Ollama | `ollama pull qwen3:30b-a3b` — it's a MoE so the pull is large but inference is fast. |
-| `Qdrant connection refused` | Check that `qdrant.exe` is running — **on this machine at `localhost:7333`** (see the port note in the Qdrant section). If `qdrant.exe` exits at boot with `os error 10048` but netstat shows nothing, a Bound-state ghost socket is squatting the port: `Get-NetTCPConnection -LocalPort <port>` reveals the owner. |
-| `Torch not compiled with CUDA enabled` | PyPI's Windows `torch` wheel is CPU-only. For GPU: `pip install torch --index-url https://download.pytorch.org/whl/cu126`. Until then the config runs CPU (`device: cpu`, `quant: none`) — slow but correct. |
-| `UnicodeDecodeError` when ingesting | All file IO uses `encoding="utf-8"` already. If you see this, the source file isn't UTF-8 — convert with `iconv` or save-as UTF-8 in your editor. |
-| Eval recall@5 is 0 for every question | Your collection is empty — run `python cli.py ingest --markdown .\samples\notes` first. |
-| Em-dashes / accents look wrong in print output | Windows console code page. Run `chcp 65001` before `python cli.py …` (sets the active code page to UTF-8). |
+| `bitsandbytes` will not install | Set `embedder.quant: none` in `config.yaml` (fp16, more VRAM). |
+| `OSError: libcudart.so not found` | CUDA runtime missing, or set `embedder.device: cpu` and `embedder.quant: none`. |
+| `qwen3:14b` not found by Ollama | `ollama pull qwen3:14b` |
+| `Qdrant connection refused` | Start `qdrant`, or let `./rag` start it. The URL is `store.url` in `config.yaml` (committed value `http://localhost:7333`). |
+| `Torch not compiled with CUDA enabled` | `pip install torch --index-url https://download.pytorch.org/whl/cu126`, then install `requirements.txt` again and check `torch.cuda.is_available()`. |
+| `UnicodeDecodeError` when ingesting | File IO is UTF-8. Convert the source with `iconv`. |
+| Eval recall@5 is 0 for every question | The collection is empty. `./rag ingest --markdown ./samples/notes` first. |
 
 ---
 

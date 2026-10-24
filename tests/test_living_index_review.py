@@ -286,7 +286,7 @@ def test_the_failure_is_still_reported_against_the_source(tmp_path, meta_store):
 # IMPORTANT — `metadata.path` was cwd-relative while config resolution is
 # repo-anchored
 #
-# `rag.ps1` tells the user to put `rag` on PATH and run it from anywhere. Run
+# `./rag` is meant to be on PATH and run from anywhere. Run
 # from any directory other than the repo, `make_metadata` opened — or CREATED —
 # an empty database there. Everything still "worked": refresh saw the whole
 # corpus as new and started a full re-embed, reporting success throughout. The

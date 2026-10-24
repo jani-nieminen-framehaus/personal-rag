@@ -175,8 +175,8 @@ def resolve_metadata_path(cfg: dict[str, Any]) -> Path:
     """Where the metadata DB lives. One resolution, for every caller.
 
     A RELATIVE `metadata.path` is anchored to the config file's directory, not
-    to the process's current directory. `rag.ps1` tells the user to put `rag` on
-    PATH and run it from anywhere, and config resolution has always been
+    to the process's current directory. `./rag` is meant to be on PATH and run
+    from anywhere, and config resolution has always been
     repo-anchored — so a cwd-relative DB path meant that running `rag refresh`
     from any other directory opened, or silently CREATED, an empty database
     there. Nothing errored: refresh read an empty catalog, called the entire

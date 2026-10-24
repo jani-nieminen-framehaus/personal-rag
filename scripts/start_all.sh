@@ -2,9 +2,11 @@
 # =============================================================================
 # start_all.sh — rag boot orchestrator (Linux / macOS).
 #
-# Idempotent. Checks each backend (rag server, Ollama, Qdrant). Starts the
-# ones that aren't running. Polls the rag server until /api/health responds.
-# Opens the default browser to the GUI URL.
+# Idempotent. Checks Ollama and Qdrant and starts the ones that are down.
+# Then opens the desktop window (`python -m cli gui`). The window loads
+# the models itself, so this path does not also start `rag serve`.
+# `--no-browser` starts the FastAPI server instead and does not open
+# the window.
 #
 # Qdrant's URL comes from config.yaml (store.url), not a hardcoded port.
 #
@@ -149,17 +151,26 @@ fi
 mkdir -p "$LOG_DIR"
 
 # -- 1. rag server ----------------------------------------------------------
+# The desktop window loads the embedder itself. Starting `rag serve` on
+# that path would load the same weights a second time.
 
 stage 1 "rag server"
 STARTED_SERVER=0
-if rag_server_running; then
-    echo "    already running -> $GUI_URL"
+if [[ "$NO_BROWSER" -eq 0 ]]; then
+    echo "    skipped (desktop window loads the models)"
+    if rag_server_running; then
+        echo "    [warn] a rag server is already running at $GUI_URL and also holds the models" >&2
+    fi
 else
-    echo "    not running, starting..."
-    export RAG_PORT="$PORT"
-    export RAG_HOST="$BIND_HOST"
-    spawn_detached "$LOG_DIR/serve.log" "$PYTHON" -m cli serve
-    STARTED_SERVER=1
+    if rag_server_running; then
+        echo "    already running -> $GUI_URL"
+    else
+        echo "    not running, starting..."
+        export RAG_PORT="$PORT"
+        export RAG_HOST="$BIND_HOST"
+        spawn_detached "$LOG_DIR/serve.log" "$PYTHON" -m cli serve
+        STARTED_SERVER=1
+    fi
 fi
 
 # -- 2. Ollama --------------------------------------------------------------
@@ -224,18 +235,15 @@ if [[ "$STARTED_SERVER" -eq 1 ]]; then
     echo "    ready -> $GUI_URL"
 fi
 
-# -- 4. open browser --------------------------------------------------------
+# -- 4. open the desktop window ---------------------------------------------
 
 stage 4 "open GUI"
 if [[ "$NO_BROWSER" -eq 0 ]]; then
-    echo "    opening $GUI_URL in the default browser"
-    if ! xdg-open "$GUI_URL" >/dev/null 2>&1; then
-        echo "    [warn] xdg-open failed. Open $GUI_URL yourself." >&2
-    fi
-else
-    echo "    skip (--no-browser). GUI: $GUI_URL"
+    echo "    opening the desktop window"
+    exec "$PYTHON" -m cli gui
 fi
 
+echo "    skip (--no-browser). Server: $GUI_URL"
 echo ""
 echo "  rag stack ready."
 echo "  url : $GUI_URL"

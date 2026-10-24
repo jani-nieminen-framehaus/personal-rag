@@ -17,11 +17,13 @@ if that one file's ingest fails it can be left short in the index until the
 next successful run. Refresh works from the `sources:` list in config.yaml,
 not from its arguments.
 
-Also: `serve` / `start` / `status` / `url` / `open` / `tray` (the GUI),
-`stats` / `sources` / `citations` / `eval-runs` / `sessions` (the metadata
-catalog), and the `golden` group (generate / review / stats) for the eval set.
+Also: `gui` (desktop window), `serve` / `start` / `status` / `url` / `open`
+(the browser page), `stats` / `sources` / `citations` / `eval-runs` /
+`sessions` (the metadata catalog), and the `golden` group (generate /
+review / stats) for the eval set.
 
-Click is the only third-party dep. No TUI, no GUI — terminal-first per spec.
+Click is the only third-party dep of the terminal commands. `rag gui`
+imports PySide6 inside the command so the rest of the CLI does not.
 """
 from __future__ import annotations
 
@@ -57,9 +59,8 @@ from ingest.pdf_dir import PdfDirIngester
 from ingest.epub_dir import EpubDirIngester
 
 
-# Persistent service state for the GUI. Path + helpers live in
-# service_state.py (single source of truth, mirrored for PowerShell in
-# scripts/_config.ps1). Module-level aliases kept for monkeypatchability.
+# Persistent service state for the browser server. Path + helpers live in
+# service_state.py. Module-level aliases kept for monkeypatchability.
 SERVICE_STATE_DIR = service_state.STATE_DIR
 SERVICE_STATE_FILE = service_state.STATE_FILE
 
@@ -647,7 +648,7 @@ def _resolve_repo_path(path_str: str) -> Path:
     """Resolve a path against multiple candidate roots.
 
     The user can be sitting in any directory when they invoke
-    `rag eval` (especially when launched via rag.bat / rag.ps1 from
+    `rag eval` (including when `./rag` is on PATH and run from
     somewhere else). The golden set lives at `eval/golden_set.jsonl`
     inside the repo, so we try in order:
       1. The literal path (absolute or relative-to-CWD)
@@ -911,11 +912,10 @@ def golden_stats(ctx):
 # rag serve / rag status / rag url
 # -----------------------------------------------------------------------------
 #
-# P1 GUI: the server runs as a long-lived process on a persistent port
+# The browser page runs as a long-lived process on a persistent port
 # (default 8420). It writes its PID + URL to ~/.rag/state.json on
 # startup so `rag status` and `rag url` can find it from any shell.
-# The Task Scheduler task (created by scripts/install-service.ps1)
-# starts the server at user logon.
+# `./rag` opens the desktop window and does not start this server.
 
 def _read_service_state() -> dict | None:
     """Read the service state file. Returns None if absent or invalid."""
@@ -951,8 +951,9 @@ def status(as_json):
             click.echo(json.dumps({"running": False}, indent=2))
         else:
             click.echo("rag GUI: not running (no state file at ~/.rag/state.json)")
-            click.echo("hint:  rag start          # Ollama + Qdrant + GUI")
-            click.echo("       rag serve          # GUI server only")
+            click.echo("hint:  rag start          # Ollama + Qdrant + window")
+            click.echo("       rag gui            # desktop window only")
+            click.echo("       rag serve          # browser server only")
         return
 
     pid = state.get("pid")
@@ -983,45 +984,42 @@ def url():
     click.echo(state["url"])
 
 
-@cli.command()
-def tray():
-    """Run the Windows system tray icon. Left-click opens the GUI."""
-    import tray
-    tray.run()
-
-
 # -----------------------------------------------------------------------------
-# rag start / rag open - boot orchestrator + browser launcher (P2)
+# rag start / rag open - boot orchestrator
 # -----------------------------------------------------------------------------
 #
-# `rag start` brings up Ollama, Qdrant, and the rag server, then opens
-# the browser. Windows dispatches to scripts/start_all.ps1; Linux and
-# macOS dispatch to scripts/start_all.sh. Both poll /api/health, then
-# open the GUI. Idempotent: if everything is already up, just open it.
+# `rag start` brings up Ollama and Qdrant, then opens the desktop window
+# via scripts/start_all.sh. `--no-browser` starts the server and leaves
+# the window closed.
 #
 # `rag open` is a quieter version that only opens the browser to the
-# currently-running GUI (errors if the server isn't up).
+# currently-running server (errors if the server isn't up).
+#
+# `rag gui` is the desktop window. It loads the models itself.
+
+@cli.command("gui")
+@click.pass_context
+def gui_cmd(ctx):
+    """Open the desktop window (Ask, Ingest, Library).
+
+    Loads the embedder, reranker, store, and generator in this process.
+    Ollama and Qdrant stay separate and must already be running.
+    Uses the config already loaded for this invocation, including -c.
+    """
+    # Lazy so `import cli` and `rag gui --help` do not require PySide6.
+    import gui as gui_mod
+    gui_mod.run((ctx.obj or {}).get("config"))
+
 
 @cli.command("start")
 @click.option("--no-browser", is_flag=True,
-              help="Don't open the browser at the end (for headless / smoke).")
+              help="Start the server and leave the desktop window closed.")
 def start(no_browser):
-    """Bring up the full rag stack (Ollama + Qdrant + rag server) and open the GUI.
+    """Bring up Ollama and Qdrant, then open the desktop window.
 
-    Idempotent. If everything is already running, just opens the browser.
-    This is the one-click entry point pinned to your desktop.
+    Idempotent for the backends. `--no-browser` starts the server instead.
     """
     repo = Path(__file__).resolve().parent
-    if sys.platform == "win32":
-        ps1 = repo / "scripts" / "start_all.ps1"
-        if not ps1.is_file():
-            click.echo(f"start: script missing: {ps1}", err=True)
-            sys.exit(1)
-        args = ["-ExecutionPolicy", "Bypass", "-File", str(ps1)]
-        if no_browser:
-            args += ["-NoBrowser"]
-        rc = subprocess.call(["powershell.exe"] + args)
-        sys.exit(rc)
     script = repo / "scripts" / "start_all.sh"
     if not script.is_file():
         click.echo(f"start: script missing: {script}", err=True)
