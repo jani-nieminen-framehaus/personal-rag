@@ -28,6 +28,9 @@ metadata.sqlite3*
 # ...and the corpus stamp beside it, wherever metadata.path points
 *.corpus-stamp
 
+# PDFs dropped in for the skeleton index
+/material for the skeleton RAG/
+
 # Smoke / debug artifacts
 test_out.pdf
 samples/test_books/
