@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# =============================================================================
+# rag — Linux / macOS shiv launcher.
+# First run: creates the venv + installs deps. After that: just runs cli.py.
+#
+# Usage:
+#     ./rag                              (no args -> "rag start": bring up
+#                                         the whole stack and open the GUI)
+#     ./rag ask "What was YaRN about?"
+#     ./rag ingest --markdown ./samples/notes
+#     ./rag serve / start / open / status / stats / etc.
+# =============================================================================
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="$REPO/.venv"
+PYEXE="$VENV/bin/python"
+
+if [[ ! -x "$PYEXE" ]]; then
+    echo "[rag] first run — creating venv and installing deps. This takes a few minutes."
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "[rag] python3 not found on PATH." >&2
+        exit 1
+    fi
+    python3 -m venv "$VENV"
+    "$PYEXE" -m pip install --upgrade pip
+    "$PYEXE" -m pip install -r "$REPO/requirements.txt"
+    echo "[rag] setup complete."
+fi
+
+if [[ $# -eq 0 ]]; then
+    exec "$PYEXE" "$REPO/cli.py" start
+fi
+exec "$PYEXE" "$REPO/cli.py" "$@"

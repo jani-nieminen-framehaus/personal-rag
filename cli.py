@@ -951,8 +951,8 @@ def status(as_json):
             click.echo(json.dumps({"running": False}, indent=2))
         else:
             click.echo("rag GUI: not running (no state file at ~/.rag/state.json)")
-            click.echo("hint:  rag serve          # start it now")
-            click.echo("       scripts\\install-service.ps1  # auto-launch on logon")
+            click.echo("hint:  rag start          # Ollama + Qdrant + GUI")
+            click.echo("       rag serve          # GUI server only")
         return
 
     pid = state.get("pid")
@@ -994,11 +994,10 @@ def tray():
 # rag start / rag open - boot orchestrator + browser launcher (P2)
 # -----------------------------------------------------------------------------
 #
-# `rag start` is the "double-click to bring up the whole stack" entry point.
-# On Windows it dispatches to scripts/start_all.ps1 which checks Ollama,
-# Qdrant, and the rag server, starts the ones that aren't running, polls
-# until /api/health says ready, then opens the browser. Idempotent: if
-# everything is already up, it just opens the browser.
+# `rag start` brings up Ollama, Qdrant, and the rag server, then opens
+# the browser. Windows dispatches to scripts/start_all.ps1; Linux and
+# macOS dispatch to scripts/start_all.sh. Both poll /api/health, then
+# open the GUI. Idempotent: if everything is already up, just open it.
 #
 # `rag open` is a quieter version that only opens the browser to the
 # currently-running GUI (errors if the server isn't up).
@@ -1023,14 +1022,15 @@ def start(no_browser):
             args += ["-NoBrowser"]
         rc = subprocess.call(["powershell.exe"] + args)
         sys.exit(rc)
-    # Non-Windows fallback: just start the rag server (user manages
-    # Ollama + Qdrant themselves).
-    click.echo("start: non-Windows detected; only starting the rag server.")
-    click.echo("start: you'll need to run Ollama and Qdrant separately.")
-    # --no-browser needs no plumbing here: the non-Windows path never
-    # opens a browser in the first place.
-    import serve as serve_mod
-    serve_mod.run()
+    script = repo / "scripts" / "start_all.sh"
+    if not script.is_file():
+        click.echo(f"start: script missing: {script}", err=True)
+        sys.exit(1)
+    args = ["bash", str(script)]
+    if no_browser:
+        args.append("--no-browser")
+    rc = subprocess.call(args)
+    sys.exit(rc)
 
 
 @cli.command("open")

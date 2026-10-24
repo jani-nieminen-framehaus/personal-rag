@@ -182,10 +182,41 @@ def test_start_dispatches_to_powershell_on_windows(monkeypatch):
     assert "-NoBrowser" in cmd
 
 
+def test_start_dispatches_to_shell_off_windows(monkeypatch):
+    """Off Windows, `rag start --no-browser` invokes start_all.sh.
+    subprocess.call is mocked; the real script is not executed."""
+    from click.testing import CliRunner
+    from cli import cli as cli_group
+
+    captured: dict = {}
+
+    def fake_call(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return 0
+
+    monkeypatch.setattr("cli.subprocess.call", fake_call)
+    monkeypatch.setattr("cli.sys.platform", "linux")
+    res = CliRunner().invoke(cli_group, ["start", "--no-browser"])
+
+    assert res.exit_code == 0, res.output
+    cmd = captured.get("cmd")
+    assert cmd, "subprocess.call was never invoked"
+    assert cmd[0] == "bash"
+    assert any(str(a).endswith("start_all.sh") for a in cmd)
+    assert "--no-browser" in cmd
+
+
 def test_start_script_file_exists():
     """The PowerShell orchestrator script must be present on disk."""
     from pathlib import Path
     p = Path(__file__).resolve().parent.parent / "scripts" / "start_all.ps1"
+    assert p.is_file(), f"missing: {p}"
+
+
+def test_start_shell_script_file_exists():
+    """The Linux/macOS orchestrator script must be present on disk."""
+    from pathlib import Path
+    p = Path(__file__).resolve().parent.parent / "scripts" / "start_all.sh"
     assert p.is_file(), f"missing: {p}"
 
 
@@ -222,6 +253,15 @@ def test_rag_ps1_defaults_to_start_when_no_args():
     p = Path(__file__).resolve().parent.parent / "rag.ps1"
     content = p.read_text(encoding="utf-8")
     assert "cli.py') start" in content
+
+
+def test_rag_shell_defaults_to_start_when_no_args():
+    """`rag` with no args should run `cli.py start`."""
+    from pathlib import Path
+    p = Path(__file__).resolve().parent.parent / "rag"
+    content = p.read_text(encoding="utf-8")
+    assert 'cli.py" start' in content
+    assert "$#" in content
 
 
 # -- /api/ingest (P2) -------------------------------------------------------

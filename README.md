@@ -205,6 +205,69 @@ the chunker, the embedding model, or the query.
 
 ---
 
+## Full setup — Linux
+
+The GUI is the page already in `static/` (Ask, Ingest, Library). `./rag`
+with no arguments runs `rag start`: Ollama, Qdrant, and the server on
+port 8420, then the browser.
+
+### 1. Python 3.11+
+
+```bash
+cd /path/to/personal-rag
+./rag
+```
+
+The first run creates `.venv` and installs `requirements.txt`. Later runs
+just start the stack.
+
+With an NVIDIA GPU, install the CUDA wheel before the rest of the
+requirements, then confirm CUDA survived the requirements install:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu126
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -c "import torch; print(torch.cuda.is_available())"
+```
+
+If that prints `False`, install the CUDA wheel again after
+`requirements.txt`. With no GPU, set `embedder.device` and
+`reranker.device` to `cpu`, and `embedder.quant` to `none`, in
+`config.yaml`.
+
+### 2. Ollama
+
+Install from https://ollama.com/download, then:
+
+```bash
+ollama pull qwen3:30b-a3b
+```
+
+`rag start` probes `http://localhost:11434/api/tags` and runs
+`ollama serve` when nothing is listening.
+
+### 3. Qdrant
+
+Put the Linux `qdrant` binary on `PATH` (or set `QDRANT_BIN`). `rag start`
+reads `store.url` from `config.yaml` and probes that URL. The committed
+file points at port **7333** because of a stuck socket on the Windows
+machine; Qdrant's normal port is **6333**. Set `store.url` to the port
+you actually run. When the script starts Qdrant itself, storage is
+`~/.local/share/rag/qdrant` and the HTTP port matches `store.url`.
+
+### 4. Open the GUI
+
+```bash
+./rag start          # or just ./rag
+# Ask / Ingest / Library at http://127.0.0.1:8420
+```
+
+Running it again is safe: services that are already up are left alone,
+and the browser opens.
+
+---
+
 ## Evaluation — what it's actually for
 
 Skip this section until you have a real corpus in the index. None of it
@@ -553,6 +616,7 @@ rag/
 ├── cli.py                   # `rag ask` / `rag ingest` / `rag eval` / etc.
 ├── serve.py                 # FastAPI server for the GUI (P1)
 ├── tray.py                  # Windows tray icon (pystray + Pillow) (P1)
+├── rag                      # Linux/macOS shiv launcher
 ├── rag.bat                  # Windows shiv launcher (cmd)
 ├── rag.ps1                  # Windows shiv launcher (PowerShell)
 ├── core/
@@ -577,6 +641,8 @@ rag/
 │   ├── golden_set.jsonl     # 9 hand-written Q->chunk_id pairs
 │   └── run_ragas.py         # recall@5, MRR, faithfulness proxy
 ├── scripts/
+│   ├── start_all.sh                # Linux/macOS boot orchestrator
+│   ├── start_all.ps1               # Windows boot orchestrator
 │   ├── install-service.ps1         # Task Scheduler setup (auto-launch at logon)
 │   ├── uninstall-service.ps1       # Task Scheduler removal
 │   ├── install-refresh-task.ps1    # Task Scheduler setup (nightly `rag refresh`)
